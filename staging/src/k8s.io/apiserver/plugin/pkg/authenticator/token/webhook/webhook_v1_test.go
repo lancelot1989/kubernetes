@@ -33,11 +33,19 @@ import (
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/token/cache"
 	"k8s.io/apiserver/pkg/authentication/user"
 	v1 "k8s.io/client-go/tools/clientcmd/api/v1"
 )
+
+var testRetryBackoff = wait.Backoff{
+	Duration: 5 * time.Millisecond,
+	Factor:   1.5,
+	Jitter:   0.2,
+	Steps:    5,
+}
 
 // V1Service mocks a remote authentication service.
 type V1Service interface {
@@ -193,12 +201,12 @@ func newV1TokenAuthenticator(serverURL string, clientCert, clientKey, ca []byte,
 		return nil, err
 	}
 
-	c, err := tokenReviewInterfaceFromKubeconfig(p, "v1")
+	c, err := tokenReviewInterfaceFromKubeconfig(p, "v1", testRetryBackoff, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	authn, err := newWithBackoff(c, 0, implicitAuds)
+	authn, err := newWithBackoff(c, testRetryBackoff, implicitAuds)
 	if err != nil {
 		return nil, err
 	}
@@ -479,7 +487,7 @@ func TestV1WebhookTokenAuthenticator(t *testing.T) {
 			expectedAuthenticated: false,
 		},
 	}
-	token := "my-s3cr3t-t0ken"
+	token := "my-s3cr3t-t0ken" // Fake token for testing.
 	for _, tt := range tests {
 		t.Run(tt.description, func(t *testing.T) {
 			wh, err := newV1TokenAuthenticator(s.URL, clientCert, clientKey, caCert, 0, tt.implicitAuds)

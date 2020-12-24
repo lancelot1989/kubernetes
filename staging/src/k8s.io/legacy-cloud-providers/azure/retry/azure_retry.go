@@ -21,11 +21,12 @@ package retry
 import (
 	"math/rand"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/mocks"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 // Ensure package autorest/mocks is imported and vendored.
@@ -55,6 +56,10 @@ type Backoff struct {
 	// exceed the cap then the duration is set to the cap and the
 	// steps parameter is set to zero.
 	Cap time.Duration
+	// The errors indicate that the request shouldn't do more retrying.
+	NonRetriableErrors []string
+	// The RetriableHTTPStatusCodes indicates that the HTTPStatusCode should do more retrying.
+	RetriableHTTPStatusCodes []int
 }
 
 // NewBackoff creates a new Backoff.
@@ -66,6 +71,35 @@ func NewBackoff(duration time.Duration, factor float64, jitter float64, steps in
 		Steps:    steps,
 		Cap:      cap,
 	}
+}
+
+// WithNonRetriableErrors returns a new *Backoff with NonRetriableErrors assigned.
+func (b *Backoff) WithNonRetriableErrors(errs []string) *Backoff {
+	newBackoff := *b
+	newBackoff.NonRetriableErrors = errs
+	return &newBackoff
+}
+
+// WithRetriableHTTPStatusCodes returns a new *Backoff with RetriableHTTPStatusCode assigned.
+func (b *Backoff) WithRetriableHTTPStatusCodes(httpStatusCodes []int) *Backoff {
+	newBackoff := *b
+	newBackoff.RetriableHTTPStatusCodes = httpStatusCodes
+	return &newBackoff
+}
+
+// isNonRetriableError returns true if the Error is one of NonRetriableErrors.
+func (b *Backoff) isNonRetriableError(rerr *Error) bool {
+	if rerr == nil {
+		return false
+	}
+
+	for _, err := range b.NonRetriableErrors {
+		if strings.Contains(rerr.RawError.Error(), err) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Step (1) returns an amount of time to sleep determined by the
@@ -110,7 +144,7 @@ func jitter(duration time.Duration, maxFactor float64) time.Duration {
 	return wait
 }
 
-// DoExponentialBackoffRetry reprents an autorest.SendDecorator with backoff retry.
+// DoExponentialBackoffRetry represents an autorest.SendDecorator with backoff retry.
 func DoExponentialBackoffRetry(backoff *Backoff) autorest.SendDecorator {
 	return func(s autorest.Sender) autorest.Sender {
 		return autorest.SenderFunc(func(r *http.Request) (*http.Response, error) {
@@ -129,13 +163,14 @@ func doBackoffRetry(s autorest.Sender, r *http.Request, backoff *Backoff) (resp 
 			return
 		}
 		resp, err = s.Do(rr.Request())
-		rerr := GetError(resp, err)
+		rerr := GetErrorWithRetriableHTTPStatusCodes(resp, err, backoff.RetriableHTTPStatusCodes)
 		// Abort retries in the following scenarios:
 		// 1) request succeed
 		// 2) request is not retriable
 		// 3) request has been throttled
-		// 4) request has completed all the retry steps
-		if rerr == nil || !rerr.Retriable || rerr.IsThrottled() || backoff.Steps == 1 {
+		// 4) request contains non-retriable errors
+		// 5) request has completed all the retry steps
+		if rerr == nil || !rerr.Retriable || rerr.IsThrottled() || backoff.isNonRetriableError(rerr) || backoff.Steps == 1 {
 			return resp, rerr.Error()
 		}
 

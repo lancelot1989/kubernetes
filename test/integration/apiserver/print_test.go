@@ -17,6 +17,7 @@ limitations under the License.
 package apiserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -26,28 +27,33 @@ import (
 	"testing"
 	"time"
 
-	auditregv1alpha1 "k8s.io/api/auditregistration/v1alpha1"
+	apiserverinternalv1alpha1 "k8s.io/api/apiserverinternal/v1alpha1"
 	batchv2alpha1 "k8s.io/api/batch/v2alpha1"
 	discoveryv1alpha1 "k8s.io/api/discovery/v1alpha1"
 	discoveryv1beta1 "k8s.io/api/discovery/v1beta1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	flowcontrolv1alpha1 "k8s.io/api/flowcontrol/v1alpha1"
+	flowcontrolv1beta1 "k8s.io/api/flowcontrol/v1beta1"
+	nodev1 "k8s.io/api/node/v1"
 	nodev1alpha1 "k8s.io/api/node/v1alpha1"
+	nodev1beta1 "k8s.io/api/node/v1beta1"
 	rbacv1alpha1 "k8s.io/api/rbac/v1alpha1"
 	schedulerapi "k8s.io/api/scheduling/v1"
-	settingsv1alpha1 "k8s.io/api/settings/v1alpha1"
 	storagev1alpha1 "k8s.io/api/storage/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	diskcached "k8s.io/client-go/discovery/cached/disk"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/gengo/examples/set-gen/sets"
 	"k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/printers"
 	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
 	"k8s.io/kubernetes/test/integration/framework"
@@ -129,8 +135,6 @@ var missingHanlders = sets.NewString(
 	"PriorityClass",
 	"PodPreset",
 	"AuditSink",
-	"FlowSchema",                 // TODO(yue9944882): remove this comment by merging print-handler for flow-control API
-	"PriorityLevelConfiguration", // TODO(yue9944882): remove this comment by merging print-handler for flow-control API
 )
 
 // known types that are no longer served we should tolerate restmapper errors for
@@ -156,20 +160,24 @@ var unservedTypes = map[schema.GroupVersionKind]bool{
 }
 
 func TestServerSidePrint(t *testing.T) {
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CSIStorageCapacity, true)()
+
 	s, _, closeFn := setupWithResources(t,
 		// additional groupversions needed for the test to run
 		[]schema.GroupVersion{
-			auditregv1alpha1.SchemeGroupVersion,
 			batchv2alpha1.SchemeGroupVersion,
 			discoveryv1alpha1.SchemeGroupVersion,
 			discoveryv1beta1.SchemeGroupVersion,
 			rbacv1alpha1.SchemeGroupVersion,
-			settingsv1alpha1.SchemeGroupVersion,
 			schedulerapi.SchemeGroupVersion,
 			storagev1alpha1.SchemeGroupVersion,
 			extensionsv1beta1.SchemeGroupVersion,
+			nodev1.SchemeGroupVersion,
 			nodev1alpha1.SchemeGroupVersion,
+			nodev1beta1.SchemeGroupVersion,
 			flowcontrolv1alpha1.SchemeGroupVersion,
+			flowcontrolv1beta1.SchemeGroupVersion,
+			apiserverinternalv1alpha1.SchemeGroupVersion,
 		},
 		[]schema.GroupVersionResource{},
 	)
@@ -238,7 +246,7 @@ func TestServerSidePrint(t *testing.T) {
 		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
 			req = req.Namespace(ns.Name)
 		}
-		body, err := req.Resource(mapping.Resource.Resource).SetHeader("Accept", tableParam).Do().Raw()
+		body, err := req.Resource(mapping.Resource.Resource).SetHeader("Accept", tableParam).Do(context.TODO()).Raw()
 		if err != nil {
 			t.Errorf("unexpected error getting %s: %v", gvk, err)
 			continue

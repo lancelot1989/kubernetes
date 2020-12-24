@@ -22,6 +22,7 @@ package e2enode
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -42,7 +43,7 @@ import (
 	commontest "k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2econfig "k8s.io/kubernetes/test/e2e/framework/config"
-	"k8s.io/kubernetes/test/e2e/framework/testfiles"
+	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
 	"k8s.io/kubernetes/test/e2e/generated"
 	"k8s.io/kubernetes/test/e2e_node/services"
 	system "k8s.io/system-validators/validators"
@@ -52,21 +53,24 @@ import (
 	morereporters "github.com/onsi/ginkgo/reporters"
 	"github.com/onsi/gomega"
 	"github.com/spf13/pflag"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
-var e2es *services.E2EServices
+var (
+	e2es *services.E2EServices
 
-// TODO(random-liu): Change the following modes to sub-command.
-var runServicesMode = flag.Bool("run-services-mode", false, "If true, only run services (etcd, apiserver) in current process, and not run test.")
-var runKubeletMode = flag.Bool("run-kubelet-mode", false, "If true, only start kubelet, and not run test.")
-var systemValidateMode = flag.Bool("system-validate-mode", false, "If true, only run system validation in current process, and not run test.")
-var systemSpecFile = flag.String("system-spec-file", "", "The name of the system spec file that will be used for node conformance test. If it's unspecified or empty, the default system spec (system.DefaultSysSpec) will be used.")
+	// TODO(random-liu): Change the following modes to sub-command.
+	runServicesMode    = flag.Bool("run-services-mode", false, "If true, only run services (etcd, apiserver) in current process, and not run test.")
+	runKubeletMode     = flag.Bool("run-kubelet-mode", false, "If true, only start kubelet, and not run test.")
+	systemValidateMode = flag.Bool("system-validate-mode", false, "If true, only run system validation in current process, and not run test.")
+	systemSpecFile     = flag.String("system-spec-file", "", "The name of the system spec file that will be used for node conformance test. If it's unspecified or empty, the default system spec (system.DefaultSysSpec) will be used.")
+)
 
 // registerNodeFlags registers flags specific to the node e2e test suite.
 func registerNodeFlags(flags *flag.FlagSet) {
 	// Mark the test as node e2e when node flags are api.Registry.
 	framework.TestContext.NodeE2E = true
+	flags.StringVar(&framework.TestContext.BearerToken, "bearer-token", "", "The bearer token to authenticate with. If not specified, it would be a random token. Currently this token is only used in node e2e tests.")
 	flags.StringVar(&framework.TestContext.NodeName, "node-name", "", "Name of the node to run tests on.")
 	// TODO(random-liu): Move kubelet start logic out of the test.
 	// TODO(random-liu): Move log fetch logic out of the test.
@@ -79,11 +83,12 @@ func registerNodeFlags(flags *flag.FlagSet) {
 	flags.StringVar(&framework.TestContext.ImageDescription, "image-description", "", "The description of the image which the test will be running on.")
 	flags.StringVar(&framework.TestContext.SystemSpecName, "system-spec-name", "", "The name of the system spec (e.g., gke) that's used in the node e2e test. The system specs are in test/e2e_node/system/specs/. This is used by the test framework to determine which tests to run for validating the system requirements.")
 	flags.Var(cliflag.NewMapStringString(&framework.TestContext.ExtraEnvs), "extra-envs", "The extra environment variables needed for node e2e tests. Format: a list of key=value pairs, e.g., env1=val1,env2=val2")
+	flags.StringVar(&framework.TestContext.SriovdpConfigMapFile, "sriovdp-configmap-file", "", "The name of the SRIOV device plugin Config Map to load.")
 }
 
 func init() {
 	// Enable bindata file lookup as fallback.
-	testfiles.AddFileSource(testfiles.BindataFileSource{
+	e2etestfiles.AddFileSource(e2etestfiles.BindataFileSource{
 		Asset:      generated.Asset,
 		AssetNames: generated.AssetNames,
 	})
@@ -177,7 +182,7 @@ var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	// This helps with debugging test flakes since it is hard to tell when a test failure is due to image pulling.
 	if framework.TestContext.PrepullImages {
 		klog.Infof("Pre-pulling images so that they are cached for the tests.")
-		updateImageWhiteList()
+		updateImageAllowList()
 		err := PrePullAllImages()
 		gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	}
@@ -192,7 +197,6 @@ var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 		// If the services are expected to keep running after test, they should not monitor the test process.
 		e2es = services.NewE2EServices(*stopServices)
 		gomega.Expect(e2es.Start()).To(gomega.Succeed(), "should be able to start node services.")
-		klog.Infof("Node services started.  Running tests...")
 	} else {
 		klog.Infof("Running tests without starting services.")
 	}
@@ -203,8 +207,12 @@ var _ = ginkgo.SynchronizedBeforeSuite(func() []byte {
 	// Reference common test to make the import valid.
 	commontest.CurrentSuite = commontest.NodeE2E
 
-	return nil
-}, func([]byte) {
+	// ginkgo would spawn multiple processes to run tests.
+	// Since the bearer token is generated randomly at run time,
+	// we need to distribute the bearer token to other processes to make them use the same token.
+	return []byte(framework.TestContext.BearerToken)
+}, func(token []byte) {
+	framework.TestContext.BearerToken = string(token)
 	// update test context with node configuration.
 	gomega.Expect(updateTestContext()).To(gomega.Succeed(), "update test context with node config.")
 })
@@ -277,7 +285,7 @@ func waitForNodeReady() {
 // update test context with node configuration.
 func updateTestContext() error {
 	setExtraEnvs()
-	updateImageWhiteList()
+	updateImageAllowList()
 
 	client, err := getAPIServerClient()
 	if err != nil {
@@ -302,7 +310,7 @@ func updateTestContext() error {
 
 // getNode gets node object from the apiserver.
 func getNode(c *clientset.Clientset) (*v1.Node, error) {
-	nodes, err := c.CoreV1().Nodes().List(metav1.ListOptions{})
+	nodes, err := c.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	framework.ExpectNoError(err, "should be able to list nodes.")
 	if nodes == nil {
 		return nil, fmt.Errorf("the node list is nil")

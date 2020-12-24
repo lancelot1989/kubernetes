@@ -626,6 +626,16 @@ func TestDrain(t *testing.T) {
 			expected:     cordonedNode,
 			pods:         []corev1.Pod{jobPod},
 			rcs:          []corev1.ReplicationController{rc},
+			args:         []string{"node", "--force", "--delete-emptydir-data=true"},
+			expectFatal:  false,
+			expectDelete: true,
+		},
+		{
+			description:  "Ensure compatibility for --delete-local-data until fully deprecated",
+			node:         node,
+			expected:     cordonedNode,
+			pods:         []corev1.Pod{jobPod},
+			rcs:          []corev1.ReplicationController{rc},
 			args:         []string{"node", "--force", "--delete-local-data=true"},
 			expectFatal:  false,
 			expectDelete: true,
@@ -690,11 +700,11 @@ func TestDrain(t *testing.T) {
 			expectDelete: true,
 		},
 		{
-			description:  "pod with EmptyDir and --delete-local-data",
+			description:  "pod with EmptyDir and --delete-emptydir-data",
 			node:         node,
 			expected:     cordonedNode,
 			pods:         []corev1.Pod{emptydirPod},
-			args:         []string{"node", "--force", "--delete-local-data=true"},
+			args:         []string{"node", "--force", "--delete-emptydir-data=true"},
 			expectFatal:  false,
 			expectDelete: true,
 		},
@@ -867,7 +877,7 @@ func TestDrain(t *testing.T) {
 				switch {
 				case recovered != nil && !sawFatal:
 					t.Fatalf("got panic: %v", recovered)
-				case test.expectDelete && test.expectFatal && !sawFatal:
+				case test.expectFatal && !sawFatal:
 					t.Fatalf("%s: unexpected non-error when using %s", test.description, currMethod)
 				case !test.expectFatal && sawFatal:
 					t.Fatalf("%s: unexpected error when using %s: %s", test.description, currMethod, fatalMsg)
@@ -903,7 +913,7 @@ func TestDrain(t *testing.T) {
 					t.Fatalf("%s: same pod deleted %d times and evicted %d times", test.description, deletions, evictions)
 				}
 
-				if test.expectDelete && len(test.expectWarning) > 0 {
+				if len(test.expectWarning) > 0 {
 					if len(errBuf.String()) == 0 {
 						t.Fatalf("%s: expected warning, but found no stderr output", test.description)
 					}

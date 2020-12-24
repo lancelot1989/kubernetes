@@ -19,25 +19,23 @@ package noderesources
 import (
 	v1 "k8s.io/api/core/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/klog"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
-	priorityutil "k8s.io/kubernetes/pkg/scheduler/algorithm/priorities/util"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	schedulernodeinfo "k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
+	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 )
 
-// ResourceToWeightMap contains resource name and weight.
-type ResourceToWeightMap map[v1.ResourceName]int64
+// resourceToWeightMap contains resource name and weight.
+type resourceToWeightMap map[v1.ResourceName]int64
 
-// DefaultRequestedRatioResources is used to set default requestToWeight map for CPU and memory
-var DefaultRequestedRatioResources = ResourceToWeightMap{v1.ResourceMemory: 1, v1.ResourceCPU: 1}
+// defaultRequestedRatioResources is used to set default requestToWeight map for CPU and memory
+var defaultRequestedRatioResources = resourceToWeightMap{v1.ResourceMemory: 1, v1.ResourceCPU: 1}
 
 // resourceAllocationScorer contains information to calculate resource allocation score.
 type resourceAllocationScorer struct {
 	Name                string
 	scorer              func(requested, allocable resourceToValueMap, includeVolumes bool, requestedVolumes int, allocatableVolumes int) int64
-	resourceToWeightMap ResourceToWeightMap
+	resourceToWeightMap resourceToWeightMap
 }
 
 // resourceToValueMap contains resource name and score.
@@ -46,7 +44,7 @@ type resourceToValueMap map[v1.ResourceName]int64
 // score will use `scorer` function to calculate the score.
 func (r *resourceAllocationScorer) score(
 	pod *v1.Pod,
-	nodeInfo *schedulernodeinfo.NodeInfo) (int64, *framework.Status) {
+	nodeInfo *framework.NodeInfo) (int64, *framework.Status) {
 	node := nodeInfo.Node()
 	if node == nil {
 		return 0, framework.NewStatus(framework.Error, "node not found")
@@ -62,13 +60,13 @@ func (r *resourceAllocationScorer) score(
 	var score int64
 
 	// Check if the pod has volumes and this could be added to scorer function for balanced resource allocation.
-	if len(pod.Spec.Volumes) >= 0 && utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes) && nodeInfo.TransientInfo != nil {
+	if len(pod.Spec.Volumes) > 0 && utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes) && nodeInfo.TransientInfo != nil {
 		score = r.scorer(requested, allocatable, true, nodeInfo.TransientInfo.TransNodeInfo.RequestedVolumes, nodeInfo.TransientInfo.TransNodeInfo.AllocatableVolumesCount)
 	} else {
 		score = r.scorer(requested, allocatable, false, 0, 0)
 	}
-	if klog.V(10) {
-		if len(pod.Spec.Volumes) >= 0 && utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes) && nodeInfo.TransientInfo != nil {
+	if klog.V(10).Enabled() {
+		if len(pod.Spec.Volumes) > 0 && utilfeature.DefaultFeatureGate.Enabled(features.BalanceAttachedNodeVolumes) && nodeInfo.TransientInfo != nil {
 			klog.Infof(
 				"%v -> %v: %v, map of allocatable resources %v, map of requested resources %v , allocatable volumes %d, requested volumes %d, score %d",
 				pod.Name, node.Name, r.Name,
@@ -90,24 +88,22 @@ func (r *resourceAllocationScorer) score(
 }
 
 // calculateResourceAllocatableRequest returns resources Allocatable and Requested values
-func calculateResourceAllocatableRequest(nodeInfo *schedulernodeinfo.NodeInfo, pod *v1.Pod, resource v1.ResourceName) (int64, int64) {
-	allocatable := nodeInfo.AllocatableResource()
-	requested := nodeInfo.RequestedResource()
+func calculateResourceAllocatableRequest(nodeInfo *framework.NodeInfo, pod *v1.Pod, resource v1.ResourceName) (int64, int64) {
 	podRequest := calculatePodResourceRequest(pod, resource)
 	switch resource {
 	case v1.ResourceCPU:
-		return allocatable.MilliCPU, (nodeInfo.NonZeroRequest().MilliCPU + podRequest)
+		return nodeInfo.Allocatable.MilliCPU, (nodeInfo.NonZeroRequested.MilliCPU + podRequest)
 	case v1.ResourceMemory:
-		return allocatable.Memory, (nodeInfo.NonZeroRequest().Memory + podRequest)
+		return nodeInfo.Allocatable.Memory, (nodeInfo.NonZeroRequested.Memory + podRequest)
 
 	case v1.ResourceEphemeralStorage:
-		return allocatable.EphemeralStorage, (requested.EphemeralStorage + podRequest)
+		return nodeInfo.Allocatable.EphemeralStorage, (nodeInfo.Requested.EphemeralStorage + podRequest)
 	default:
-		if v1helper.IsScalarResourceName(resource) {
-			return allocatable.ScalarResources[resource], (requested.ScalarResources[resource] + podRequest)
+		if schedutil.IsScalarResourceName(resource) {
+			return nodeInfo.Allocatable.ScalarResources[resource], (nodeInfo.Requested.ScalarResources[resource] + podRequest)
 		}
 	}
-	if klog.V(10) {
+	if klog.V(10).Enabled() {
 		klog.Infof("requested resource %v not considered for node score calculation",
 			resource,
 		)
@@ -117,12 +113,21 @@ func calculateResourceAllocatableRequest(nodeInfo *schedulernodeinfo.NodeInfo, p
 
 // calculatePodResourceRequest returns the total non-zero requests. If Overhead is defined for the pod and the
 // PodOverhead feature is enabled, the Overhead is added to the result.
+// podResourceRequest = max(sum(podSpec.Containers), podSpec.InitContainers) + overHead
 func calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 	var podRequest int64
 	for i := range pod.Spec.Containers {
 		container := &pod.Spec.Containers[i]
-		value := priorityutil.GetNonzeroRequestForResource(resource, &container.Resources.Requests)
+		value := schedutil.GetNonzeroRequestForResource(resource, &container.Resources.Requests)
 		podRequest += value
+	}
+
+	for i := range pod.Spec.InitContainers {
+		initContainer := &pod.Spec.InitContainers[i]
+		value := schedutil.GetNonzeroRequestForResource(resource, &initContainer.Resources.Requests)
+		if podRequest < value {
+			podRequest = value
+		}
 	}
 
 	// If Overhead is being utilized, add to the total requests for the pod
@@ -131,5 +136,6 @@ func calculatePodResourceRequest(pod *v1.Pod, resource v1.ResourceName) int64 {
 			podRequest += quantity.Value()
 		}
 	}
+
 	return podRequest
 }

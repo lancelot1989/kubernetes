@@ -57,12 +57,6 @@ type EndpointSlice struct {
 type AddressType string
 
 const (
-	// AddressTypeIP represents an IP Address.
-	// This address type has been deprecated and has been replaced by the IPv4
-	// and IPv6 adddress types. New resources with this address type will be
-	// considered invalid. This will be fully removed in 1.18.
-	// +deprecated
-	AddressTypeIP = AddressType("IP")
 	// AddressTypeIPv4 represents an IPv4 Address.
 	AddressTypeIPv4 = AddressType(api.IPv4Protocol)
 	// AddressTypeIPv6 represents an IPv6 Address.
@@ -105,8 +99,14 @@ type Endpoint struct {
 	//   endpoint is located. This should match the corresponding node label.
 	// * topology.kubernetes.io/region: the value indicates the region where the
 	//   endpoint is located. This should match the corresponding node label.
+	// This field is deprecated and will be removed in future api versions.
 	// +optional
 	Topology map[string]string
+	// nodeName represents the name of the Node hosting this endpoint. This can
+	// be used to determine endpoints local to a Node. This field can be enabled
+	// with the EndpointSliceNodeName feature gate.
+	// +optional
+	NodeName *string
 }
 
 // EndpointConditions represents the current condition of an endpoint.
@@ -114,8 +114,24 @@ type EndpointConditions struct {
 	// ready indicates that this endpoint is prepared to receive traffic,
 	// according to whatever system is managing the endpoint. A nil value
 	// indicates an unknown state. In most cases consumers should interpret this
-	// unknown state as ready.
+	// unknown state as ready. For compatibility reasons, ready should never be
+	// "true" for terminating endpoints.
 	Ready *bool
+
+	// serving is identical to ready except that it is set regardless of the
+	// terminating state of endpoints. This condition should be set to true for
+	// a ready endpoint that is terminating. If nil, consumers should defer to
+	// the ready condition. This field can be enabled with the
+	// EndpointSliceTerminatingCondition feature gate.
+	// +optional
+	Serving *bool
+
+	// terminating indicates that this endpoint is terminating. A nil value
+	// indicates an unknown state. Consumers should interpret this unknown state
+	// to mean that the endpoint is not terminating. This field can be enabled
+	// with the EndpointSliceTerminatingCondition feature gate.
+	// +optional
+	Terminating *bool
 }
 
 // EndpointPort represents a Port used by an EndpointSlice.
@@ -139,8 +155,8 @@ type EndpointPort struct {
 	// This field follows standard Kubernetes label syntax.
 	// Un-prefixed names are reserved for IANA standard service names (as per
 	// RFC-6335 and http://www.iana.org/assignments/service-names).
-	// Non-standard protocols should use prefixed names.
-	// Default is empty string.
+	// Non-standard protocols should use prefixed names such as
+	// mycompany.com/my-custom-protocol.
 	// +optional
 	AppProtocol *string
 }
@@ -154,6 +170,5 @@ type EndpointSliceList struct {
 	// +optional
 	metav1.ListMeta
 	// List of endpoint slices
-	// +listType=set
 	Items []EndpointSlice
 }

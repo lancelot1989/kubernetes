@@ -17,6 +17,7 @@ limitations under the License.
 package internalversion
 
 import (
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/kubernetes/pkg/apis/apiserverinternal"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	"k8s.io/kubernetes/pkg/apis/batch"
@@ -33,6 +35,7 @@ import (
 	"k8s.io/kubernetes/pkg/apis/coordination"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/apis/discovery"
+	"k8s.io/kubernetes/pkg/apis/flowcontrol"
 	"k8s.io/kubernetes/pkg/apis/networking"
 	nodeapi "k8s.io/kubernetes/pkg/apis/node"
 	"k8s.io/kubernetes/pkg/apis/policy"
@@ -133,6 +136,147 @@ func TestPrintEvent(t *testing.T) {
 			options: printers.GenerateOptions{Wide: true},
 			// Columns: Last Seen, Type, Reason, Object, Subobject, Message, First Seen, Count, Name
 			expected: []metav1.TableRow{{Cells: []interface{}{"2d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, Node1", "Message Data", "3d", int64(6), "event2"}}},
+		},
+		// Basic event, w/o FirstTimestamp set
+		{
+			event: api.Event{
+				Source: api.EventSource{
+					Component: "kubelet",
+					Host:      "Node1",
+				},
+				InvolvedObject: api.ObjectReference{
+					Kind:      "Deployment",
+					Name:      "Deployment Name",
+					FieldPath: "spec.containers{foo}",
+				},
+				Reason:        "Event Reason",
+				Message:       "Message Data",
+				EventTime:     metav1.MicroTime{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				LastTimestamp: metav1.Time{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				Count:         1,
+				Type:          api.EventTypeWarning,
+				ObjectMeta:    metav1.ObjectMeta{Name: "event3"},
+			},
+			options: printers.GenerateOptions{Wide: true},
+			// Columns: Last Seen, Type, Reason, Object, Subobject, Message, First Seen, Count, Name
+			expected: []metav1.TableRow{{Cells: []interface{}{"3d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, Node1", "Message Data", "3d", int64(1), "event3"}}},
+		},
+		// Basic event, w/o LastTimestamp set
+		{
+			event: api.Event{
+				Source: api.EventSource{
+					Component: "kubelet",
+					Host:      "Node1",
+				},
+				InvolvedObject: api.ObjectReference{
+					Kind:      "Deployment",
+					Name:      "Deployment Name",
+					FieldPath: "spec.containers{foo}",
+				},
+				Reason:         "Event Reason",
+				Message:        "Message Data",
+				EventTime:      metav1.MicroTime{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				FirstTimestamp: metav1.Time{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				Count:          1,
+				Type:           api.EventTypeWarning,
+				ObjectMeta:     metav1.ObjectMeta{Name: "event4"},
+			},
+			options: printers.GenerateOptions{Wide: true},
+			// Columns: Last Seen, Type, Reason, Object, Subobject, Message, First Seen, Count, Name
+			expected: []metav1.TableRow{{Cells: []interface{}{"3d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, Node1", "Message Data", "3d", int64(1), "event4"}}},
+		},
+		// Basic event, w/o FirstTimestamp and LastTimestamp set
+		{
+			event: api.Event{
+				Source: api.EventSource{
+					Component: "kubelet",
+					Host:      "Node1",
+				},
+				InvolvedObject: api.ObjectReference{
+					Kind:      "Deployment",
+					Name:      "Deployment Name",
+					FieldPath: "spec.containers{foo}",
+				},
+				Reason:     "Event Reason",
+				Message:    "Message Data",
+				EventTime:  metav1.MicroTime{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				Count:      1,
+				Type:       api.EventTypeWarning,
+				ObjectMeta: metav1.ObjectMeta{Name: "event5"},
+			},
+			options: printers.GenerateOptions{Wide: true},
+			// Columns: Last Seen, Type, Reason, Object, Subobject, Message, First Seen, Count, Name
+			expected: []metav1.TableRow{{Cells: []interface{}{"3d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, Node1", "Message Data", "3d", int64(1), "event5"}}},
+		},
+		// Basic event serie, w/o FirstTimestamp, LastTimestamp and Count set
+		{
+			event: api.Event{
+				Source: api.EventSource{
+					Component: "kubelet",
+					Host:      "Node1",
+				},
+				InvolvedObject: api.ObjectReference{
+					Kind:      "Deployment",
+					Name:      "Deployment Name",
+					FieldPath: "spec.containers{foo}",
+				},
+				Series: &api.EventSeries{
+					Count:            1,
+					LastObservedTime: metav1.MicroTime{Time: time.Now().UTC().AddDate(0, 0, -2)},
+				},
+				Reason:     "Event Reason",
+				Message:    "Message Data",
+				EventTime:  metav1.MicroTime{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				Type:       api.EventTypeWarning,
+				ObjectMeta: metav1.ObjectMeta{Name: "event6"},
+			},
+			options: printers.GenerateOptions{Wide: true},
+			// Columns: Last Seen, Type, Reason, Object, Subobject, Message, First Seen, Count, Name
+			expected: []metav1.TableRow{{Cells: []interface{}{"2d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, Node1", "Message Data", "3d", int64(2), "event6"}}},
+		},
+		// Singleton event, w/o FirstTimestamp, LastTimestamp and Count set
+		{
+			event: api.Event{
+				Source: api.EventSource{
+					Component: "kubelet",
+					Host:      "Node1",
+				},
+				InvolvedObject: api.ObjectReference{
+					Kind:      "Deployment",
+					Name:      "Deployment Name",
+					FieldPath: "spec.containers{foo}",
+				},
+				Reason:     "Event Reason",
+				Message:    "Message Data",
+				EventTime:  metav1.MicroTime{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				Type:       api.EventTypeWarning,
+				ObjectMeta: metav1.ObjectMeta{Name: "event7"},
+			},
+			options: printers.GenerateOptions{Wide: true},
+			// Columns: Last Seen, Type, Reason, Object, Subobject, Message, First Seen, Count, Name
+			expected: []metav1.TableRow{{Cells: []interface{}{"3d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, Node1", "Message Data", "3d", int64(1), "event7"}}},
+		},
+		// Basic event, with empty Source; generate options=Wide
+		{
+			event: api.Event{
+				ReportingController: "kubelet",
+				ReportingInstance:   "test",
+				InvolvedObject: api.ObjectReference{
+					Kind:      "Deployment",
+					Name:      "Deployment Name",
+					FieldPath: "spec.containers{foo}",
+				},
+				Reason:         "Event Reason",
+				Message:        "Message Data",
+				FirstTimestamp: metav1.Time{Time: time.Now().UTC().AddDate(0, 0, -3)},
+				LastTimestamp:  metav1.Time{Time: time.Now().UTC().AddDate(0, 0, -2)},
+				Count:          6,
+				Type:           api.EventTypeWarning,
+				ObjectMeta:     metav1.ObjectMeta{Name: "event2"},
+			},
+			options: printers.GenerateOptions{Wide: true},
+			// Columns: Last Seen, Type, Reason, Object, Subobject, Source, Message, First Seen, Count, Name
+			expected: []metav1.TableRow{{Cells: []interface{}{"2d", "Warning", "Event Reason", "deployment/Deployment Name", "spec.containers{foo}", "kubelet, test", "Message Data", "3d", int64(6), "event2"}}},
 		},
 	}
 
@@ -819,9 +963,15 @@ func TestPrintIngress(t *testing.T) {
 			CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
 		},
 		Spec: networking.IngressSpec{
-			Backend: &networking.IngressBackend{
-				ServiceName: "svc",
-				ServicePort: intstr.FromInt(93),
+			IngressClassName: utilpointer.StringPtr("foo"),
+			DefaultBackend: &networking.IngressBackend{
+				Service: &networking.IngressServiceBackend{
+					Name: "default-backend",
+					Port: networking.ServiceBackendPort{
+						Name:   "default-backend",
+						Number: 80,
+					},
+				},
 			},
 		},
 		Status: networking.IngressStatus{
@@ -836,7 +986,7 @@ func TestPrintIngress(t *testing.T) {
 		},
 	}
 	// Columns: Name, Hosts, Address, Ports, Age
-	expected := []metav1.TableRow{{Cells: []interface{}{"test1", "*", "2.3.4.5", "80", "10y"}}}
+	expected := []metav1.TableRow{{Cells: []interface{}{"test1", "foo", "*", "2.3.4.5", "80", "10y"}}}
 
 	rows, err := printIngress(&ingress, printers.GenerateOptions{})
 	if err != nil {
@@ -845,6 +995,71 @@ func TestPrintIngress(t *testing.T) {
 	rows[0].Object.Object = nil
 	if !reflect.DeepEqual(expected, rows) {
 		t.Errorf("mismatch: %s", diff.ObjectReflectDiff(expected, rows))
+	}
+}
+
+func TestPrintIngressClass(t *testing.T) {
+	testCases := []struct {
+		name         string
+		ingressClass *networking.IngressClass
+		expected     []metav1.TableRow
+	}{{
+		name: "example with params",
+		ingressClass: &networking.IngressClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test1",
+				CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
+			},
+			Spec: networking.IngressClassSpec{
+				Controller: "example.com/controller",
+				Parameters: &api.TypedLocalObjectReference{Kind: "customgroup", Name: "example"},
+			},
+		},
+		expected: []metav1.TableRow{{Cells: []interface{}{"test1", "example.com/controller", "customgroup/example", "10y"}}},
+	}, {
+		name: "example with params + API Group",
+		ingressClass: &networking.IngressClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test1",
+				CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-10, 0, 0)},
+			},
+			Spec: networking.IngressClassSpec{
+				Controller: "example.com/controller",
+				Parameters: &api.TypedLocalObjectReference{
+					APIGroup: utilpointer.StringPtr("example.com"),
+					Kind:     "customgroup",
+					Name:     "example",
+				},
+			},
+		},
+		expected: []metav1.TableRow{{Cells: []interface{}{"test1", "example.com/controller", "customgroup.example.com/example", "10y"}}},
+	}, {
+		name: "example without params",
+		ingressClass: &networking.IngressClass{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test2",
+				CreationTimestamp: metav1.Time{Time: time.Now().AddDate(-11, 0, 0)},
+			},
+			Spec: networking.IngressClassSpec{
+				Controller: "example.com/controller2",
+			},
+		},
+		expected: []metav1.TableRow{{Cells: []interface{}{"test2", "example.com/controller2", "<none>", "11y"}}},
+	}}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			rows, err := printIngressClass(testCase.ingressClass, printers.GenerateOptions{})
+			if err != nil {
+				t.Fatalf("Error generating table rows for Ingress: %#v", err)
+			}
+			for i := range rows {
+				rows[i].Object.Object = nil
+			}
+			if !reflect.DeepEqual(testCase.expected, rows) {
+				t.Errorf("mismatch: %s", diff.ObjectReflectDiff(testCase.expected, rows))
+			}
+		})
 	}
 }
 
@@ -859,9 +1074,9 @@ func TestPrintServiceLoadBalancer(t *testing.T) {
 			service: api.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "service1"},
 				Spec: api.ServiceSpec{
-					ClusterIP: "1.2.3.4",
-					Type:      "LoadBalancer",
-					Ports:     []api.ServicePort{{Port: 80, Protocol: "TCP"}},
+					ClusterIPs: []string{"1.2.3.4"},
+					Type:       "LoadBalancer",
+					Ports:      []api.ServicePort{{Port: 80, Protocol: "TCP"}},
 				},
 				Status: api.ServiceStatus{
 					LoadBalancer: api.LoadBalancerStatus{
@@ -877,9 +1092,9 @@ func TestPrintServiceLoadBalancer(t *testing.T) {
 			service: api.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "service2"},
 				Spec: api.ServiceSpec{
-					ClusterIP: "1.3.4.5",
-					Type:      "LoadBalancer",
-					Ports:     []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}, {Port: 7777, Protocol: "SCTP"}},
+					ClusterIPs: []string{"1.3.4.5"},
+					Type:       "LoadBalancer",
+					Ports:      []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}, {Port: 7777, Protocol: "SCTP"}},
 				},
 			},
 			options: printers.GenerateOptions{},
@@ -891,9 +1106,9 @@ func TestPrintServiceLoadBalancer(t *testing.T) {
 			service: api.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "service3"},
 				Spec: api.ServiceSpec{
-					ClusterIP: "1.4.5.6",
-					Type:      "LoadBalancer",
-					Ports:     []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}},
+					ClusterIPs: []string{"1.4.5.6"},
+					Type:       "LoadBalancer",
+					Ports:      []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}},
 				},
 				Status: api.ServiceStatus{
 					LoadBalancer: api.LoadBalancerStatus{
@@ -909,9 +1124,9 @@ func TestPrintServiceLoadBalancer(t *testing.T) {
 			service: api.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "service4"},
 				Spec: api.ServiceSpec{
-					ClusterIP: "1.5.6.7",
-					Type:      "LoadBalancer",
-					Ports:     []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}},
+					ClusterIPs: []string{"1.5.6.7"},
+					Type:       "LoadBalancer",
+					Ports:      []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}},
 				},
 				Status: api.ServiceStatus{
 					LoadBalancer: api.LoadBalancerStatus{
@@ -927,10 +1142,10 @@ func TestPrintServiceLoadBalancer(t *testing.T) {
 			service: api.Service{
 				ObjectMeta: metav1.ObjectMeta{Name: "service4"},
 				Spec: api.ServiceSpec{
-					ClusterIP: "1.5.6.7",
-					Type:      "LoadBalancer",
-					Ports:     []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}},
-					Selector:  map[string]string{"foo": "bar"},
+					ClusterIPs: []string{"1.5.6.7"},
+					Type:       "LoadBalancer",
+					Ports:      []api.ServicePort{{Port: 80, Protocol: "TCP"}, {Port: 8090, Protocol: "UDP"}, {Port: 8000, Protocol: "TCP"}},
+					Selector:   map[string]string{"foo": "bar"},
 				},
 				Status: api.ServiceStatus{
 					LoadBalancer: api.LoadBalancerStatus{
@@ -1039,7 +1254,7 @@ func TestPrintPod(t *testing.T) {
 			[]metav1.TableRow{{Cells: []interface{}{"test5", "1/2", "podReason", int64(6), "<unknown>"}}},
 		},
 		{
-			// Test pod has 2 containers, one is running and the other is completed.
+			// Test pod has 2 containers, one is running and the other is completed, w/o ready condition
 			api.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "test6"},
 				Spec:       api.PodSpec{Containers: make([]api.Container, 2)},
@@ -1049,6 +1264,25 @@ func TestPrintPod(t *testing.T) {
 					ContainerStatuses: []api.ContainerStatus{
 						{Ready: true, RestartCount: 3, State: api.ContainerState{Terminated: &api.ContainerStateTerminated{Reason: "Completed", ExitCode: 0}}},
 						{Ready: true, RestartCount: 3, State: api.ContainerState{Running: &api.ContainerStateRunning{}}},
+					},
+				},
+			},
+			[]metav1.TableRow{{Cells: []interface{}{"test6", "1/2", "NotReady", int64(6), "<unknown>"}}},
+		},
+		{
+			// Test pod has 2 containers, one is running and the other is completed, with ready condition
+			api.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "test6"},
+				Spec:       api.PodSpec{Containers: make([]api.Container, 2)},
+				Status: api.PodStatus{
+					Phase:  "Running",
+					Reason: "",
+					ContainerStatuses: []api.ContainerStatus{
+						{Ready: true, RestartCount: 3, State: api.ContainerState{Terminated: &api.ContainerStateTerminated{Reason: "Completed", ExitCode: 0}}},
+						{Ready: true, RestartCount: 3, State: api.ContainerState{Running: &api.ContainerStateRunning{}}},
+					},
+					Conditions: []api.PodCondition{
+						{Type: api.PodReady, Status: api.ConditionTrue, LastProbeTime: metav1.Time{Time: time.Now()}},
 					},
 				},
 			},
@@ -2579,6 +2813,161 @@ func TestPrintHPA(t *testing.T) {
 			// Columns: Name, Reference, Targets, MinPods, MaxPods, Replicas, Age
 			expected: []metav1.TableRow{{Cells: []interface{}{"some-hpa", "ReplicationController/some-rc", "50%/80%", "2", int64(10), int64(4), "<unknown>"}}},
 		},
+		// container resource source type, targetVal (no current)
+		{
+			hpa: autoscaling.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: "some-hpa"},
+				Spec: autoscaling.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscaling.CrossVersionObjectReference{
+						Name: "some-rc",
+						Kind: "ReplicationController",
+					},
+					MinReplicas: &minReplicasVal,
+					MaxReplicas: 10,
+					Metrics: []autoscaling.MetricSpec{
+						{
+							Type: autoscaling.ContainerResourceMetricSourceType,
+							ContainerResource: &autoscaling.ContainerResourceMetricSource{
+								Name:      api.ResourceCPU,
+								Container: "application",
+								Target: autoscaling.MetricTarget{
+									Type:         autoscaling.AverageValueMetricType,
+									AverageValue: resource.NewMilliQuantity(100, resource.DecimalSI),
+								},
+							},
+						},
+					},
+				},
+				Status: autoscaling.HorizontalPodAutoscalerStatus{
+					CurrentReplicas: 4,
+					DesiredReplicas: 5,
+				},
+			},
+			// Columns: Name, Reference, Targets, MinPods, MaxPods, Replicas, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"some-hpa", "ReplicationController/some-rc", "<unknown>/100m", "2", int64(10), int64(4), "<unknown>"}}},
+		},
+		// container resource source type, targetVal
+		{
+			hpa: autoscaling.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: "some-hpa"},
+				Spec: autoscaling.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscaling.CrossVersionObjectReference{
+						Name: "some-rc",
+						Kind: "ReplicationController",
+					},
+					MinReplicas: &minReplicasVal,
+					MaxReplicas: 10,
+					Metrics: []autoscaling.MetricSpec{
+						{
+							Type: autoscaling.ContainerResourceMetricSourceType,
+							ContainerResource: &autoscaling.ContainerResourceMetricSource{
+								Name: api.ResourceCPU,
+								Target: autoscaling.MetricTarget{
+									Type:         autoscaling.AverageValueMetricType,
+									AverageValue: resource.NewMilliQuantity(100, resource.DecimalSI),
+								},
+							},
+						},
+					},
+				},
+				Status: autoscaling.HorizontalPodAutoscalerStatus{
+					CurrentReplicas: 4,
+					DesiredReplicas: 5,
+					CurrentMetrics: []autoscaling.MetricStatus{
+						{
+							Type: autoscaling.ContainerResourceMetricSourceType,
+							ContainerResource: &autoscaling.ContainerResourceMetricStatus{
+								Name:      api.ResourceCPU,
+								Container: "application",
+								Current: autoscaling.MetricValueStatus{
+									AverageValue: resource.NewMilliQuantity(50, resource.DecimalSI),
+								},
+							},
+						},
+					},
+				},
+			},
+			// Columns: Name, Reference, Targets, MinPods, MaxPods, Replicas, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"some-hpa", "ReplicationController/some-rc", "50m/100m", "2", int64(10), int64(4), "<unknown>"}}},
+		},
+		// container resource source type, targetUtil (no current)
+		{
+			hpa: autoscaling.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: "some-hpa"},
+				Spec: autoscaling.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscaling.CrossVersionObjectReference{
+						Name: "some-rc",
+						Kind: "ReplicationController",
+					},
+					MinReplicas: &minReplicasVal,
+					MaxReplicas: 10,
+					Metrics: []autoscaling.MetricSpec{
+						{
+							Type: autoscaling.ContainerResourceMetricSourceType,
+							ContainerResource: &autoscaling.ContainerResourceMetricSource{
+								Name:      api.ResourceCPU,
+								Container: "application",
+								Target: autoscaling.MetricTarget{
+									Type:               autoscaling.UtilizationMetricType,
+									AverageUtilization: &targetUtilizationVal,
+								},
+							},
+						},
+					},
+				},
+				Status: autoscaling.HorizontalPodAutoscalerStatus{
+					CurrentReplicas: 4,
+					DesiredReplicas: 5,
+				},
+			},
+			// Columns: Name, Reference, Targets, MinPods, MaxPods, Replicas, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"some-hpa", "ReplicationController/some-rc", "<unknown>/80%", "2", int64(10), int64(4), "<unknown>"}}},
+		},
+		// container resource source type, targetUtil
+		{
+			hpa: autoscaling.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: "some-hpa"},
+				Spec: autoscaling.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscaling.CrossVersionObjectReference{
+						Name: "some-rc",
+						Kind: "ReplicationController",
+					},
+					MinReplicas: &minReplicasVal,
+					MaxReplicas: 10,
+					Metrics: []autoscaling.MetricSpec{
+						{
+							Type: autoscaling.ContainerResourceMetricSourceType,
+							ContainerResource: &autoscaling.ContainerResourceMetricSource{
+								Name: api.ResourceCPU,
+								Target: autoscaling.MetricTarget{
+									Type:               autoscaling.UtilizationMetricType,
+									AverageUtilization: &targetUtilizationVal,
+								},
+							},
+						},
+					},
+				},
+				Status: autoscaling.HorizontalPodAutoscalerStatus{
+					CurrentReplicas: 4,
+					DesiredReplicas: 5,
+					CurrentMetrics: []autoscaling.MetricStatus{
+						{
+							Type: autoscaling.ContainerResourceMetricSourceType,
+							ContainerResource: &autoscaling.ContainerResourceMetricStatus{
+								Name:      api.ResourceCPU,
+								Container: "application",
+								Current: autoscaling.MetricValueStatus{
+									AverageUtilization: &currentUtilizationVal,
+									AverageValue:       resource.NewMilliQuantity(40, resource.DecimalSI),
+								},
+							},
+						},
+					},
+				},
+			},
+			// Columns: Name, Reference, Targets, MinPods, MaxPods, Replicas, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"some-hpa", "ReplicationController/some-rc", "50%/80%", "2", int64(10), int64(4), "<unknown>"}}},
+		},
 		// multiple specs
 		{
 			hpa: autoscaling.HorizontalPodAutoscaler{
@@ -2694,8 +3083,8 @@ func TestPrintService(t *testing.T) {
 							Port:     2233,
 						},
 					},
-					ClusterIP: "10.9.8.7",
-					Selector:  map[string]string{"foo": "bar"}, // Does NOT get printed.
+					ClusterIPs: []string{"10.9.8.7"},
+					Selector:   map[string]string{"foo": "bar"}, // Does NOT get printed.
 				},
 			},
 			options: printers.GenerateOptions{},
@@ -2714,8 +3103,8 @@ func TestPrintService(t *testing.T) {
 							Port:     2233,
 						},
 					},
-					ClusterIP: "10.9.8.7",
-					Selector:  map[string]string{"foo": "bar"},
+					ClusterIPs: []string{"10.9.8.7"},
+					Selector:   map[string]string{"foo": "bar"},
 				},
 			},
 			options: printers.GenerateOptions{Wide: true},
@@ -2735,7 +3124,7 @@ func TestPrintService(t *testing.T) {
 							NodePort: 9999,
 						},
 					},
-					ClusterIP: "10.9.8.7",
+					ClusterIPs: []string{"10.9.8.7"},
 				},
 			},
 			options: printers.GenerateOptions{},
@@ -2754,7 +3143,7 @@ func TestPrintService(t *testing.T) {
 							Port:     8888,
 						},
 					},
-					ClusterIP: "10.9.8.7",
+					ClusterIPs: []string{"10.9.8.7"},
 				},
 			},
 			options: printers.GenerateOptions{},
@@ -2773,7 +3162,7 @@ func TestPrintService(t *testing.T) {
 							Port:     8888,
 						},
 					},
-					ClusterIP:   "10.9.8.7",
+					ClusterIPs:  []string{"10.9.8.7"},
 					ExternalIPs: singleExternalIP,
 				},
 			},
@@ -2793,7 +3182,7 @@ func TestPrintService(t *testing.T) {
 							Port:     8888,
 						},
 					},
-					ClusterIP:   "10.9.8.7",
+					ClusterIPs:  []string{"10.9.8.7"},
 					ExternalIPs: singleExternalIP,
 				},
 				Status: api.ServiceStatus{
@@ -2823,7 +3212,7 @@ func TestPrintService(t *testing.T) {
 							Port:     8888,
 						},
 					},
-					ClusterIP:   "10.9.8.7",
+					ClusterIPs:  []string{"10.9.8.7"},
 					ExternalIPs: mulExternalIP,
 				},
 				Status: api.ServiceStatus{
@@ -2887,7 +3276,7 @@ func TestPrintServiceList(t *testing.T) {
 							Port:     2233,
 						},
 					},
-					ClusterIP: "10.9.8.7",
+					ClusterIPs: []string{"10.9.8.7"},
 				},
 			},
 			{
@@ -2900,7 +3289,7 @@ func TestPrintServiceList(t *testing.T) {
 							Port:     5566,
 						},
 					},
-					ClusterIP: "1.2.3.4",
+					ClusterIPs: []string{"1.2.3.4"},
 				},
 			},
 		},
@@ -3392,7 +3781,7 @@ func TestPrintCertificateSigningRequest(t *testing.T) {
 				Status: certificates.CertificateSigningRequestStatus{},
 			},
 			// Columns: Name, Age, Requestor, Condition
-			expected: []metav1.TableRow{{Cells: []interface{}{"csr1", "0s", "", "Pending"}}},
+			expected: []metav1.TableRow{{Cells: []interface{}{"csr1", "0s", "<none>", "", "Pending"}}},
 		},
 		// Basic CSR with Spec and Status=Approved.
 		{
@@ -3413,7 +3802,29 @@ func TestPrintCertificateSigningRequest(t *testing.T) {
 				},
 			},
 			// Columns: Name, Age, Requestor, Condition
-			expected: []metav1.TableRow{{Cells: []interface{}{"csr2", "0s", "CSR Requestor", "Approved"}}},
+			expected: []metav1.TableRow{{Cells: []interface{}{"csr2", "0s", "<none>", "CSR Requestor", "Approved"}}},
+		},
+		// Basic CSR with Spec and SignerName set
+		{
+			csr: certificates.CertificateSigningRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "csr2",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: certificates.CertificateSigningRequestSpec{
+					Username:   "CSR Requestor",
+					SignerName: "example.com/test-signer",
+				},
+				Status: certificates.CertificateSigningRequestStatus{
+					Conditions: []certificates.CertificateSigningRequestCondition{
+						{
+							Type: certificates.CertificateApproved,
+						},
+					},
+				},
+			},
+			// Columns: Name, Age, Requestor, Condition
+			expected: []metav1.TableRow{{Cells: []interface{}{"csr2", "0s", "example.com/test-signer", "CSR Requestor", "Approved"}}},
 		},
 		// Basic CSR with Spec and Status=Approved; certificate issued.
 		{
@@ -3435,7 +3846,7 @@ func TestPrintCertificateSigningRequest(t *testing.T) {
 				},
 			},
 			// Columns: Name, Age, Requestor, Condition
-			expected: []metav1.TableRow{{Cells: []interface{}{"csr2", "0s", "CSR Requestor", "Approved,Issued"}}},
+			expected: []metav1.TableRow{{Cells: []interface{}{"csr2", "0s", "<none>", "CSR Requestor", "Approved,Issued"}}},
 		},
 		// Basic CSR with Spec and Status=Denied.
 		{
@@ -3456,7 +3867,7 @@ func TestPrintCertificateSigningRequest(t *testing.T) {
 				},
 			},
 			// Columns: Name, Age, Requestor, Condition
-			expected: []metav1.TableRow{{Cells: []interface{}{"csr3", "0s", "CSR Requestor", "Denied"}}},
+			expected: []metav1.TableRow{{Cells: []interface{}{"csr3", "0s", "<none>", "CSR Requestor", "Denied"}}},
 		},
 	}
 
@@ -4820,6 +5231,353 @@ func TestPrintEndpointSlice(t *testing.T) {
 
 	for i, test := range tests {
 		rows, err := printEndpointSlice(&test.endpointSlice, printers.GenerateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range rows {
+			rows[i].Object.Object = nil
+		}
+		if !reflect.DeepEqual(test.expected, rows) {
+			t.Errorf("%d mismatch: %s", i, diff.ObjectReflectDiff(test.expected, rows))
+		}
+	}
+}
+
+func TestPrintFlowSchema(t *testing.T) {
+	all := []string{"*"}
+
+	tests := []struct {
+		fs       flowcontrol.FlowSchema
+		expected []metav1.TableRow
+	}{
+		{
+			fs: flowcontrol.FlowSchema{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "all-matcher",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: flowcontrol.FlowSchemaSpec{
+					PriorityLevelConfiguration: flowcontrol.PriorityLevelConfigurationReference{Name: "allee"},
+					MatchingPrecedence:         math.MaxInt32,
+					DistinguisherMethod:        &flowcontrol.FlowDistinguisherMethod{Type: flowcontrol.FlowDistinguisherMethodByUserType},
+					Rules: []flowcontrol.PolicyRulesWithSubjects{{
+						Subjects: []flowcontrol.Subject{{
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:authenticated"},
+						}},
+						ResourceRules: []flowcontrol.ResourcePolicyRule{{
+							Verbs:        all,
+							APIGroups:    all,
+							Resources:    all,
+							ClusterScope: true,
+							Namespaces:   all,
+						}},
+					}, {
+						Subjects: []flowcontrol.Subject{{
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:unauthenticated"},
+						}},
+						ResourceRules: []flowcontrol.ResourcePolicyRule{{
+							Verbs:        all,
+							APIGroups:    all,
+							Resources:    all,
+							ClusterScope: true,
+							Namespaces:   all,
+						}},
+					}, {
+						Subjects: []flowcontrol.Subject{{
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:authenticated"},
+						}, {
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:unauthenticated"},
+						}},
+						NonResourceRules: []flowcontrol.NonResourcePolicyRule{{
+							Verbs:           all,
+							NonResourceURLs: all,
+						}},
+					}},
+				},
+			},
+			// Columns: Name, PriorityLevelName, MatchingPrecedence, DistinguisherMethod, Age, MissingPL
+			expected: []metav1.TableRow{{Cells: []interface{}{"all-matcher", "allee", int32(math.MaxInt32), "ByUser", "0s", "?"}}},
+		}, {
+			fs: flowcontrol.FlowSchema{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "some-matcher",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(-3e11)},
+				},
+				Spec: flowcontrol.FlowSchemaSpec{
+					PriorityLevelConfiguration: flowcontrol.PriorityLevelConfigurationReference{Name: "allee"},
+					MatchingPrecedence:         0,
+					DistinguisherMethod:        &flowcontrol.FlowDistinguisherMethod{Type: flowcontrol.FlowDistinguisherMethodByNamespaceType},
+					Rules: []flowcontrol.PolicyRulesWithSubjects{{
+						Subjects: []flowcontrol.Subject{{
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:unauthenticated"},
+						}},
+						ResourceRules: []flowcontrol.ResourcePolicyRule{{
+							Verbs:        all,
+							APIGroups:    all,
+							Resources:    all,
+							ClusterScope: true,
+							Namespaces:   all,
+						}},
+					}, {
+						Subjects: []flowcontrol.Subject{{
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:authenticated"},
+						}, {
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:unauthenticated"},
+						}},
+						NonResourceRules: []flowcontrol.NonResourcePolicyRule{{
+							Verbs:           all,
+							NonResourceURLs: all,
+						}},
+					}},
+				},
+				Status: flowcontrol.FlowSchemaStatus{
+					Conditions: []flowcontrol.FlowSchemaCondition{{
+						Type:               flowcontrol.FlowSchemaConditionDangling,
+						Status:             "True",
+						LastTransitionTime: metav1.Time{Time: time.Now().Add(-time.Hour)},
+					}},
+				},
+			},
+			// Columns: Name, PriorityLevelName, MatchingPrecedence, DistinguisherMethod, Age, MissingPL
+			expected: []metav1.TableRow{{Cells: []interface{}{"some-matcher", "allee", int32(0), "ByNamespace", "5m", "True"}}},
+		}, {
+			fs: flowcontrol.FlowSchema{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "exempt",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(-3e11)},
+				},
+				Spec: flowcontrol.FlowSchemaSpec{
+					PriorityLevelConfiguration: flowcontrol.PriorityLevelConfigurationReference{Name: "allee"},
+					MatchingPrecedence:         0,
+					DistinguisherMethod:        nil,
+					Rules: []flowcontrol.PolicyRulesWithSubjects{{
+						Subjects: []flowcontrol.Subject{{
+							Kind:  flowcontrol.SubjectKindGroup,
+							Group: &flowcontrol.GroupSubject{Name: "system:masters"},
+						}},
+						ResourceRules: []flowcontrol.ResourcePolicyRule{{
+							Verbs:        all,
+							APIGroups:    all,
+							Resources:    all,
+							ClusterScope: true,
+							Namespaces:   all,
+						}},
+					}},
+				},
+			},
+			// Columns: Name, PriorityLevelName, MatchingPrecedence, DistinguisherMethod, Age, MissingPL
+			expected: []metav1.TableRow{{Cells: []interface{}{"exempt", "allee", int32(0), "<none>", "5m", "?"}}},
+		},
+	}
+
+	for i, test := range tests {
+		rows, err := printFlowSchema(&test.fs, printers.GenerateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range rows {
+			rows[i].Object.Object = nil
+		}
+		if !reflect.DeepEqual(test.expected, rows) {
+			t.Errorf("%d mismatch: %s", i, diff.ObjectReflectDiff(test.expected, rows))
+		}
+	}
+}
+
+func TestPrintPriorityLevelConfiguration(t *testing.T) {
+	tests := []struct {
+		pl       flowcontrol.PriorityLevelConfiguration
+		expected []metav1.TableRow
+	}{
+		{
+			pl: flowcontrol.PriorityLevelConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "unlimited",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: flowcontrol.PriorityLevelConfigurationSpec{
+					Type: flowcontrol.PriorityLevelEnablementExempt,
+				},
+			},
+			// Columns: Name, Type, AssuredConcurrencyShares, Queues, HandSize, QueueLengthLimit, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"unlimited", "Exempt", "<none>", "<none>", "<none>", "<none>", "0s"}}},
+		},
+		{
+			pl: flowcontrol.PriorityLevelConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "unqueued",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: flowcontrol.PriorityLevelConfigurationSpec{
+					Type: flowcontrol.PriorityLevelEnablementLimited,
+					Limited: &flowcontrol.LimitedPriorityLevelConfiguration{
+						AssuredConcurrencyShares: 47,
+						LimitResponse: flowcontrol.LimitResponse{
+							Type: flowcontrol.LimitResponseTypeReject,
+						},
+					},
+				},
+			},
+			// Columns: Name, Type, AssuredConcurrencyShares, Queues, HandSize, QueueLengthLimit, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"unqueued", "Limited", int32(47), "<none>", "<none>", "<none>", "0s"}}},
+		},
+		{
+			pl: flowcontrol.PriorityLevelConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "queued",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Spec: flowcontrol.PriorityLevelConfigurationSpec{
+					Type: flowcontrol.PriorityLevelEnablementLimited,
+					Limited: &flowcontrol.LimitedPriorityLevelConfiguration{
+						AssuredConcurrencyShares: 42,
+						LimitResponse: flowcontrol.LimitResponse{
+							Type: flowcontrol.LimitResponseTypeQueue,
+							Queuing: &flowcontrol.QueuingConfiguration{
+								Queues:           8,
+								HandSize:         3,
+								QueueLengthLimit: 4,
+							},
+						},
+					},
+				},
+			},
+			// Columns: Name, Type, AssuredConcurrencyShares, Queues, HandSize, QueueLengthLimit, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"queued", "Limited", int32(42), int32(8), int32(3), int32(4), "0s"}}},
+		},
+	}
+
+	for i, test := range tests {
+		rows, err := printPriorityLevelConfiguration(&test.pl, printers.GenerateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range rows {
+			rows[i].Object.Object = nil
+		}
+		if !reflect.DeepEqual(test.expected, rows) {
+			t.Errorf("%d mismatch: %s", i, diff.ObjectReflectDiff(test.expected, rows))
+		}
+	}
+}
+
+func TestPrintStorageVersion(t *testing.T) {
+	commonEncodingVersion := "v1"
+	tests := []struct {
+		sv       apiserverinternal.StorageVersion
+		expected []metav1.TableRow
+	}{
+		{
+			sv: apiserverinternal.StorageVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "empty",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Status: apiserverinternal.StorageVersionStatus{},
+			},
+			// Columns: Name, CommonEncodingVersion, StorageVersions, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"empty", "<unset>", "<unset>", "0s"}}},
+		},
+		{
+			sv: apiserverinternal.StorageVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "valid",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Status: apiserverinternal.StorageVersionStatus{
+					StorageVersions: []apiserverinternal.ServerStorageVersion{
+						{
+							APIServerID:       "1",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1"},
+						},
+						{
+							APIServerID:       "2",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1", "v2"},
+						},
+					},
+					CommonEncodingVersion: &commonEncodingVersion,
+				},
+			},
+			// Columns: Name, CommonEncodingVersion, StorageVersions, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"valid", "v1", "1=v1,2=v1", "0s"}}},
+		},
+		{
+			sv: apiserverinternal.StorageVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "disagree",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Status: apiserverinternal.StorageVersionStatus{
+					StorageVersions: []apiserverinternal.ServerStorageVersion{
+						{
+							APIServerID:       "1",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1"},
+						},
+						{
+							APIServerID:       "2",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1", "v2"},
+						},
+						{
+							APIServerID:       "3",
+							EncodingVersion:   "v2",
+							DecodableVersions: []string{"v2"},
+						},
+					},
+				},
+			},
+			// Columns: Name, CommonEncodingVersion, StorageVersions, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"disagree", "<unset>", "1=v1,2=v1,3=v2", "0s"}}},
+		},
+		{
+			sv: apiserverinternal.StorageVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "agreeWithMore",
+					CreationTimestamp: metav1.Time{Time: time.Now().Add(1.9e9)},
+				},
+				Status: apiserverinternal.StorageVersionStatus{
+					StorageVersions: []apiserverinternal.ServerStorageVersion{
+						{
+							APIServerID:       "1",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1"},
+						},
+						{
+							APIServerID:       "2",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1", "v2"},
+						},
+						{
+							APIServerID:       "3",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1", "v2"},
+						},
+						{
+							APIServerID:       "4",
+							EncodingVersion:   "v1",
+							DecodableVersions: []string{"v1", "v2", "v3alpha1"},
+						},
+					},
+					CommonEncodingVersion: &commonEncodingVersion,
+				},
+			},
+			// Columns: Name, CommonEncodingVersion, StorageVersions, Age
+			expected: []metav1.TableRow{{Cells: []interface{}{"agreeWithMore", "v1", "1=v1,2=v1,3=v1 + 1 more...", "0s"}}},
+		},
+	}
+
+	for i, test := range tests {
+		rows, err := printStorageVersion(&test.sv, printers.GenerateOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}

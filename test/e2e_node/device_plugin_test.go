@@ -17,6 +17,7 @@ limitations under the License.
 package e2enode
 
 import (
+	"context"
 	"path/filepath"
 	"time"
 
@@ -24,16 +25,17 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/kubernetes/test/e2e/framework/testfiles"
+	e2etestfiles "k8s.io/kubernetes/test/e2e/framework/testfiles"
 
 	"regexp"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	kubeletpodresourcesv1 "k8s.io/kubelet/pkg/apis/podresources/v1"
+	kubeletpodresourcesv1alpha1 "k8s.io/kubelet/pkg/apis/podresources/v1alpha1"
 	"k8s.io/kubernetes/pkg/features"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
-	kubeletpodresourcesv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/podresources/v1alpha1"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -79,7 +81,12 @@ func numberOfSampleResources(node *v1.Node) int64 {
 
 // getSampleDevicePluginPod returns the Device Plugin pod for sample resources in e2e tests.
 func getSampleDevicePluginPod() *v1.Pod {
-	ds := readDaemonSetV1OrDie(testfiles.ReadOrDie(sampleDevicePluginDSYAML))
+	data, err := e2etestfiles.Read(sampleDevicePluginDSYAML)
+	if err != nil {
+		framework.Fail(err.Error())
+	}
+
+	ds := readDaemonSetV1OrDie(data)
 	p := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sampleDevicePluginName,
@@ -124,7 +131,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			framework.Logf("env %v", dp.Spec.Containers[0].Env)
 			dp.Spec.NodeName = framework.TestContext.NodeName
 			ginkgo.By("Create sample device plugin pod")
-			devicePluginPod, err := f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Create(dp)
+			devicePluginPod, err := f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Create(context.TODO(), dp, metav1.CreateOptions{})
 			framework.ExpectNoError(err)
 
 			ginkgo.By("Waiting for devices to become available on the local node")
@@ -138,7 +145,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			// and then use the same here
 			devsLen := int64(2)
 			gomega.Eventually(func() bool {
-				node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+				node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 				framework.ExpectNoError(err)
 				return numberOfDevicesCapacity(node, resourceName) == devsLen &&
 					numberOfDevicesAllocatable(node, resourceName) == devsLen
@@ -151,27 +158,58 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			devID1 := parseLog(f, pod1.Name, pod1.Name, deviceIDRE)
 			gomega.Expect(devID1).To(gomega.Not(gomega.Equal("")))
 
-			podResources, err := getNodeDevices()
-			var resourcesForOurPod *kubeletpodresourcesv1alpha1.PodResources
-			framework.Logf("pod resources %v", podResources)
+			v1alphaPodResources, err := getV1alpha1NodeDevices()
 			framework.ExpectNoError(err)
-			framework.ExpectEqual(len(podResources.PodResources), 2)
-			for _, res := range podResources.GetPodResources() {
+			framework.Logf("v1alpha pod resources %v", v1alphaPodResources)
+
+			v1PodResources, err := getV1NodeDevices()
+			framework.ExpectNoError(err)
+			framework.Logf("v1 pod resources %v", v1PodResources)
+
+			framework.ExpectEqual(len(v1alphaPodResources.PodResources), 2)
+			framework.ExpectEqual(len(v1PodResources.PodResources), 2)
+
+			var v1alphaResourcesForOurPod *kubeletpodresourcesv1alpha1.PodResources
+			for _, res := range v1alphaPodResources.GetPodResources() {
 				if res.Name == pod1.Name {
-					resourcesForOurPod = res
+					v1alphaResourcesForOurPod = res
 				}
 			}
-			framework.Logf("resourcesForOurPod %v", resourcesForOurPod)
-			gomega.Expect(resourcesForOurPod).NotTo(gomega.BeNil())
-			framework.ExpectEqual(resourcesForOurPod.Name, pod1.Name)
-			framework.ExpectEqual(resourcesForOurPod.Namespace, pod1.Namespace)
-			framework.ExpectEqual(len(resourcesForOurPod.Containers), 1)
-			framework.ExpectEqual(resourcesForOurPod.Containers[0].Name, pod1.Spec.Containers[0].Name)
-			framework.ExpectEqual(len(resourcesForOurPod.Containers[0].Devices), 1)
-			framework.ExpectEqual(resourcesForOurPod.Containers[0].Devices[0].ResourceName, resourceName)
-			framework.ExpectEqual(len(resourcesForOurPod.Containers[0].Devices[0].DeviceIds), 1)
+			framework.Logf("v1alphaResourcesForOurPod %v", v1alphaResourcesForOurPod)
 
-			pod1, err = f.PodClient().Get(pod1.Name, metav1.GetOptions{})
+			var v1ResourcesForOurPod *kubeletpodresourcesv1.PodResources
+			for _, res := range v1PodResources.GetPodResources() {
+				if res.Name == pod1.Name {
+					v1ResourcesForOurPod = res
+				}
+			}
+			framework.Logf("v1ResourcesForOurPod %v", v1ResourcesForOurPod)
+
+			gomega.Expect(v1alphaResourcesForOurPod).NotTo(gomega.BeNil())
+			gomega.Expect(v1ResourcesForOurPod).NotTo(gomega.BeNil())
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Name, pod1.Name)
+			framework.ExpectEqual(v1ResourcesForOurPod.Name, pod1.Name)
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Namespace, pod1.Namespace)
+			framework.ExpectEqual(v1ResourcesForOurPod.Namespace, pod1.Namespace)
+
+			framework.ExpectEqual(len(v1alphaResourcesForOurPod.Containers), 1)
+			framework.ExpectEqual(len(v1ResourcesForOurPod.Containers), 1)
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Containers[0].Name, pod1.Spec.Containers[0].Name)
+			framework.ExpectEqual(v1ResourcesForOurPod.Containers[0].Name, pod1.Spec.Containers[0].Name)
+
+			framework.ExpectEqual(len(v1alphaResourcesForOurPod.Containers[0].Devices), 1)
+			framework.ExpectEqual(len(v1ResourcesForOurPod.Containers[0].Devices), 1)
+
+			framework.ExpectEqual(v1alphaResourcesForOurPod.Containers[0].Devices[0].ResourceName, resourceName)
+			framework.ExpectEqual(v1ResourcesForOurPod.Containers[0].Devices[0].ResourceName, resourceName)
+
+			framework.ExpectEqual(len(v1alphaResourcesForOurPod.Containers[0].Devices[0].DeviceIds), 1)
+			framework.ExpectEqual(len(v1ResourcesForOurPod.Containers[0].Devices[0].DeviceIds), 1)
+
+			pod1, err = f.PodClient().Get(context.TODO(), pod1.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 
 			ensurePodContainerRestart(f, pod1.Name, pod1.Name)
@@ -188,7 +226,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			// Otherwise, Kubelet DeviceManager may remove the re-registered sockets after it starts.
 			ginkgo.By("Wait for node is ready")
 			gomega.Eventually(func() bool {
-				node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+				node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 				framework.ExpectNoError(err)
 				for _, cond := range node.Status.Conditions {
 					if cond.Type == v1.NodeReady && cond.Status == v1.ConditionTrue && cond.LastHeartbeatTime.After(restartTime) {
@@ -204,14 +242,14 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			deleteOptions := metav1.DeleteOptions{
 				GracePeriodSeconds: &gp,
 			}
-			err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Delete(dp.Name, &deleteOptions)
+			err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Delete(context.TODO(), dp.Name, deleteOptions)
 			framework.ExpectNoError(err)
 			waitForContainerRemoval(devicePluginPod.Spec.Containers[0].Name, devicePluginPod.Name, devicePluginPod.Namespace)
-			_, err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Get(dp.Name, getOptions)
+			_, err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Get(context.TODO(), dp.Name, getOptions)
 			framework.Logf("Trying to get dp pod after deletion. err must be non-nil. err: %v", err)
 			framework.ExpectError(err)
 
-			devicePluginPod, err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Create(dp)
+			devicePluginPod, err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Create(context.TODO(), dp, metav1.CreateOptions{})
 			framework.ExpectNoError(err)
 
 			ensurePodContainerRestart(f, pod1.Name, pod1.Name)
@@ -221,7 +259,7 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 
 			ginkgo.By("Waiting for resource to become available on the local node after re-registration")
 			gomega.Eventually(func() bool {
-				node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+				node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 				framework.ExpectNoError(err)
 				return numberOfDevicesCapacity(node, resourceName) == devsLen &&
 					numberOfDevicesAllocatable(node, resourceName) == devsLen
@@ -236,13 +274,13 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			gomega.Expect(devID1).To(gomega.Not(gomega.Equal(devID2)))
 
 			ginkgo.By("By deleting the pods and waiting for container removal")
-			err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Delete(dp.Name, &deleteOptions)
+			err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Delete(context.TODO(), dp.Name, deleteOptions)
 			framework.ExpectNoError(err)
 			waitForContainerRemoval(devicePluginPod.Spec.Containers[0].Name, devicePluginPod.Name, devicePluginPod.Namespace)
 
 			ginkgo.By("Waiting for stub device plugin to become unhealthy on the local node")
 			gomega.Eventually(func() int64 {
-				node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+				node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 				framework.ExpectNoError(err)
 				return numberOfDevicesAllocatable(node, resourceName)
 			}, 30*time.Second, framework.Poll).Should(gomega.Equal(int64(0)))
@@ -257,31 +295,31 @@ func testDevicePlugin(f *framework.Framework, pluginSockDir string) {
 			framework.ExpectEqual(devIDRestart2, devID2)
 
 			ginkgo.By("Re-register resources")
-			devicePluginPod, err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Create(dp)
+			devicePluginPod, err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Create(context.TODO(), dp, metav1.CreateOptions{})
 			framework.ExpectNoError(err)
 
 			ginkgo.By("Waiting for the resource exported by the stub device plugin to become healthy on the local node")
 			gomega.Eventually(func() int64 {
-				node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+				node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 				framework.ExpectNoError(err)
 				return numberOfDevicesAllocatable(node, resourceName)
 			}, 30*time.Second, framework.Poll).Should(gomega.Equal(devsLen))
 
 			ginkgo.By("by deleting the pods and waiting for container removal")
-			err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Delete(dp.Name, &deleteOptions)
+			err = f.ClientSet.CoreV1().Pods(metav1.NamespaceSystem).Delete(context.TODO(), dp.Name, deleteOptions)
 			framework.ExpectNoError(err)
 			waitForContainerRemoval(devicePluginPod.Spec.Containers[0].Name, devicePluginPod.Name, devicePluginPod.Namespace)
 
 			ginkgo.By("Waiting for stub device plugin to become unavailable on the local node")
 			gomega.Eventually(func() bool {
-				node, err := f.ClientSet.CoreV1().Nodes().Get(framework.TestContext.NodeName, metav1.GetOptions{})
+				node, err := f.ClientSet.CoreV1().Nodes().Get(context.TODO(), framework.TestContext.NodeName, metav1.GetOptions{})
 				framework.ExpectNoError(err)
 				return numberOfDevicesCapacity(node, resourceName) <= 0
 			}, 10*time.Minute, framework.Poll).Should(gomega.BeTrue())
 
 			// Cleanup
-			f.PodClient().DeleteSync(pod1.Name, &metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
-			f.PodClient().DeleteSync(pod2.Name, &metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
+			f.PodClient().DeleteSync(pod1.Name, metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
+			f.PodClient().DeleteSync(pod2.Name, metav1.DeleteOptions{}, framework.DefaultPodDeletionTimeout)
 		})
 	})
 }
@@ -314,13 +352,13 @@ func makeBusyboxPod(resourceName, cmd string) *v1.Pod {
 func ensurePodContainerRestart(f *framework.Framework, podName string, contName string) {
 	var initialCount int32
 	var currentCount int32
-	p, err := f.PodClient().Get(podName, metav1.GetOptions{})
+	p, err := f.PodClient().Get(context.TODO(), podName, metav1.GetOptions{})
 	if err != nil || len(p.Status.ContainerStatuses) < 1 {
 		framework.Failf("ensurePodContainerRestart failed for pod %q: %v", podName, err)
 	}
 	initialCount = p.Status.ContainerStatuses[0].RestartCount
 	gomega.Eventually(func() bool {
-		p, err = f.PodClient().Get(podName, metav1.GetOptions{})
+		p, err = f.PodClient().Get(context.TODO(), podName, metav1.GetOptions{})
 		if err != nil || len(p.Status.ContainerStatuses) < 1 {
 			return false
 		}

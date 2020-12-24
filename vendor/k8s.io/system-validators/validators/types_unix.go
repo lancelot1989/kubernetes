@@ -56,7 +56,14 @@ var DefaultSysSpec = SysSpec{
 		},
 		Forbidden: []KernelConfig{},
 	},
-	Cgroups: []string{"cpu", "cpuacct", "cpuset", "devices", "freezer", "memory"},
+	Cgroups: []string{"cpu", "cpuacct", "cpuset", "devices", "freezer", "memory", "pids"},
+	CgroupsOptional: []string{
+		// The hugetlb cgroup is optional since some kernels are compiled without support for huge pages
+		// and therefore lacks corresponding hugetlb cgroup
+		"hugetlb",
+	},
+	CgroupsV2:         []string{"cpu", "cpuset", "devices", "freezer", "memory", "pids"},
+	CgroupsV2Optional: []string{"hugetlb"},
 	RuntimeSpec: RuntimeSpec{
 		DockerSpec: &DockerSpec{
 			Version:     []string{`1\.1[1-3]\..*`, `17\.0[3,6,9]\..*`, `18\.0[6,9]\..*`, `19\.03\..*`},

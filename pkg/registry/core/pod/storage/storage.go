@@ -87,6 +87,7 @@ func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGet
 		RESTOptions: optsGetter,
 		AttrFunc:    registrypod.GetAttrs,
 		TriggerFunc: map[string]storage.IndexerFunc{"spec.nodeName": registrypod.NodeNameTriggerFunc},
+		Indexers:    registrypod.Indexers(),
 	}
 	if err := store.CompleteWithOptions(options); err != nil {
 		return PodStorage{}, err
@@ -118,7 +119,7 @@ var _ = rest.Redirector(&REST{})
 
 // ResourceLocation returns a pods location from its HostIP
 func (r *REST) ResourceLocation(ctx context.Context, name string) (*url.URL, http.RoundTripper, error) {
-	return registrypod.ResourceLocation(r, r.proxyTransport, ctx, name)
+	return registrypod.ResourceLocation(ctx, r, r.proxyTransport, name)
 }
 
 // Implement ShortNamesProvider
@@ -213,7 +214,7 @@ func (r *BindingREST) setPodHostAndAnnotations(ctx context.Context, podID, oldMa
 		})
 		finalPod = pod
 		return pod, nil
-	}), dryRun)
+	}), dryRun, nil)
 	return finalPod, err
 }
 
@@ -345,11 +346,24 @@ func (r *EphemeralContainersREST) Update(ctx context.Context, name string, objIn
 		return newPod, nil
 	})
 
-	obj, _, err = r.store.Update(ctx, name, updatedPodInfo, createValidation, updateValidation, false, options)
+	// Validation should be passed the API kind (EphemeralContainers) rather than the storage kind.
+	obj, _, err = r.store.Update(ctx, name, updatedPodInfo, toEphemeralContainersCreateValidation(createValidation), toEphemeralContainersUpdateValidation(updateValidation), false, options)
 	if err != nil {
 		return nil, false, err
 	}
 	return ephemeralContainersInPod(obj.(*api.Pod)), false, err
+}
+
+func toEphemeralContainersCreateValidation(f rest.ValidateObjectFunc) rest.ValidateObjectFunc {
+	return func(ctx context.Context, obj runtime.Object) error {
+		return f(ctx, ephemeralContainersInPod(obj.(*api.Pod)))
+	}
+}
+
+func toEphemeralContainersUpdateValidation(f rest.ValidateObjectUpdateFunc) rest.ValidateObjectUpdateFunc {
+	return func(ctx context.Context, obj, old runtime.Object) error {
+		return f(ctx, ephemeralContainersInPod(obj.(*api.Pod)), ephemeralContainersInPod(old.(*api.Pod)))
+	}
 }
 
 // Extract the list of Ephemeral Containers from a Pod

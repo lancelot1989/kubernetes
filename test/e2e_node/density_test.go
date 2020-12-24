@@ -19,6 +19,7 @@ limitations under the License.
 package e2enode
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -32,8 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
+	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
 	kubeletconfig "k8s.io/kubernetes/pkg/kubelet/apis/config"
-	kubeletstatsv1alpha1 "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1"
 	kubemetrics "k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubelet "k8s.io/kubernetes/test/e2e/framework/kubelet"
@@ -125,7 +126,7 @@ var _ = framework.KubeDescribe("Density [Serial] [Slow]", func() {
 				interval: 0 * time.Millisecond,
 			},
 			{
-				podsNr:   105,
+				podsNr:   90,
 				interval: 0 * time.Millisecond,
 			},
 			{
@@ -137,7 +138,7 @@ var _ = framework.KubeDescribe("Density [Serial] [Slow]", func() {
 				interval: 100 * time.Millisecond,
 			},
 			{
-				podsNr:   105,
+				podsNr:   90,
 				interval: 100 * time.Millisecond,
 			},
 			{
@@ -149,7 +150,7 @@ var _ = framework.KubeDescribe("Density [Serial] [Slow]", func() {
 				interval: 300 * time.Millisecond,
 			},
 			{
-				podsNr:   105,
+				podsNr:   90,
 				interval: 300 * time.Millisecond,
 			},
 		}
@@ -175,17 +176,17 @@ var _ = framework.KubeDescribe("Density [Serial] [Slow]", func() {
 	ginkgo.Context("create a batch of pods with higher API QPS", func() {
 		dTests := []densityTest{
 			{
-				podsNr:      105,
+				podsNr:      90,
 				interval:    0 * time.Millisecond,
 				APIQPSLimit: 60,
 			},
 			{
-				podsNr:      105,
+				podsNr:      90,
 				interval:    100 * time.Millisecond,
 				APIQPSLimit: 60,
 			},
 			{
-				podsNr:      105,
+				podsNr:      90,
 				interval:    300 * time.Millisecond,
 				APIQPSLimit: 60,
 			},
@@ -493,12 +494,12 @@ func newInformerWatchPod(f *framework.Framework, mutex *sync.Mutex, watchTimes m
 		&cache.ListWatch{
 			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 				options.LabelSelector = labels.SelectorFromSet(labels.Set{"type": podType}).String()
-				obj, err := f.ClientSet.CoreV1().Pods(ns).List(options)
+				obj, err := f.ClientSet.CoreV1().Pods(ns).List(context.TODO(), options)
 				return runtime.Object(obj), err
 			},
 			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 				options.LabelSelector = labels.SelectorFromSet(labels.Set{"type": podType}).String()
-				return f.ClientSet.CoreV1().Pods(ns).Watch(options)
+				return f.ClientSet.CoreV1().Pods(ns).Watch(context.TODO(), options)
 			},
 		},
 		&v1.Pod{},

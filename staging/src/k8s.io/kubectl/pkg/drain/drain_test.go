@@ -196,7 +196,7 @@ func createPods(ifCreateNewPods bool) (map[string]corev1.Pod, []corev1.Pod) {
 	for i := 0; i < 8; i++ {
 		var uid types.UID
 		if ifCreateNewPods {
-			uid = types.UID(i)
+			uid = types.UID(strconv.Itoa(i))
 		} else {
 			uid = types.UID(strconv.Itoa(i) + strconv.Itoa(i))
 		}
@@ -241,7 +241,7 @@ func addEvictionSupport(t *testing.T, k *fake.Clientset) {
 		eviction := *action.(ktest.CreateAction).GetObject().(*policyv1beta1.Eviction)
 		// Avoid the lock
 		go func() {
-			err := k.CoreV1().Pods(eviction.Namespace).Delete(eviction.Name, &metav1.DeleteOptions{})
+			err := k.CoreV1().Pods(eviction.Namespace).Delete(context.TODO(), eviction.Name, metav1.DeleteOptions{})
 			if err != nil {
 				// Errorf because we can't call Fatalf from another goroutine
 				t.Errorf("failed to delete pod: %s/%s", eviction.Namespace, eviction.Name)
@@ -356,7 +356,7 @@ func TestDeleteOrEvict(t *testing.T) {
 			// Test that other pods are still there
 			var remainingPods []string
 			{
-				podList, err := k.CoreV1().Pods("").List(metav1.ListOptions{})
+				podList, err := k.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 				if err != nil {
 					t.Fatalf("error listing pods: %v", err)
 				}
@@ -385,6 +385,75 @@ func TestDeleteOrEvict(t *testing.T) {
 			})
 			if !reflect.DeepEqual(actualEvictions, expectedEvictions) {
 				t.Errorf("%s: unexpected evictions; actual %v; expected %v", tc.description, actualEvictions, expectedEvictions)
+			}
+		})
+	}
+}
+
+func mockFilterSkip(_ corev1.Pod) PodDeleteStatus {
+	return MakePodDeleteStatusSkip()
+}
+
+func mockFilterOkay(_ corev1.Pod) PodDeleteStatus {
+	return MakePodDeleteStatusOkay()
+}
+
+func TestFilterPods(t *testing.T) {
+	tCases := []struct {
+		description        string
+		expectedPodListLen int
+		additionalFilters  []PodFilter
+	}{
+		{
+			description:        "AdditionalFilter skip all",
+			expectedPodListLen: 0,
+			additionalFilters: []PodFilter{
+				mockFilterSkip,
+				mockFilterOkay,
+			},
+		},
+		{
+			description:        "AdditionalFilter okay all",
+			expectedPodListLen: 1,
+			additionalFilters: []PodFilter{
+				mockFilterOkay,
+			},
+		},
+		{
+			description:        "AdditionalFilter Skip after Okay all skip",
+			expectedPodListLen: 0,
+			additionalFilters: []PodFilter{
+				mockFilterOkay,
+				mockFilterSkip,
+			},
+		},
+		{
+			description:        "No additionalFilters okay all",
+			expectedPodListLen: 1,
+		},
+	}
+	for _, tc := range tCases {
+		t.Run(tc.description, func(t *testing.T) {
+			h := &Helper{
+				Force:             true,
+				AdditionalFilters: tc.additionalFilters,
+			}
+			pod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pod",
+					Namespace: "default",
+				},
+			}
+			podList := corev1.PodList{
+				Items: []corev1.Pod{
+					pod,
+				},
+			}
+
+			list := filterPods(&podList, h.makeFilters())
+			podsLen := len(list.Pods())
+			if podsLen != tc.expectedPodListLen {
+				t.Errorf("%s: unexpected evictions; actual %v; expected %v", tc.description, podsLen, tc.expectedPodListLen)
 			}
 		})
 	}

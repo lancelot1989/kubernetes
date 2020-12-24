@@ -22,14 +22,14 @@ import (
 	"time"
 
 	siotypes "github.com/thecodeteam/goscaleio/types/v1"
+	volumetesting "k8s.io/kubernetes/pkg/volume/testing"
 	"k8s.io/utils/exec/testing"
 )
 
 var (
-	fakeSdcID      = "test-sdc-123456789"
-	fakeVolumeName = "test-vol-0001"
-	fakeVolumeID   = "1234567890"
-	fakeDev        = "/dev/testABC"
+	fakeSdcID    = "test-sdc-123456789"
+	fakeVolumeID = "1234567890"
+	fakeDev      = "/dev/testABC"
 
 	fakeConfig = map[string]string{
 		confKey.gateway:    "http://sio.gateway:1234",
@@ -43,7 +43,8 @@ var (
 )
 
 func newTestMgr(t *testing.T) *sioMgr {
-	mgr, err := newSioMgr(fakeConfig, &testingexec.FakeExec{})
+	host := volumetesting.NewFakeVolumeHost(t, "/tmp/fake", nil, nil)
+	mgr, err := newSioMgr(fakeConfig, host, &testingexec.FakeExec{})
 	if err != nil {
 		t.Error(err)
 	}
@@ -52,7 +53,8 @@ func newTestMgr(t *testing.T) *sioMgr {
 }
 
 func TestMgrNew(t *testing.T) {
-	mgr, err := newSioMgr(fakeConfig, &testingexec.FakeExec{})
+	host := volumetesting.NewFakeVolumeHost(t, "/tmp/fake", nil, nil)
+	mgr, err := newSioMgr(fakeConfig, host, &testingexec.FakeExec{})
 	if err != nil {
 		t.Fatal(err)
 	}

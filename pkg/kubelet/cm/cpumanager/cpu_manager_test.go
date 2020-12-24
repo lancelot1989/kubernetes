@@ -33,7 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
-	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/containermap"
+	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/state"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/topology"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
@@ -100,10 +100,11 @@ func (p *mockPolicy) Name() string {
 	return "mock"
 }
 
-func (p *mockPolicy) Start(s state.State) {
+func (p *mockPolicy) Start(s state.State) error {
+	return p.err
 }
 
-func (p *mockPolicy) AddContainer(s state.State, pod *v1.Pod, container *v1.Container) error {
+func (p *mockPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Container) error {
 	return p.err
 }
 
@@ -111,7 +112,11 @@ func (p *mockPolicy) RemoveContainer(s state.State, podUID string, containerName
 	return p.err
 }
 
-func (p *mockPolicy) GetTopologyHints(s state.State, pod v1.Pod, container v1.Container) map[string][]topologymanager.TopologyHint {
+func (p *mockPolicy) GetTopologyHints(s state.State, pod *v1.Pod, container *v1.Container) map[string][]topologymanager.TopologyHint {
+	return nil
+}
+
+func (p *mockPolicy) GetPodTopologyHints(s state.State, pod *v1.Pod) map[string][]topologymanager.TopologyHint {
 	return nil
 }
 
@@ -206,7 +211,7 @@ func makeMultiContainerPod(initCPUs, appCPUs []struct{ request, limit string }) 
 }
 
 func TestCPUManagerAdd(t *testing.T) {
-	testPolicy := NewStaticPolicy(
+	testPolicy, _ := NewStaticPolicy(
 		&topology.CPUTopology{
 			NumCPUs:    4,
 			NumSockets: 1,
@@ -222,18 +227,20 @@ func TestCPUManagerAdd(t *testing.T) {
 		cpuset.NewCPUSet(),
 		topologymanager.NewFakeManager())
 	testCases := []struct {
-		description string
-		updateErr   error
-		policy      Policy
-		expCPUSet   cpuset.CPUSet
-		expErr      error
+		description        string
+		updateErr          error
+		policy             Policy
+		expCPUSet          cpuset.CPUSet
+		expAllocateErr     error
+		expAddContainerErr error
 	}{
 		{
-			description: "cpu manager add - no error",
-			updateErr:   nil,
-			policy:      testPolicy,
-			expCPUSet:   cpuset.NewCPUSet(3, 4),
-			expErr:      nil,
+			description:        "cpu manager add - no error",
+			updateErr:          nil,
+			policy:             testPolicy,
+			expCPUSet:          cpuset.NewCPUSet(3, 4),
+			expAllocateErr:     nil,
+			expAddContainerErr: nil,
 		},
 		{
 			description: "cpu manager add - policy add container error",
@@ -241,15 +248,17 @@ func TestCPUManagerAdd(t *testing.T) {
 			policy: &mockPolicy{
 				err: fmt.Errorf("fake reg error"),
 			},
-			expCPUSet: cpuset.NewCPUSet(1, 2, 3, 4),
-			expErr:    fmt.Errorf("fake reg error"),
+			expCPUSet:          cpuset.NewCPUSet(1, 2, 3, 4),
+			expAllocateErr:     fmt.Errorf("fake reg error"),
+			expAddContainerErr: nil,
 		},
 		{
-			description: "cpu manager add - container update error",
-			updateErr:   fmt.Errorf("fake update error"),
-			policy:      testPolicy,
-			expCPUSet:   cpuset.NewCPUSet(1, 2, 3, 4),
-			expErr:      fmt.Errorf("fake update error"),
+			description:        "cpu manager add - container update error",
+			updateErr:          fmt.Errorf("fake update error"),
+			policy:             testPolicy,
+			expCPUSet:          cpuset.NewCPUSet(1, 2, 3, 4),
+			expAllocateErr:     nil,
+			expAddContainerErr: fmt.Errorf("fake update error"),
 		},
 	}
 
@@ -264,16 +273,24 @@ func TestCPUManagerAdd(t *testing.T) {
 				err: testCase.updateErr,
 			},
 			containerMap:      containermap.NewContainerMap(),
-			activePods:        func() []*v1.Pod { return nil },
 			podStatusProvider: mockPodStatusProvider{},
+			sourcesReady:      &sourcesReadyStub{},
 		}
 
 		pod := makePod("fakePod", "fakeContainer", "2", "2")
 		container := &pod.Spec.Containers[0]
-		err := mgr.AddContainer(pod, container, "fakeID")
-		if !reflect.DeepEqual(err, testCase.expErr) {
+		mgr.activePods = func() []*v1.Pod { return []*v1.Pod{pod} }
+
+		err := mgr.Allocate(pod, container)
+		if !reflect.DeepEqual(err, testCase.expAllocateErr) {
+			t.Errorf("CPU Manager Allocate() error (%v). expected error: %v but got: %v",
+				testCase.description, testCase.expAllocateErr, err)
+		}
+
+		err = mgr.AddContainer(pod, container, "fakeID")
+		if !reflect.DeepEqual(err, testCase.expAddContainerErr) {
 			t.Errorf("CPU Manager AddContainer() error (%v). expected error: %v but got: %v",
-				testCase.description, testCase.expErr, err)
+				testCase.description, testCase.expAddContainerErr, err)
 		}
 		if !testCase.expCPUSet.Equals(mgr.state.GetDefaultCPUSet()) {
 			t.Errorf("CPU Manager AddContainer() error (%v). expected cpuset: %v but got: %v",
@@ -464,7 +481,7 @@ func TestCPUManagerAddWithInitContainers(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		policy := NewStaticPolicy(testCase.topo, testCase.numReservedCPUs, cpuset.NewCPUSet(), topologymanager.NewFakeManager())
+		policy, _ := NewStaticPolicy(testCase.topo, testCase.numReservedCPUs, cpuset.NewCPUSet(), topologymanager.NewFakeManager())
 
 		state := &mockState{
 			assignments:   testCase.stAssignments,
@@ -476,8 +493,11 @@ func TestCPUManagerAddWithInitContainers(t *testing.T) {
 			state:             state,
 			containerRuntime:  mockRuntimeService{},
 			containerMap:      containermap.NewContainerMap(),
-			activePods:        func() []*v1.Pod { return nil },
 			podStatusProvider: mockPodStatusProvider{},
+			sourcesReady:      &sourcesReadyStub{},
+			activePods: func() []*v1.Pod {
+				return []*v1.Pod{testCase.pod}
+			},
 		}
 
 		containers := append(
@@ -492,8 +512,15 @@ func TestCPUManagerAddWithInitContainers(t *testing.T) {
 			testCase.expInitCSets,
 			testCase.expCSets...)
 
+		cumCSet := cpuset.NewCPUSet()
+
 		for i := range containers {
-			err := mgr.AddContainer(testCase.pod, &containers[i], containerIDs[i])
+			err := mgr.Allocate(testCase.pod, &containers[i])
+			if err != nil {
+				t.Errorf("StaticPolicy Allocate() error (%v). unexpected error for container id: %v: %v",
+					testCase.description, containerIDs[i], err)
+			}
+			err = mgr.AddContainer(testCase.pod, &containers[i], containerIDs[i])
 			if err != nil {
 				t.Errorf("StaticPolicy AddContainer() error (%v). unexpected error for container id: %v: %v",
 					testCase.description, containerIDs[i], err)
@@ -509,6 +536,13 @@ func TestCPUManagerAddWithInitContainers(t *testing.T) {
 				t.Errorf("StaticPolicy AddContainer() error (%v). expected cpuset %v for container %v but got %v",
 					testCase.description, expCSets[i], containers[i].Name, cset)
 			}
+
+			cumCSet = cumCSet.Union(cset)
+		}
+
+		if !testCase.stDefaultCPUSet.Difference(cumCSet).Equals(state.defaultCPUSet) {
+			t.Errorf("StaticPolicy error (%v). expected final state for defaultCPUSet %v but got %v",
+				testCase.description, testCase.stDefaultCPUSet.Difference(cumCSet), state.defaultCPUSet)
 		}
 	}
 }
@@ -599,7 +633,7 @@ func TestCPUManagerGenerate(t *testing.T) {
 			}
 			defer os.RemoveAll(sDir)
 
-			mgr, err := NewManager(testCase.cpuPolicyName, 5*time.Second, machineInfo, nil, cpuset.NewCPUSet(), testCase.nodeAllocatableReservation, sDir, topologymanager.NewFakeManager())
+			mgr, err := NewManager(testCase.cpuPolicyName, 5*time.Second, machineInfo, cpuset.NewCPUSet(), testCase.nodeAllocatableReservation, sDir, topologymanager.NewFakeManager())
 			if testCase.expectedError != nil {
 				if !strings.Contains(err.Error(), testCase.expectedError.Error()) {
 					t.Errorf("Unexpected error message. Have: %s wants %s", err.Error(), testCase.expectedError.Error())
@@ -701,6 +735,9 @@ func TestReconcileState(t *testing.T) {
 					{
 						Name:        "fakeContainerName",
 						ContainerID: "docker://fakeContainerID",
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
 					},
 				},
 			},
@@ -737,6 +774,9 @@ func TestReconcileState(t *testing.T) {
 					{
 						Name:        "fakeContainerName",
 						ContainerID: "docker://fakeContainerID",
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
 					},
 				},
 			},
@@ -752,7 +792,7 @@ func TestReconcileState(t *testing.T) {
 			expectFailedContainerName:    "",
 		},
 		{
-			description: "cpu manager reconclie - pod status not found",
+			description: "cpu manager reconcile - pod status not found",
 			activePods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -774,10 +814,10 @@ func TestReconcileState(t *testing.T) {
 			stDefaultCPUSet:              cpuset.NewCPUSet(),
 			updateErr:                    nil,
 			expectSucceededContainerName: "",
-			expectFailedContainerName:    "fakeContainerName",
+			expectFailedContainerName:    "",
 		},
 		{
-			description: "cpu manager reconclie - container id not found",
+			description: "cpu manager reconcile - container state not found",
 			activePods: []*v1.Pod{
 				{
 					ObjectMeta: metav1.ObjectMeta{
@@ -830,6 +870,9 @@ func TestReconcileState(t *testing.T) {
 					{
 						Name:        "fakeContainerName",
 						ContainerID: "docker://fakeContainerID",
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
 					},
 				},
 			},
@@ -866,6 +909,9 @@ func TestReconcileState(t *testing.T) {
 					{
 						Name:        "fakeContainerName",
 						ContainerID: "docker://fakeContainerID",
+						State: v1.ContainerState{
+							Running: &v1.ContainerStateRunning{},
+						},
 					},
 				},
 			},
@@ -941,7 +987,7 @@ func TestReconcileState(t *testing.T) {
 // above test cases are without kubelet --reserved-cpus cmd option
 // the following tests are with --reserved-cpus configured
 func TestCPUManagerAddWithResvList(t *testing.T) {
-	testPolicy := NewStaticPolicy(
+	testPolicy, _ := NewStaticPolicy(
 		&topology.CPUTopology{
 			NumCPUs:    4,
 			NumSockets: 1,
@@ -957,25 +1003,28 @@ func TestCPUManagerAddWithResvList(t *testing.T) {
 		cpuset.NewCPUSet(0),
 		topologymanager.NewFakeManager())
 	testCases := []struct {
-		description string
-		updateErr   error
-		policy      Policy
-		expCPUSet   cpuset.CPUSet
-		expErr      error
+		description        string
+		updateErr          error
+		policy             Policy
+		expCPUSet          cpuset.CPUSet
+		expAllocateErr     error
+		expAddContainerErr error
 	}{
 		{
-			description: "cpu manager add - no error",
-			updateErr:   nil,
-			policy:      testPolicy,
-			expCPUSet:   cpuset.NewCPUSet(0, 3),
-			expErr:      nil,
+			description:        "cpu manager add - no error",
+			updateErr:          nil,
+			policy:             testPolicy,
+			expCPUSet:          cpuset.NewCPUSet(0, 3),
+			expAllocateErr:     nil,
+			expAddContainerErr: nil,
 		},
 		{
-			description: "cpu manager add - container update error",
-			updateErr:   fmt.Errorf("fake update error"),
-			policy:      testPolicy,
-			expCPUSet:   cpuset.NewCPUSet(0, 1, 2, 3),
-			expErr:      fmt.Errorf("fake update error"),
+			description:        "cpu manager add - container update error",
+			updateErr:          fmt.Errorf("fake update error"),
+			policy:             testPolicy,
+			expCPUSet:          cpuset.NewCPUSet(0, 1, 2, 3),
+			expAllocateErr:     nil,
+			expAddContainerErr: fmt.Errorf("fake update error"),
 		},
 	}
 
@@ -990,16 +1039,24 @@ func TestCPUManagerAddWithResvList(t *testing.T) {
 				err: testCase.updateErr,
 			},
 			containerMap:      containermap.NewContainerMap(),
-			activePods:        func() []*v1.Pod { return nil },
 			podStatusProvider: mockPodStatusProvider{},
+			sourcesReady:      &sourcesReadyStub{},
 		}
 
 		pod := makePod("fakePod", "fakeContainer", "2", "2")
 		container := &pod.Spec.Containers[0]
-		err := mgr.AddContainer(pod, container, "fakeID")
-		if !reflect.DeepEqual(err, testCase.expErr) {
+		mgr.activePods = func() []*v1.Pod { return []*v1.Pod{pod} }
+
+		err := mgr.Allocate(pod, container)
+		if !reflect.DeepEqual(err, testCase.expAllocateErr) {
+			t.Errorf("CPU Manager Allocate() error (%v). expected error: %v but got: %v",
+				testCase.description, testCase.expAllocateErr, err)
+		}
+
+		err = mgr.AddContainer(pod, container, "fakeID")
+		if !reflect.DeepEqual(err, testCase.expAddContainerErr) {
 			t.Errorf("CPU Manager AddContainer() error (%v). expected error: %v but got: %v",
-				testCase.description, testCase.expErr, err)
+				testCase.description, testCase.expAddContainerErr, err)
 		}
 		if !testCase.expCPUSet.Equals(mgr.state.GetDefaultCPUSet()) {
 			t.Errorf("CPU Manager AddContainer() error (%v). expected cpuset: %v but got: %v",

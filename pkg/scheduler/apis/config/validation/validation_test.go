@@ -28,14 +28,12 @@ import (
 )
 
 func TestValidateKubeSchedulerConfiguration(t *testing.T) {
-	testTimeout := int64(0)
 	podInitialBackoffSeconds := int64(1)
 	podMaxBackoffSeconds := int64(1)
 	validConfig := &config.KubeSchedulerConfiguration{
-		SchedulerName:                  "me",
-		HealthzBindAddress:             "0.0.0.0:10254",
-		MetricsBindAddress:             "0.0.0.0:10254",
-		HardPodAffinitySymmetricWeight: 80,
+		Parallelism:        8,
+		HealthzBindAddress: "0.0.0.0:10254",
+		MetricsBindAddress: "0.0.0.0:10254",
 		ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
 			AcceptContentTypes: "application/json",
 			ContentType:        "application/json",
@@ -50,28 +48,52 @@ func TestValidateKubeSchedulerConfiguration(t *testing.T) {
 				},
 			},
 		},
-		LeaderElection: config.KubeSchedulerLeaderElectionConfiguration{
-			LeaderElectionConfiguration: componentbaseconfig.LeaderElectionConfiguration{
-				ResourceLock:      "configmap",
-				LeaderElect:       true,
-				LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
-				RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
-				RetryPeriod:       metav1.Duration{Duration: 5 * time.Second},
-				ResourceNamespace: "name",
-				ResourceName:      "name",
-			},
+		LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
+			ResourceLock:      "configmap",
+			LeaderElect:       true,
+			LeaseDuration:     metav1.Duration{Duration: 30 * time.Second},
+			RenewDeadline:     metav1.Duration{Duration: 15 * time.Second},
+			RetryPeriod:       metav1.Duration{Duration: 5 * time.Second},
+			ResourceNamespace: "name",
+			ResourceName:      "name",
 		},
 		PodInitialBackoffSeconds: podInitialBackoffSeconds,
 		PodMaxBackoffSeconds:     podMaxBackoffSeconds,
-		BindTimeoutSeconds:       testTimeout,
 		PercentageOfNodesToScore: 35,
+		Profiles: []config.KubeSchedulerProfile{
+			{
+				SchedulerName: "me",
+				Plugins: &config.Plugins{
+					QueueSort: &config.PluginSet{
+						Enabled: []config.Plugin{{Name: "CustomSort"}},
+					},
+					Score: &config.PluginSet{
+						Disabled: []config.Plugin{{Name: "*"}},
+					},
+				},
+			},
+			{
+				SchedulerName: "other",
+				Plugins: &config.Plugins{
+					QueueSort: &config.PluginSet{
+						Enabled: []config.Plugin{{Name: "CustomSort"}},
+					},
+					Bind: &config.PluginSet{
+						Enabled: []config.Plugin{{Name: "CustomBind"}},
+					},
+				},
+			},
+		},
+		Extenders: []config.Extender{
+			{
+				PrioritizeVerb: "prioritize",
+				Weight:         1,
+			},
+		},
 	}
 
-	HardPodAffinitySymmetricWeightGt100 := validConfig.DeepCopy()
-	HardPodAffinitySymmetricWeightGt100.HardPodAffinitySymmetricWeight = 120
-
-	HardPodAffinitySymmetricWeightLt0 := validConfig.DeepCopy()
-	HardPodAffinitySymmetricWeightLt0.HardPodAffinitySymmetricWeight = -1
+	invalidParallelismValue := validConfig.DeepCopy()
+	invalidParallelismValue.Parallelism = 0
 
 	resourceNameNotSet := validConfig.DeepCopy()
 	resourceNameNotSet.LeaderElection.ResourceName = ""
@@ -98,6 +120,34 @@ func TestValidateKubeSchedulerConfiguration(t *testing.T) {
 	percentageOfNodesToScore101 := validConfig.DeepCopy()
 	percentageOfNodesToScore101.PercentageOfNodesToScore = int32(101)
 
+	schedulerNameNotSet := validConfig.DeepCopy()
+	schedulerNameNotSet.Profiles[1].SchedulerName = ""
+
+	repeatedSchedulerName := validConfig.DeepCopy()
+	repeatedSchedulerName.Profiles[0].SchedulerName = "other"
+
+	differentQueueSort := validConfig.DeepCopy()
+	differentQueueSort.Profiles[1].Plugins.QueueSort.Enabled[0].Name = "AnotherSort"
+
+	oneEmptyQueueSort := validConfig.DeepCopy()
+	oneEmptyQueueSort.Profiles[0].Plugins = nil
+
+	extenderNegativeWeight := validConfig.DeepCopy()
+	extenderNegativeWeight.Extenders[0].Weight = -1
+
+	extenderDuplicateManagedResource := validConfig.DeepCopy()
+	extenderDuplicateManagedResource.Extenders[0].ManagedResources = []config.ExtenderManagedResource{
+		{Name: "foo", IgnoredByScheduler: false},
+		{Name: "foo", IgnoredByScheduler: false},
+	}
+
+	extenderDuplicateBind := validConfig.DeepCopy()
+	extenderDuplicateBind.Extenders[0].BindVerb = "foo"
+	extenderDuplicateBind.Extenders = append(extenderDuplicateBind.Extenders, config.Extender{
+		PrioritizeVerb: "prioritize",
+		BindVerb:       "bar",
+	})
+
 	scenarios := map[string]struct {
 		expectedToFail bool
 		config         *config.KubeSchedulerConfiguration
@@ -105,6 +155,10 @@ func TestValidateKubeSchedulerConfiguration(t *testing.T) {
 		"good": {
 			expectedToFail: false,
 			config:         validConfig,
+		},
+		"bad-parallelism-invalid-value": {
+			expectedToFail: true,
+			config:         invalidParallelismValue,
 		},
 		"bad-resource-name-not-set": {
 			expectedToFail: true,
@@ -130,28 +184,50 @@ func TestValidateKubeSchedulerConfiguration(t *testing.T) {
 			expectedToFail: true,
 			config:         metricsBindAddrHostInvalid,
 		},
-		"bad-hard-pod-affinity-symmetric-weight-lt-0": {
-			expectedToFail: true,
-			config:         HardPodAffinitySymmetricWeightGt100,
-		},
-		"bad-hard-pod-affinity-symmetric-weight-gt-100": {
-			expectedToFail: true,
-			config:         HardPodAffinitySymmetricWeightLt0,
-		},
 		"bad-percentage-of-nodes-to-score": {
 			expectedToFail: true,
 			config:         percentageOfNodesToScore101,
 		},
+		"scheduler-name-not-set": {
+			expectedToFail: true,
+			config:         schedulerNameNotSet,
+		},
+		"repeated-scheduler-name": {
+			expectedToFail: true,
+			config:         repeatedSchedulerName,
+		},
+		"different-queue-sort": {
+			expectedToFail: true,
+			config:         differentQueueSort,
+		},
+		"one-empty-queue-sort": {
+			expectedToFail: true,
+			config:         oneEmptyQueueSort,
+		},
+		"extender-negative-weight": {
+			expectedToFail: true,
+			config:         extenderNegativeWeight,
+		},
+		"extender-duplicate-managed-resources": {
+			expectedToFail: true,
+			config:         extenderDuplicateManagedResource,
+		},
+		"extender-duplicate-bind": {
+			expectedToFail: true,
+			config:         extenderDuplicateBind,
+		},
 	}
 
 	for name, scenario := range scenarios {
-		errs := ValidateKubeSchedulerConfiguration(scenario.config)
-		if len(errs) == 0 && scenario.expectedToFail {
-			t.Errorf("Unexpected success for scenario: %s", name)
-		}
-		if len(errs) > 0 && !scenario.expectedToFail {
-			t.Errorf("Unexpected failure for scenario: %s - %+v", name, errs)
-		}
+		t.Run(name, func(t *testing.T) {
+			errs := ValidateKubeSchedulerConfiguration(scenario.config)
+			if len(errs) == 0 && scenario.expectedToFail {
+				t.Error("Unexpected success")
+			}
+			if len(errs) > 0 && !scenario.expectedToFail {
+				t.Errorf("Unexpected failure: %+v", errs)
+			}
+		})
 	}
 }
 
@@ -164,12 +240,12 @@ func TestValidatePolicy(t *testing.T) {
 		{
 			name:     "no weight defined in policy",
 			policy:   config.Policy{Priorities: []config.PriorityPolicy{{Name: "NoWeightPriority"}}},
-			expected: errors.New("Priority NoWeightPriority should have a positive weight applied to it or it has overflown"),
+			expected: errors.New("priority NoWeightPriority should have a positive weight applied to it or it has overflown"),
 		},
 		{
 			name:     "policy weight is not positive",
 			policy:   config.Policy{Priorities: []config.PriorityPolicy{{Name: "NoWeightPriority", Weight: 0}}},
-			expected: errors.New("Priority NoWeightPriority should have a positive weight applied to it or it has overflown"),
+			expected: errors.New("priority NoWeightPriority should have a positive weight applied to it or it has overflown"),
 		},
 		{
 			name:     "valid weight priority",
@@ -179,12 +255,12 @@ func TestValidatePolicy(t *testing.T) {
 		{
 			name:     "invalid negative weight policy",
 			policy:   config.Policy{Priorities: []config.PriorityPolicy{{Name: "WeightPriority", Weight: -2}}},
-			expected: errors.New("Priority WeightPriority should have a positive weight applied to it or it has overflown"),
+			expected: errors.New("priority WeightPriority should have a positive weight applied to it or it has overflown"),
 		},
 		{
 			name:     "policy weight exceeds maximum",
 			policy:   config.Policy{Priorities: []config.PriorityPolicy{{Name: "WeightPriority", Weight: config.MaxWeight}}},
-			expected: errors.New("Priority WeightPriority should have a positive weight applied to it or it has overflown"),
+			expected: errors.New("priority WeightPriority should have a positive weight applied to it or it has overflown"),
 		},
 		{
 			name:     "valid weight in policy extender config",
@@ -194,7 +270,7 @@ func TestValidatePolicy(t *testing.T) {
 		{
 			name:     "invalid negative weight in policy extender config",
 			policy:   config.Policy{Extenders: []config.Extender{{URLPrefix: "http://127.0.0.1:8081/extender", PrioritizeVerb: "prioritize", Weight: -2}}},
-			expected: errors.New("Priority for extender http://127.0.0.1:8081/extender should have a positive weight applied to it"),
+			expected: errors.New("extenders[0].weight: Invalid value: -2: must have a positive weight applied to it"),
 		},
 		{
 			name:     "valid filter verb and url prefix",
@@ -213,7 +289,7 @@ func TestValidatePolicy(t *testing.T) {
 					{URLPrefix: "http://127.0.0.1:8081/extender", BindVerb: "bind"},
 					{URLPrefix: "http://127.0.0.1:8082/extender", BindVerb: "bind"},
 				}},
-			expected: errors.New("Only one extender can implement bind, found 2"),
+			expected: errors.New("extenders: Invalid value: \"found 2 extenders implementing bind\": only one extender can implement bind"),
 		},
 		{
 			name: "invalid duplicate extender resource name",
@@ -222,7 +298,7 @@ func TestValidatePolicy(t *testing.T) {
 					{URLPrefix: "http://127.0.0.1:8081/extender", ManagedResources: []config.ExtenderManagedResource{{Name: "foo.com/bar"}}},
 					{URLPrefix: "http://127.0.0.1:8082/extender", BindVerb: "bind", ManagedResources: []config.ExtenderManagedResource{{Name: "foo.com/bar"}}},
 				}},
-			expected: errors.New("Duplicate extender managed resource name foo.com/bar"),
+			expected: errors.New("extenders[1].managedResources[0].name: Invalid value: \"foo.com/bar\": duplicate extender managed resource name"),
 		},
 		{
 			name: "invalid extended resource name",
@@ -230,7 +306,7 @@ func TestValidatePolicy(t *testing.T) {
 				Extenders: []config.Extender{
 					{URLPrefix: "http://127.0.0.1:8081/extender", ManagedResources: []config.ExtenderManagedResource{{Name: "kubernetes.io/foo"}}},
 				}},
-			expected: errors.New("kubernetes.io/foo is an invalid extended resource name"),
+			expected: errors.New("extenders[0].managedResources[0].name: Invalid value: \"kubernetes.io/foo\": kubernetes.io/foo is an invalid extended resource name"),
 		},
 		{
 			name: "invalid redeclared RequestedToCapacityRatio custom priority",
@@ -240,7 +316,7 @@ func TestValidatePolicy(t *testing.T) {
 					{Name: "customPriority2", Weight: 1, Argument: &config.PriorityArgument{RequestedToCapacityRatioArguments: &config.RequestedToCapacityRatioArguments{}}},
 				},
 			},
-			expected: errors.New("Priority \"customPriority2\" redeclares custom priority \"RequestedToCapacityRatio\", from:\"customPriority1\""),
+			expected: errors.New("priority \"customPriority2\" redeclares custom priority \"RequestedToCapacityRatio\", from: \"customPriority1\""),
 		},
 		{
 			name: "different weights for LabelPreference custom priority",

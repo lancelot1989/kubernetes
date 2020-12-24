@@ -17,19 +17,19 @@ limitations under the License.
 package state
 
 import (
+	"io/ioutil"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
-	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/containermap"
+	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 	testutil "k8s.io/kubernetes/pkg/kubelet/cm/cpumanager/state/testing"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 )
 
 const testingCheckpoint = "cpumanager_checkpoint_test"
-
-var testingDir = os.TempDir()
 
 func TestCheckpointStateRestore(t *testing.T) {
 	testCases := []struct {
@@ -54,7 +54,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 				"policyName": "none",
 				"defaultCPUSet": "4-6",
 				"entries": {},
-				"checksum": 2655485041
+				"checksum": 354655845
 			}`,
 			"none",
 			containermap.ContainerMap{},
@@ -74,7 +74,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 						"container2": "1-3"
 					}
 				},
-				"checksum": 3415933391
+				"checksum": 3610638499
 			}`,
 			"none",
 			containermap.ContainerMap{},
@@ -116,7 +116,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 				"policyName": "other",
 				"defaultCPUSet": "1-3",
 				"entries": {},
-				"checksum": 698611581
+				"checksum": 1394507217
 			}`,
 			"none",
 			containermap.ContainerMap{},
@@ -129,7 +129,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 				"policyName": "none",
 				"defaultCPUSet": "1.3",
 				"entries": {},
-				"checksum": 1966990140
+				"checksum": 3021697696
 			}`,
 			"none",
 			containermap.ContainerMap{},
@@ -147,12 +147,26 @@ func TestCheckpointStateRestore(t *testing.T) {
 						"container2": "asd"
 					}
 				},
-				"checksum": 3082925826
+				"checksum": 962272150
 			}`,
 			"none",
 			containermap.ContainerMap{},
 			`could not parse cpuset "asd" for container "container2" in pod "pod": strconv.Atoi: parsing "asd": invalid syntax`,
 			&stateMemory{},
+		},
+		{
+			"Restore checkpoint from checkpoint with v1 checksum",
+			`{
+				"policyName": "none",
+				"defaultCPUSet": "1-3",
+				"checksum": 1694838852
+			}`,
+			"none",
+			containermap.ContainerMap{},
+			"",
+			&stateMemory{
+				defaultCPUSet: cpuset.NewCPUSet(1, 2, 3),
+			},
 		},
 		{
 			"Restore checkpoint with migration",
@@ -163,7 +177,7 @@ func TestCheckpointStateRestore(t *testing.T) {
 					"containerID1": "4-6",
 					"containerID2": "1-3"
 				},
-				"checksum": 2832947348
+				"checksum": 3680390589
 			}`,
 			"none",
 			func() containermap.ContainerMap {
@@ -185,6 +199,12 @@ func TestCheckpointStateRestore(t *testing.T) {
 		},
 	}
 
+	// create temp dir
+	testingDir, err := ioutil.TempDir("", "cpumanager_state_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testingDir)
 	// create checkpoint manager for testing
 	cpm, err := checkpointmanager.NewCheckpointManager(testingDir)
 	if err != nil {
@@ -242,6 +262,13 @@ func TestCheckpointStateStore(t *testing.T) {
 			},
 		},
 	}
+
+	// create temp dir
+	testingDir, err := ioutil.TempDir("", "cpumanager_state_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testingDir)
 
 	cpm, err := checkpointmanager.NewCheckpointManager(testingDir)
 	if err != nil {
@@ -309,6 +336,13 @@ func TestCheckpointStateHelpers(t *testing.T) {
 		},
 	}
 
+	// create temp dir
+	testingDir, err := ioutil.TempDir("", "cpumanager_state_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(testingDir)
+
 	cpm, err := checkpointmanager.NewCheckpointManager(testingDir)
 	if err != nil {
 		t.Fatalf("could not create testing checkpoint manager: %v", err)
@@ -361,6 +395,13 @@ func TestCheckpointStateClear(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.description, func(t *testing.T) {
+			// create temp dir
+			testingDir, err := ioutil.TempDir("", "cpumanager_state_test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(testingDir)
+
 			state, err := NewCheckpointState(testingDir, testingCheckpoint, "none", nil)
 			if err != nil {
 				t.Fatalf("could not create testing checkpointState instance: %v", err)
@@ -381,5 +422,19 @@ func TestCheckpointStateClear(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func AssertStateEqual(t *testing.T, sf State, sm State) {
+	cpusetSf := sf.GetDefaultCPUSet()
+	cpusetSm := sm.GetDefaultCPUSet()
+	if !cpusetSf.Equals(cpusetSm) {
+		t.Errorf("State CPUSet mismatch. Have %v, want %v", cpusetSf, cpusetSm)
+	}
+
+	cpuassignmentSf := sf.GetCPUAssignments()
+	cpuassignmentSm := sm.GetCPUAssignments()
+	if !reflect.DeepEqual(cpuassignmentSf, cpuassignmentSm) {
+		t.Errorf("State CPU assignments mismatch. Have %s, want %s", cpuassignmentSf, cpuassignmentSm)
 	}
 }

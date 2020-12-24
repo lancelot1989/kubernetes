@@ -17,11 +17,12 @@ limitations under the License.
 package ipam
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
@@ -306,7 +307,7 @@ func TestOccupyPreExistingCIDR(t *testing.T) {
 		t.Run(tc.description, func(t *testing.T) {
 			// Initialize the range allocator.
 			fakeNodeInformer := getFakeNodeInformer(tc.fakeNodeHandler)
-			nodeList, _ := tc.fakeNodeHandler.List(metav1.ListOptions{})
+			nodeList, _ := tc.fakeNodeHandler.List(context.TODO(), metav1.ListOptions{})
 			_, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, fakeNodeInformer, tc.allocatorParams, nodeList)
 			if err == nil && tc.ctrlCreateFail {
 				t.Fatalf("creating range allocator was expected to fail, but it did not")
@@ -485,12 +486,55 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 				NodeCIDRMaskSizes:    []int{24, 98, 24},
 			},
 		},
+		{
+			description: "no double counting",
+			fakeNodeHandler: &testutil.FakeNodeHandler{
+				Existing: []*v1.Node{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node0",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.0.0/24"},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node1",
+						},
+						Spec: v1.NodeSpec{
+							PodCIDRs: []string{"10.10.2.0/24"},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "node2",
+						},
+					},
+				},
+				Clientset: fake.NewSimpleClientset(),
+			},
+			allocatorParams: CIDRAllocatorParams{
+				ClusterCIDRs: func() []*net.IPNet {
+					_, clusterCIDR, _ := net.ParseCIDR("10.10.0.0/22")
+					return []*net.IPNet{clusterCIDR}
+				}(),
+				ServiceCIDR:          nil,
+				SecondaryServiceCIDR: nil,
+				NodeCIDRMaskSizes:    []int{24},
+			},
+			expectedAllocatedCIDR: map[int]string{
+				0: "10.10.1.0/24",
+			},
+		},
 	}
 
 	// test function
 	testFunc := func(tc testCase) {
+		fakeNodeInformer := getFakeNodeInformer(tc.fakeNodeHandler)
+		nodeList, _ := tc.fakeNodeHandler.List(context.TODO(), metav1.ListOptions{})
 		// Initialize the range allocator.
-		allocator, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, getFakeNodeInformer(tc.fakeNodeHandler), tc.allocatorParams, nil)
+		allocator, err := NewCIDRRangeAllocator(tc.fakeNodeHandler, fakeNodeInformer, tc.allocatorParams, nodeList)
 		if err != nil {
 			t.Errorf("%v: failed to create CIDRRangeAllocator with error %v", tc.description, err)
 			return
@@ -516,12 +560,22 @@ func TestAllocateOrOccupyCIDRSuccess(t *testing.T) {
 					t.Fatalf("%v: unexpected error when occupying CIDR %v: %v", tc.description, allocated, err)
 				}
 			}
-			if err := allocator.AllocateOrOccupyCIDR(tc.fakeNodeHandler.Existing[0]); err != nil {
+		}
+
+		updateCount := 0
+		for _, node := range tc.fakeNodeHandler.Existing {
+			if node.Spec.PodCIDRs == nil {
+				updateCount++
+			}
+			if err := allocator.AllocateOrOccupyCIDR(node); err != nil {
 				t.Errorf("%v: unexpected error in AllocateOrOccupyCIDR: %v", tc.description, err)
 			}
-			if err := waitForUpdatedNodeWithTimeout(tc.fakeNodeHandler, 1, wait.ForeverTestTimeout); err != nil {
-				t.Fatalf("%v: timeout while waiting for Node update: %v", tc.description, err)
-			}
+		}
+		if updateCount != 1 {
+			t.Fatalf("test error: all tests must update exactly one node")
+		}
+		if err := waitForUpdatedNodeWithTimeout(tc.fakeNodeHandler, updateCount, wait.ForeverTestTimeout); err != nil {
+			t.Fatalf("%v: timeout while waiting for Node update: %v", tc.description, err)
 		}
 
 		if len(tc.expectedAllocatedCIDR) == 0 {

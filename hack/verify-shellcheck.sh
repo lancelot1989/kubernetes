@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script lints each shell script by `shellcheck`.
+# Usage: `hack/verify-shellcheck.sh`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -133,7 +136,7 @@ fi
 # common arguments we'll pass to shellcheck
 SHELLCHECK_OPTIONS=(
   # allow following sourced files that are not specified in the command,
-  # we need this because we specify one file at at time in order to trivially
+  # we need this because we specify one file at a time in order to trivially
   # detect which files are failing
   "--external-sources"
   # include our disabled lints

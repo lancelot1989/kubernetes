@@ -54,6 +54,7 @@ import (
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/apiserver/pkg/storage/storagebackend/factory"
 	storagetesting "k8s.io/apiserver/pkg/storage/testing"
+	"k8s.io/client-go/tools/cache"
 )
 
 var scheme = runtime.NewScheme()
@@ -1600,8 +1601,11 @@ func newTestGenericStoreRegistry(t *testing.T, scheme *runtime.Scheme, hasCacheE
 	server, sc := etcd3testing.NewUnsecuredEtcd3TestClientServer(t)
 	strategy := &testRESTStrategy{scheme, names.SimpleNameGenerator, true, false, true}
 
+	newFunc := func() runtime.Object { return &example.Pod{} }
+	newListFunc := func() runtime.Object { return &example.PodList{} }
+
 	sc.Codec = apitesting.TestStorageCodec(codecs, examplev1.SchemeGroupVersion)
-	s, dFunc, err := factory.Create(*sc)
+	s, dFunc, err := factory.Create(*sc, newFunc)
 	if err != nil {
 		t.Fatalf("Error creating storage: %v", err)
 	}
@@ -1611,14 +1615,13 @@ func newTestGenericStoreRegistry(t *testing.T, scheme *runtime.Scheme, hasCacheE
 	}
 	if hasCacheEnabled {
 		config := cacherstorage.Config{
-			CacheCapacity:  10,
 			Storage:        s,
 			Versioner:      etcd3.APIObjectVersioner{},
 			ResourcePrefix: podPrefix,
 			KeyFunc:        func(obj runtime.Object) (string, error) { return storage.NoNamespaceKeyFunc(podPrefix, obj) },
 			GetAttrsFunc:   getPodAttrs,
-			NewFunc:        func() runtime.Object { return &example.Pod{} },
-			NewListFunc:    func() runtime.Object { return &example.PodList{} },
+			NewFunc:        newFunc,
+			NewListFunc:    newListFunc,
 			Codec:          sc.Codec,
 		}
 		cacher, err := cacherstorage.NewCacherFromConfig(config)
@@ -1923,7 +1926,7 @@ type staleGuaranteedUpdateStorage struct {
 // GuaranteedUpdate overwrites the method with one that always suggests the cachedObj.
 func (s *staleGuaranteedUpdateStorage) GuaranteedUpdate(
 	ctx context.Context, key string, ptrToType runtime.Object, ignoreNotFound bool,
-	preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, _ ...runtime.Object) error {
+	preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, _ runtime.Object) error {
 	return s.Interface.GuaranteedUpdate(ctx, key, ptrToType, ignoreNotFound, preconditions, tryUpdate, s.cachedObj)
 }
 
@@ -2087,6 +2090,56 @@ func TestRetryDeleteValidation(t *testing.T) {
 		}
 		if called != 2 {
 			t.Fatalf("expected deleteValidation to be called twice")
+		}
+	}
+}
+
+func emptyIndexFunc(obj interface{}) ([]string, error) {
+	return []string{}, nil
+}
+
+func TestValidateIndexers(t *testing.T) {
+	testcases := []struct {
+		name          string
+		indexers      *cache.Indexers
+		expectedError bool
+	}{
+		{
+			name:          "nil indexers",
+			indexers:      nil,
+			expectedError: false,
+		},
+		{
+			name: "normal indexers",
+			indexers: &cache.Indexers{
+				"f:spec.nodeName":            emptyIndexFunc,
+				"l:controller-revision-hash": emptyIndexFunc,
+			},
+			expectedError: false,
+		},
+		{
+			name: "too short indexers",
+			indexers: &cache.Indexers{
+				"f": emptyIndexFunc,
+			},
+			expectedError: true,
+		},
+		{
+			name: "invalid indexers",
+			indexers: &cache.Indexers{
+				"spec.nodeName": emptyIndexFunc,
+			},
+			expectedError: true,
+		},
+	}
+
+	for _, tc := range testcases {
+		err := validateIndexers(tc.indexers)
+		if tc.expectedError && err == nil {
+			t.Errorf("%v: expected error, but got nil", tc.name)
+		}
+		if !tc.expectedError && err != nil {
+			t.Errorf("%v: expected no error, but got %v", tc.name, err)
 		}
 	}
 }

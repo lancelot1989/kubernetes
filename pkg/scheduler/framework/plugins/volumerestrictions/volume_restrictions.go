@@ -21,9 +21,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/algorithm/predicates"
-	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
-	"k8s.io/kubernetes/pkg/scheduler/nodeinfo"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // VolumeRestrictions is a plugin that checks volume restrictions.
@@ -34,17 +32,17 @@ var _ framework.FilterPlugin = &VolumeRestrictions{}
 // Name is the name of the plugin used in the plugin registry and configurations.
 const Name = "VolumeRestrictions"
 
+const (
+	// ErrReasonDiskConflict is used for NoDiskConflict predicate error.
+	ErrReasonDiskConflict = "node(s) had no available disk"
+)
+
 // Name returns name of the plugin. It is used in logs, etc.
 func (pl *VolumeRestrictions) Name() string {
 	return Name
 }
 
-func isVolumeConflict(volume v1.Volume, pod *v1.Pod) bool {
-	// fast path if there is no conflict checking targets.
-	if volume.GCEPersistentDisk == nil && volume.AWSElasticBlockStore == nil && volume.RBD == nil && volume.ISCSI == nil {
-		return false
-	}
-
+func isVolumeConflict(volume *v1.Volume, pod *v1.Pod) bool {
 	for _, existingVolume := range pod.Spec.Volumes {
 		// Same GCE disk mounted by multiple pods conflicts unless all pods mount it read-only.
 		if volume.GCEPersistentDisk != nil && existingVolume.GCEPersistentDisk != nil {
@@ -114,11 +112,17 @@ func haveOverlap(a1, a2 []string) bool {
 // - AWS EBS forbids any two pods mounting the same volume ID
 // - Ceph RBD forbids if any two pods share at least same monitor, and match pool and image, and the image is read-only
 // - ISCSI forbids if any two pods share at least same IQN and ISCSI volume is read-only
-func (pl *VolumeRestrictions) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *nodeinfo.NodeInfo) *framework.Status {
-	for _, v := range pod.Spec.Volumes {
-		for _, ev := range nodeInfo.Pods() {
-			if isVolumeConflict(v, ev) {
-				return framework.NewStatus(framework.Unschedulable, predicates.ErrDiskConflict.GetReason())
+func (pl *VolumeRestrictions) Filter(ctx context.Context, _ *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+	for i := range pod.Spec.Volumes {
+		v := &pod.Spec.Volumes[i]
+		// fast path if there is no conflict checking targets.
+		if v.GCEPersistentDisk == nil && v.AWSElasticBlockStore == nil && v.RBD == nil && v.ISCSI == nil {
+			continue
+		}
+
+		for _, ev := range nodeInfo.Pods {
+			if isVolumeConflict(v, ev.Pod) {
+				return framework.NewStatus(framework.Unschedulable, ErrReasonDiskConflict)
 			}
 		}
 	}
@@ -126,6 +130,6 @@ func (pl *VolumeRestrictions) Filter(ctx context.Context, _ *framework.CycleStat
 }
 
 // New initializes a new plugin and returns it.
-func New(_ *runtime.Unknown, _ framework.FrameworkHandle) (framework.Plugin, error) {
+func New(_ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
 	return &VolumeRestrictions{}, nil
 }

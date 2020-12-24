@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"k8s.io/klog"
-	"k8s.io/utils/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -48,14 +48,14 @@ import (
 const (
 	// reconcilerLoopSleepDuration is the amount of time the reconciler loop
 	// waits between successive executions
-	reconcilerLoopSleepDuration time.Duration = 1 * time.Nanosecond
+	reconcilerLoopSleepDuration = 1 * time.Nanosecond
 	// waitForAttachTimeout is the maximum amount of time a
 	// operationexecutor.Mount call will wait for a volume to be attached.
-	waitForAttachTimeout         time.Duration     = 1 * time.Second
-	nodeName                     k8stypes.NodeName = k8stypes.NodeName("mynodename")
-	kubeletPodsDir               string            = "fake-dir"
-	testOperationBackOffDuration time.Duration     = 100 * time.Millisecond
-	reconcilerSyncWaitDuration   time.Duration     = 10 * time.Second
+	waitForAttachTimeout         = 1 * time.Second
+	nodeName                     = k8stypes.NodeName("mynodename")
+	kubeletPodsDir               = "fake-dir"
+	testOperationBackOffDuration = 100 * time.Millisecond
+	reconcilerSyncWaitDuration   = 10 * time.Second
 )
 
 func hasAddedPods() bool { return true }
@@ -64,7 +64,7 @@ func hasAddedPods() bool { return true }
 // Verifies there are no calls to attach, detach, mount, unmount, etc.
 func Test_Run_Positive_DoNothing(t *testing.T) {
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createTestClient()
@@ -109,7 +109,7 @@ func Test_Run_Positive_DoNothing(t *testing.T) {
 // Verifies there is are attach/mount/etc calls and no detach/unmount calls.
 func Test_Run_Positive_VolumeAttachAndMount(t *testing.T) {
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createTestClient()
@@ -187,7 +187,7 @@ func Test_Run_Positive_VolumeAttachAndMount(t *testing.T) {
 // Verifies there are no attach/detach calls.
 func Test_Run_Positive_VolumeMountControllerAttachEnabled(t *testing.T) {
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createTestClient()
@@ -266,7 +266,7 @@ func Test_Run_Positive_VolumeMountControllerAttachEnabled(t *testing.T) {
 // Verifies detach/unmount calls are issued.
 func Test_Run_Positive_VolumeAttachMountUnmountDetach(t *testing.T) {
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createTestClient()
@@ -356,7 +356,7 @@ func Test_Run_Positive_VolumeAttachMountUnmountDetach(t *testing.T) {
 // Verifies there are no attach/detach calls made.
 func Test_Run_Positive_VolumeUnmountControllerAttachEnabled(t *testing.T) {
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createTestClient()
@@ -443,9 +443,6 @@ func Test_Run_Positive_VolumeUnmountControllerAttachEnabled(t *testing.T) {
 // Verifies there are attach/get map paths/setupDevice calls and
 // no detach/teardownDevice calls.
 func Test_Run_Positive_VolumeAttachAndMap(t *testing.T) {
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod1",
@@ -483,7 +480,7 @@ func Test_Run_Positive_VolumeAttachAndMap(t *testing.T) {
 	}
 
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createtestClientWithPVPVC(gcepv, gcepvc)
@@ -543,9 +540,6 @@ func Test_Run_Positive_VolumeAttachAndMap(t *testing.T) {
 // and no teardownDevice call.
 // Verifies there are no attach/detach calls.
 func Test_Run_Positive_BlockVolumeMapControllerAttachEnabled(t *testing.T) {
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod1",
@@ -586,7 +580,7 @@ func Test_Run_Positive_BlockVolumeMapControllerAttachEnabled(t *testing.T) {
 	}
 
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createtestClientWithPVPVC(gcepv, gcepvc, v1.AttachedVolume{
@@ -647,9 +641,6 @@ func Test_Run_Positive_BlockVolumeMapControllerAttachEnabled(t *testing.T) {
 // Deletes volume/pod from desired state of world.
 // Verifies one detach/teardownDevice calls are issued.
 func Test_Run_Positive_BlockVolumeAttachMapUnmapDetach(t *testing.T) {
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod1",
@@ -690,7 +681,7 @@ func Test_Run_Positive_BlockVolumeAttachMapUnmapDetach(t *testing.T) {
 	}
 
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createtestClientWithPVPVC(gcepv, gcepvc)
@@ -758,9 +749,6 @@ func Test_Run_Positive_BlockVolumeAttachMapUnmapDetach(t *testing.T) {
 // Verifies one teardownDevice call is made.
 // Verifies there are no attach/detach calls made.
 func Test_Run_Positive_VolumeUnmapControllerAttachEnabled(t *testing.T) {
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "pod1",
@@ -801,7 +789,7 @@ func Test_Run_Positive_VolumeUnmapControllerAttachEnabled(t *testing.T) {
 	}
 
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
 	kubeClient := createtestClientWithPVPVC(gcepv, gcepvc, v1.AttachedVolume{
@@ -883,9 +871,6 @@ func Test_GenerateMapVolumeFunc_Plugin_Not_Found(t *testing.T) {
 		},
 	}
 
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			volumePluginMgr := &volume.VolumePluginMgr{}
@@ -937,9 +922,6 @@ func Test_GenerateUnmapVolumeFunc_Plugin_Not_Found(t *testing.T) {
 		},
 	}
 
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			volumePluginMgr := &volume.VolumePluginMgr{}
@@ -983,9 +965,6 @@ func Test_GenerateUnmapDeviceFunc_Plugin_Not_Found(t *testing.T) {
 		},
 	}
 
-	// Enable BlockVolume feature gate
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.BlockVolume, true)()
-
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			volumePluginMgr := &volume.VolumePluginMgr{}
@@ -1022,16 +1001,42 @@ func Test_Run_Positive_VolumeFSResizeControllerAttachEnabled(t *testing.T) {
 	fsMode := v1.PersistentVolumeFilesystem
 
 	var tests = []struct {
-		name       string
-		volumeMode *v1.PersistentVolumeMode
+		name            string
+		volumeMode      *v1.PersistentVolumeMode
+		expansionFailed bool
+		pvName          string
+		pvcSize         resource.Quantity
+		pvcStatusSize   resource.Quantity
+		oldPVSize       resource.Quantity
+		newPVSize       resource.Quantity
 	}{
 		{
-			name:       "expand-fs-volume",
-			volumeMode: &fsMode,
+			name:          "expand-fs-volume",
+			volumeMode:    &fsMode,
+			pvName:        "pv",
+			pvcSize:       resource.MustParse("10G"),
+			pvcStatusSize: resource.MustParse("10G"),
+			newPVSize:     resource.MustParse("15G"),
+			oldPVSize:     resource.MustParse("10G"),
 		},
 		{
-			name:       "expand-raw-block",
-			volumeMode: &blockMode,
+			name:          "expand-raw-block",
+			volumeMode:    &blockMode,
+			pvName:        "pv",
+			pvcSize:       resource.MustParse("10G"),
+			pvcStatusSize: resource.MustParse("10G"),
+			newPVSize:     resource.MustParse("15G"),
+			oldPVSize:     resource.MustParse("10G"),
+		},
+		{
+			name:            "expand-fs-volume with in-use error",
+			volumeMode:      &fsMode,
+			expansionFailed: true,
+			pvName:          volumetesting.FailWithInUseVolumeName,
+			pvcSize:         resource.MustParse("10G"),
+			pvcStatusSize:   resource.MustParse("10G"),
+			newPVSize:       resource.MustParse("15G"),
+			oldPVSize:       resource.MustParse("13G"),
 		},
 	}
 
@@ -1039,12 +1044,15 @@ func Test_Run_Positive_VolumeFSResizeControllerAttachEnabled(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pv := &v1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "pv",
+					Name: tc.pvName,
 					UID:  "pvuid",
 				},
 				Spec: v1.PersistentVolumeSpec{
 					ClaimRef:   &v1.ObjectReference{Name: "pvc"},
 					VolumeMode: tc.volumeMode,
+					Capacity: v1.ResourceList{
+						v1.ResourceStorage: tc.oldPVSize,
+					},
 				},
 			}
 			pvc := &v1.PersistentVolumeClaim{
@@ -1053,8 +1061,18 @@ func Test_Run_Positive_VolumeFSResizeControllerAttachEnabled(t *testing.T) {
 					UID:  "pvcuid",
 				},
 				Spec: v1.PersistentVolumeClaimSpec{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceStorage: tc.pvcSize,
+						},
+					},
 					VolumeName: "pv",
 					VolumeMode: tc.volumeMode,
+				},
+				Status: v1.PersistentVolumeClaimStatus{
+					Capacity: v1.ResourceList{
+						v1.ResourceStorage: tc.pvcStatusSize,
+					},
 				},
 			}
 			pod := &v1.Pod{
@@ -1076,10 +1094,13 @@ func Test_Run_Positive_VolumeFSResizeControllerAttachEnabled(t *testing.T) {
 				},
 			}
 
-			volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+			volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 			dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 			asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
-			kubeClient := createtestClientWithPVPVC(pv, pvc)
+			kubeClient := createtestClientWithPVPVC(pv, pvc, v1.AttachedVolume{
+				Name:       v1.UniqueVolumeName(fmt.Sprintf("fake-plugin/%s", tc.pvName)),
+				DevicePath: "fake/path",
+			})
 			fakeRecorder := &record.FakeRecorder{}
 			fakeHandler := volumetesting.NewBlockVolumePathHandler()
 			oex := operationexecutor.NewOperationExecutor(operationexecutor.NewOperationGenerator(
@@ -1125,30 +1146,41 @@ func Test_Run_Positive_VolumeFSResizeControllerAttachEnabled(t *testing.T) {
 			close(stopChan)
 			<-stoppedChan
 
-			// Mark volume as fsResizeRequired.
+			// Simulate what DSOWP does
+			pv.Spec.Capacity[v1.ResourceStorage] = tc.newPVSize
+			volumeSpec = &volume.Spec{PersistentVolume: pv}
+			dsw.AddPodToVolume(podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGidValue */)
+			// mark volume as resize required
 			asw.MarkFSResizeRequired(volumeName, podName)
+
 			_, _, podExistErr := asw.PodExistsInVolume(podName, volumeName)
-			if !cache.IsFSResizeRequiredError(podExistErr) {
-				t.Fatalf("Volume should be marked as fsResizeRequired, but receive unexpected error: %v", podExistErr)
+			if tc.expansionFailed {
+				if cache.IsFSResizeRequiredError(podExistErr) {
+					t.Fatalf("volume %s should not throw fsResizeRequired error: %v", volumeName, podExistErr)
+				}
+			} else {
+				if !cache.IsFSResizeRequiredError(podExistErr) {
+					t.Fatalf("Volume should be marked as fsResizeRequired, but receive unexpected error: %v", podExistErr)
+				}
+
+				// Start the reconciler again, we hope reconciler will perform the
+				// resize operation and clear the fsResizeRequired flag for volume.
+				go reconciler.Run(wait.NeverStop)
+
+				waitErr := retryWithExponentialBackOff(testOperationBackOffDuration, func() (done bool, err error) {
+					mounted, _, err := asw.PodExistsInVolume(podName, volumeName)
+					return mounted && err == nil, nil
+				})
+				if waitErr != nil {
+					t.Fatal("Volume resize should succeeded")
+				}
 			}
 
-			// Start the reconciler again, we hope reconciler will perform the
-			// resize operation and clear the fsResizeRequired flag for volume.
-			go reconciler.Run(wait.NeverStop)
-
-			waitErr := retryWithExponentialBackOff(testOperationBackOffDuration, func() (done bool, err error) {
-				mounted, _, err := asw.PodExistsInVolume(podName, volumeName)
-				return mounted && err == nil, nil
-			})
-			if waitErr != nil {
-				t.Fatal("Volume resize should succeeded")
-			}
 		})
 	}
 }
 
 func Test_UncertainDeviceGlobalMounts(t *testing.T) {
-	fsMode := v1.PersistentVolumeFilesystem
 	var tests = []struct {
 		name                   string
 		deviceState            operationexecutor.DeviceMountState
@@ -1190,129 +1222,140 @@ func Test_UncertainDeviceGlobalMounts(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, mode := range []v1.PersistentVolumeMode{v1.PersistentVolumeBlock, v1.PersistentVolumeFilesystem} {
+		for _, tc := range tests {
+			testName := fmt.Sprintf("%s [%s]", tc.name, mode)
+			t.Run(testName+"[", func(t *testing.T) {
 
-			pv := &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: tc.volumeName,
-					UID:  "pvuid",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					ClaimRef:   &v1.ObjectReference{Name: "pvc"},
-					VolumeMode: &fsMode,
-				},
-			}
-			pvc := &v1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "pvc",
-					UID:  "pvcuid",
-				},
-				Spec: v1.PersistentVolumeClaimSpec{
-					VolumeName: tc.volumeName,
-				},
-			}
-			pod := &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "pod1",
-					UID:  "pod1uid",
-				},
-				Spec: v1.PodSpec{
-					Volumes: []v1.Volume{
-						{
-							Name: "volume-name",
-							VolumeSource: v1.VolumeSource{
-								PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
-									ClaimName: pvc.Name,
+				pv := &v1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: tc.volumeName,
+						UID:  "pvuid",
+					},
+					Spec: v1.PersistentVolumeSpec{
+						ClaimRef:   &v1.ObjectReference{Name: "pvc"},
+						VolumeMode: &mode,
+					},
+				}
+				pvc := &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pvc",
+						UID:  "pvcuid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						VolumeName: tc.volumeName,
+						VolumeMode: &mode,
+					},
+				}
+				pod := &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod1",
+						UID:  "pod1uid",
+					},
+					Spec: v1.PodSpec{
+						Volumes: []v1.Volume{
+							{
+								Name: "volume-name",
+								VolumeSource: v1.VolumeSource{
+									PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+										ClaimName: pvc.Name,
+									},
 								},
 							},
 						},
 					},
-				},
-			}
+				}
 
-			volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
-			fakePlugin.SupportsRemount = tc.supportRemount
+				volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
+				fakePlugin.SupportsRemount = tc.supportRemount
 
-			dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
-			asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
-			kubeClient := createtestClientWithPVPVC(pv, pvc, v1.AttachedVolume{
-				Name:       v1.UniqueVolumeName(fmt.Sprintf("fake-plugin/%s", tc.volumeName)),
-				DevicePath: "fake/path",
+				dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
+				asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
+				kubeClient := createtestClientWithPVPVC(pv, pvc, v1.AttachedVolume{
+					Name:       v1.UniqueVolumeName(fmt.Sprintf("fake-plugin/%s", tc.volumeName)),
+					DevicePath: "fake/path",
+				})
+				fakeRecorder := &record.FakeRecorder{}
+				fakeHandler := volumetesting.NewBlockVolumePathHandler()
+				oex := operationexecutor.NewOperationExecutor(operationexecutor.NewOperationGenerator(
+					kubeClient,
+					volumePluginMgr,
+					fakeRecorder,
+					false, /* checkNodeCapabilitiesBeforeMount */
+					fakeHandler))
+
+				reconciler := NewReconciler(
+					kubeClient,
+					true, /* controllerAttachDetachEnabled */
+					reconcilerLoopSleepDuration,
+					waitForAttachTimeout,
+					nodeName,
+					dsw,
+					asw,
+					hasAddedPods,
+					oex,
+					&mount.FakeMounter{},
+					hostutil.NewFakeHostUtil(nil),
+					volumePluginMgr,
+					kubeletPodsDir)
+				volumeSpec := &volume.Spec{PersistentVolume: pv}
+				podName := util.GetUniquePodName(pod)
+				volumeName, err := dsw.AddPodToVolume(
+					podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGidValue */)
+				// Assert
+				if err != nil {
+					t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
+				}
+				dsw.MarkVolumesReportedInUse([]v1.UniqueVolumeName{volumeName})
+
+				// Start the reconciler to fill ASW.
+				stopChan, stoppedChan := make(chan struct{}), make(chan struct{})
+				go func() {
+					reconciler.Run(stopChan)
+					close(stoppedChan)
+				}()
+				waitForVolumeToExistInASW(t, volumeName, asw)
+				if tc.volumeName == volumetesting.TimeoutAndFailOnMountDeviceVolumeName {
+					// Wait upto 10s for reconciler to catch up
+					time.Sleep(reconcilerSyncWaitDuration)
+				}
+
+				if tc.volumeName == volumetesting.SuccessAndFailOnMountDeviceName ||
+					tc.volumeName == volumetesting.SuccessAndTimeoutDeviceName {
+					// wait for mount and then break it via remount
+					waitForMount(t, fakePlugin, volumeName, asw)
+					asw.MarkRemountRequired(podName)
+					time.Sleep(reconcilerSyncWaitDuration)
+				}
+
+				if tc.deviceState == operationexecutor.DeviceMountUncertain {
+					waitForUncertainGlobalMount(t, volumeName, asw)
+				}
+
+				if tc.deviceState == operationexecutor.DeviceGloballyMounted {
+					waitForMount(t, fakePlugin, volumeName, asw)
+				}
+
+				dsw.DeletePodFromVolume(podName, volumeName)
+				waitForDetach(t, volumeName, asw)
+				if mode == v1.PersistentVolumeFilesystem {
+					err = volumetesting.VerifyUnmountDeviceCallCount(tc.unmountDeviceCallCount, fakePlugin)
+				} else {
+					if tc.unmountDeviceCallCount == 0 {
+						err = volumetesting.VerifyZeroTearDownDeviceCallCount(fakePlugin)
+					} else {
+						err = volumetesting.VerifyTearDownDeviceCallCount(tc.unmountDeviceCallCount, fakePlugin)
+					}
+				}
+				if err != nil {
+					t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+				}
 			})
-			fakeRecorder := &record.FakeRecorder{}
-			fakeHandler := volumetesting.NewBlockVolumePathHandler()
-			oex := operationexecutor.NewOperationExecutor(operationexecutor.NewOperationGenerator(
-				kubeClient,
-				volumePluginMgr,
-				fakeRecorder,
-				false, /* checkNodeCapabilitiesBeforeMount */
-				fakeHandler))
-
-			reconciler := NewReconciler(
-				kubeClient,
-				true, /* controllerAttachDetachEnabled */
-				reconcilerLoopSleepDuration,
-				waitForAttachTimeout,
-				nodeName,
-				dsw,
-				asw,
-				hasAddedPods,
-				oex,
-				&mount.FakeMounter{},
-				hostutil.NewFakeHostUtil(nil),
-				volumePluginMgr,
-				kubeletPodsDir)
-			volumeSpec := &volume.Spec{PersistentVolume: pv}
-			podName := util.GetUniquePodName(pod)
-			volumeName, err := dsw.AddPodToVolume(
-				podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGidValue */)
-			// Assert
-			if err != nil {
-				t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
-			}
-			dsw.MarkVolumesReportedInUse([]v1.UniqueVolumeName{volumeName})
-
-			// Start the reconciler to fill ASW.
-			stopChan, stoppedChan := make(chan struct{}), make(chan struct{})
-			go func() {
-				reconciler.Run(stopChan)
-				close(stoppedChan)
-			}()
-			waitForVolumeToExistInASW(t, volumeName, asw)
-			if tc.volumeName == volumetesting.TimeoutAndFailOnMountDeviceVolumeName {
-				// Wait upto 10s for reconciler to catchup
-				time.Sleep(reconcilerSyncWaitDuration)
-			}
-
-			if tc.volumeName == volumetesting.SuccessAndFailOnMountDeviceName ||
-				tc.volumeName == volumetesting.SuccessAndTimeoutDeviceName {
-				// wait for mount and then break it via remount
-				waitForMount(t, fakePlugin, volumeName, asw)
-				asw.MarkRemountRequired(podName)
-				time.Sleep(reconcilerSyncWaitDuration)
-			}
-
-			if tc.deviceState == operationexecutor.DeviceMountUncertain {
-				waitForUncertainGlobalMount(t, volumeName, asw)
-			}
-
-			if tc.deviceState == operationexecutor.DeviceGloballyMounted {
-				waitForMount(t, fakePlugin, volumeName, asw)
-			}
-
-			dsw.DeletePodFromVolume(podName, volumeName)
-			waitForDetach(t, volumeName, asw)
-			err = volumetesting.VerifyUnmountDeviceCallCount(tc.unmountDeviceCallCount, fakePlugin)
-			if err != nil {
-				t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
-			}
-		})
+		}
 	}
 }
 
 func Test_UncertainVolumeMountState(t *testing.T) {
-	fsMode := v1.PersistentVolumeFilesystem
 	var tests = []struct {
 		name                   string
 		volumeState            operationexecutor.VolumeMountState
@@ -1331,14 +1374,14 @@ func Test_UncertainVolumeMountState(t *testing.T) {
 		{
 			name:                   "failed operation should result in not-mounted volume",
 			volumeState:            operationexecutor.VolumeNotMounted,
-			unmountDeviceCallCount: 0,
+			unmountDeviceCallCount: 1,
 			unmountVolumeCount:     0,
 			volumeName:             volumetesting.FailOnSetupVolumeName,
 		},
 		{
 			name:                   "timeout followed by failed operation should result in non-mounted volume",
 			volumeState:            operationexecutor.VolumeNotMounted,
-			unmountDeviceCallCount: 0,
+			unmountDeviceCallCount: 1,
 			unmountVolumeCount:     0,
 			volumeName:             volumetesting.TimeoutAndFailOnSetupVolumeName,
 		},
@@ -1360,123 +1403,151 @@ func Test_UncertainVolumeMountState(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			pv := &v1.PersistentVolume{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: tc.volumeName,
-					UID:  "pvuid",
-				},
-				Spec: v1.PersistentVolumeSpec{
-					ClaimRef:   &v1.ObjectReference{Name: "pvc"},
-					VolumeMode: &fsMode,
-				},
-			}
-			pvc := &v1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "pvc",
-					UID:  "pvcuid",
-				},
-				Spec: v1.PersistentVolumeClaimSpec{
-					VolumeName: tc.volumeName,
-				},
-			}
-			pod := &v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "pod1",
-					UID:  "pod1uid",
-				},
-				Spec: v1.PodSpec{
-					Volumes: []v1.Volume{
-						{
-							Name: "volume-name",
-							VolumeSource: v1.VolumeSource{
-								PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
-									ClaimName: pvc.Name,
+	for _, mode := range []v1.PersistentVolumeMode{v1.PersistentVolumeBlock, v1.PersistentVolumeFilesystem} {
+		for _, tc := range tests {
+			testName := fmt.Sprintf("%s [%s]", tc.name, mode)
+			t.Run(testName, func(t *testing.T) {
+				pv := &v1.PersistentVolume{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: tc.volumeName,
+						UID:  "pvuid",
+					},
+					Spec: v1.PersistentVolumeSpec{
+						ClaimRef:   &v1.ObjectReference{Name: "pvc"},
+						VolumeMode: &mode,
+					},
+				}
+				pvc := &v1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pvc",
+						UID:  "pvcuid",
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						VolumeName: tc.volumeName,
+						VolumeMode: &mode,
+					},
+				}
+				pod := &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod1",
+						UID:  "pod1uid",
+					},
+					Spec: v1.PodSpec{
+						Volumes: []v1.Volume{
+							{
+								Name: "volume-name",
+								VolumeSource: v1.VolumeSource{
+									PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+										ClaimName: pvc.Name,
+									},
 								},
 							},
 						},
 					},
-				},
-			}
+				}
 
-			volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
-			fakePlugin.SupportsRemount = tc.supportRemount
-			dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
-			asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
-			kubeClient := createtestClientWithPVPVC(pv, pvc, v1.AttachedVolume{
-				Name:       v1.UniqueVolumeName(fmt.Sprintf("fake-plugin/%s", tc.volumeName)),
-				DevicePath: "fake/path",
+				volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
+				fakePlugin.SupportsRemount = tc.supportRemount
+				dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
+				asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
+				kubeClient := createtestClientWithPVPVC(pv, pvc, v1.AttachedVolume{
+					Name:       v1.UniqueVolumeName(fmt.Sprintf("fake-plugin/%s", tc.volumeName)),
+					DevicePath: "fake/path",
+				})
+				fakeRecorder := &record.FakeRecorder{}
+				fakeHandler := volumetesting.NewBlockVolumePathHandler()
+				oex := operationexecutor.NewOperationExecutor(operationexecutor.NewOperationGenerator(
+					kubeClient,
+					volumePluginMgr,
+					fakeRecorder,
+					false, /* checkNodeCapabilitiesBeforeMount */
+					fakeHandler))
+
+				reconciler := NewReconciler(
+					kubeClient,
+					true, /* controllerAttachDetachEnabled */
+					reconcilerLoopSleepDuration,
+					waitForAttachTimeout,
+					nodeName,
+					dsw,
+					asw,
+					hasAddedPods,
+					oex,
+					&mount.FakeMounter{},
+					hostutil.NewFakeHostUtil(nil),
+					volumePluginMgr,
+					kubeletPodsDir)
+				volumeSpec := &volume.Spec{PersistentVolume: pv}
+				podName := util.GetUniquePodName(pod)
+				volumeName, err := dsw.AddPodToVolume(
+					podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGidValue */)
+				// Assert
+				if err != nil {
+					t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
+				}
+				dsw.MarkVolumesReportedInUse([]v1.UniqueVolumeName{volumeName})
+
+				// Start the reconciler to fill ASW.
+				stopChan, stoppedChan := make(chan struct{}), make(chan struct{})
+				go func() {
+					reconciler.Run(stopChan)
+					close(stoppedChan)
+				}()
+				waitForVolumeToExistInASW(t, volumeName, asw)
+				if tc.volumeName == volumetesting.TimeoutAndFailOnSetupVolumeName {
+					// Wait upto 10s for reconciler to catchup
+					time.Sleep(reconcilerSyncWaitDuration)
+				}
+
+				if tc.volumeName == volumetesting.SuccessAndFailOnSetupVolumeName ||
+					tc.volumeName == volumetesting.SuccessAndTimeoutSetupVolumeName {
+					// wait for mount and then break it via remount
+					waitForMount(t, fakePlugin, volumeName, asw)
+					asw.MarkRemountRequired(podName)
+					time.Sleep(reconcilerSyncWaitDuration)
+				}
+
+				if tc.volumeState == operationexecutor.VolumeMountUncertain {
+					waitForUncertainPodMount(t, volumeName, asw)
+				}
+
+				if tc.volumeState == operationexecutor.VolumeMounted {
+					waitForMount(t, fakePlugin, volumeName, asw)
+				}
+
+				dsw.DeletePodFromVolume(podName, volumeName)
+				waitForDetach(t, volumeName, asw)
+
+				if mode == v1.PersistentVolumeFilesystem {
+					if err := volumetesting.VerifyUnmountDeviceCallCount(tc.unmountDeviceCallCount, fakePlugin); err != nil {
+						t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+					}
+					if err := volumetesting.VerifyTearDownCallCount(tc.unmountVolumeCount, fakePlugin); err != nil {
+						t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+					}
+				} else {
+					if tc.unmountVolumeCount == 0 {
+						if err := volumetesting.VerifyZeroUnmapPodDeviceCallCount(fakePlugin); err != nil {
+							t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+						}
+					} else {
+						if err := volumetesting.VerifyUnmapPodDeviceCallCount(tc.unmountVolumeCount, fakePlugin); err != nil {
+							t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+						}
+					}
+					if tc.unmountDeviceCallCount == 0 {
+						if err := volumetesting.VerifyZeroTearDownDeviceCallCount(fakePlugin); err != nil {
+							t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+						}
+					} else {
+						if err := volumetesting.VerifyTearDownDeviceCallCount(tc.unmountDeviceCallCount, fakePlugin); err != nil {
+							t.Errorf("Error verifying UnMountDeviceCallCount: %v", err)
+						}
+					}
+				}
 			})
-			fakeRecorder := &record.FakeRecorder{}
-			fakeHandler := volumetesting.NewBlockVolumePathHandler()
-			oex := operationexecutor.NewOperationExecutor(operationexecutor.NewOperationGenerator(
-				kubeClient,
-				volumePluginMgr,
-				fakeRecorder,
-				false, /* checkNodeCapabilitiesBeforeMount */
-				fakeHandler))
-
-			reconciler := NewReconciler(
-				kubeClient,
-				true, /* controllerAttachDetachEnabled */
-				reconcilerLoopSleepDuration,
-				waitForAttachTimeout,
-				nodeName,
-				dsw,
-				asw,
-				hasAddedPods,
-				oex,
-				&mount.FakeMounter{},
-				hostutil.NewFakeHostUtil(nil),
-				volumePluginMgr,
-				kubeletPodsDir)
-			volumeSpec := &volume.Spec{PersistentVolume: pv}
-			podName := util.GetUniquePodName(pod)
-			volumeName, err := dsw.AddPodToVolume(
-				podName, pod, volumeSpec, volumeSpec.Name(), "" /* volumeGidValue */)
-			// Assert
-			if err != nil {
-				t.Fatalf("AddPodToVolume failed. Expected: <no error> Actual: <%v>", err)
-			}
-			dsw.MarkVolumesReportedInUse([]v1.UniqueVolumeName{volumeName})
-
-			// Start the reconciler to fill ASW.
-			stopChan, stoppedChan := make(chan struct{}), make(chan struct{})
-			go func() {
-				reconciler.Run(stopChan)
-				close(stoppedChan)
-			}()
-			waitForVolumeToExistInASW(t, volumeName, asw)
-			if tc.volumeName == volumetesting.TimeoutAndFailOnSetupVolumeName {
-				// Wait upto 10s for reconciler to catchup
-				time.Sleep(reconcilerSyncWaitDuration)
-			}
-
-			if tc.volumeName == volumetesting.SuccessAndFailOnSetupVolumeName ||
-				tc.volumeName == volumetesting.SuccessAndTimeoutSetupVolumeName {
-				// wait for mount and then break it via remount
-				waitForMount(t, fakePlugin, volumeName, asw)
-				asw.MarkRemountRequired(podName)
-				time.Sleep(reconcilerSyncWaitDuration)
-			}
-
-			if tc.volumeState == operationexecutor.VolumeMountUncertain {
-				waitForUncertainPodMount(t, volumeName, asw)
-			}
-
-			if tc.volumeState == operationexecutor.VolumeMounted {
-				waitForMount(t, fakePlugin, volumeName, asw)
-			}
-
-			dsw.DeletePodFromVolume(podName, volumeName)
-			waitForDetach(t, volumeName, asw)
-
-			volumetesting.VerifyUnmountDeviceCallCount(tc.unmountDeviceCallCount, fakePlugin)
-			volumetesting.VerifyTearDownCallCount(tc.unmountVolumeCount, fakePlugin)
-		})
+		}
 	}
-
 }
 
 func waitForUncertainGlobalMount(t *testing.T, volumeName v1.UniqueVolumeName, asw cache.ActualStateOfWorld) {
@@ -1636,6 +1707,12 @@ func createtestClientWithPVPVC(pv *v1.PersistentVolume, pvc *v1.PersistentVolume
 	fakeClient.AddReactor("get", "persistentvolumes", func(action core.Action) (bool, runtime.Object, error) {
 		return true, pv, nil
 	})
+	fakeClient.AddReactor("patch", "persistentvolumeclaims", func(action core.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "status" {
+			return true, pvc, nil
+		}
+		return true, nil, fmt.Errorf("no reaction implemented for %s", action)
+	})
 	fakeClient.AddReactor("*", "*", func(action core.Action) (bool, runtime.Object, error) {
 		return true, nil, fmt.Errorf("no reaction implemented for %s", action)
 	})
@@ -1644,7 +1721,7 @@ func createtestClientWithPVPVC(pv *v1.PersistentVolume, pvc *v1.PersistentVolume
 
 func Test_Run_Positive_VolumeMountControllerAttachEnabledRace(t *testing.T) {
 	// Arrange
-	volumePluginMgr, fakePlugin := volumetesting.GetTestVolumePluginMgr(t)
+	volumePluginMgr, fakePlugin := volumetesting.GetTestKubeletVolumePluginMgr(t)
 
 	dsw := cache.NewDesiredStateOfWorld(volumePluginMgr)
 	asw := cache.NewActualStateOfWorld(nodeName, volumePluginMgr)
@@ -1714,6 +1791,7 @@ func Test_Run_Positive_VolumeMountControllerAttachEnabledRace(t *testing.T) {
 	<-stoppedChan
 
 	finished := make(chan interface{})
+	fakePlugin.Lock()
 	fakePlugin.UnmountDeviceHook = func(mountPath string) error {
 		// Act:
 		// 3. While a volume is being unmounted, add it back to the desired state of world
@@ -1735,6 +1813,7 @@ func Test_Run_Positive_VolumeMountControllerAttachEnabledRace(t *testing.T) {
 		close(finished)
 		return devicePath, nil
 	}
+	fakePlugin.Unlock()
 
 	// Start the reconciler again.
 	go reconciler.Run(wait.NeverStop)

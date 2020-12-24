@@ -17,6 +17,7 @@ limitations under the License.
 package labels
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -140,6 +141,7 @@ func expectMatchDirect(t *testing.T, selector, ls Set) {
 	}
 }
 
+//lint:ignore U1000 currently commented out in TODO of TestSetMatches
 func expectNoMatchDirect(t *testing.T, selector, ls Set) {
 	if SelectorFromSet(selector).Matches(ls) {
 		t.Errorf("Wanted '%s' to not match '%s', but it did.", selector, ls)
@@ -240,16 +242,14 @@ func TestLexerSequence(t *testing.T) {
 		{"key<1", []Token{IdentifierToken, LessThanToken, IdentifierToken}},
 	}
 	for _, v := range testcases {
-		var literals []string
 		var tokens []Token
 		l := &Lexer{s: v.s, pos: 0}
 		for {
-			token, lit := l.Lex()
+			token, _ := l.Lex()
 			if token == EndOfStringToken {
 				break
 			}
 			tokens = append(tokens, token)
-			literals = append(literals, lit)
 		}
 		if len(tokens) != len(v.t) {
 			t.Errorf("Bad number of tokens for '%s %d, %d", v.s, len(tokens), len(v.t))
@@ -706,5 +706,35 @@ func TestRequiresExactMatch(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func TestValidatedSelectorFromSet(t *testing.T) {
+	tests := []struct {
+		name             string
+		input            Set
+		expectedSelector internalSelector
+		expectedError    error
+	}{
+		{
+			name:             "Simple Set, no error",
+			input:            Set{"key": "val"},
+			expectedSelector: internalSelector([]Requirement{{key: "key", operator: selection.Equals, strValues: []string{"val"}}}),
+		},
+		{
+			name:          "Invalid Set, value too long",
+			input:         Set{"Key": "axahm2EJ8Phiephe2eixohbee9eGeiyees1thuozi1xoh0GiuH3diewi8iem7Nui"},
+			expectedError: fmt.Errorf(`invalid label value: "axahm2EJ8Phiephe2eixohbee9eGeiyees1thuozi1xoh0GiuH3diewi8iem7Nui": at key: "Key": must be no more than 63 characters`),
+		},
+	}
+
+	for _, tc := range tests {
+		selector, err := ValidatedSelectorFromSet(tc.input)
+		if !reflect.DeepEqual(err, tc.expectedError) {
+			t.Fatalf("expected error %v, got error %v", tc.expectedError, err)
+		}
+		if err == nil && !reflect.DeepEqual(selector, tc.expectedSelector) {
+			t.Errorf("expected selector %v, got selector %v", tc.expectedSelector, selector)
+		}
 	}
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package integration
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -26,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
 
@@ -76,7 +78,7 @@ func TestForProperValidationErrors(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		_, err := noxuResourceClient.Create(tc.instanceFn(), metav1.CreateOptions{})
+		_, err := noxuResourceClient.Create(context.TODO(), tc.instanceFn(), metav1.CreateOptions{})
 		if err == nil {
 			t.Errorf("%v: expected %v", tc.name, tc.expectedError)
 			continue
@@ -245,7 +247,7 @@ func TestCustomResourceValidation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unable to create noxu instance: %v", err)
 			}
-			noxuResourceClient.Delete("foo", &metav1.DeleteOptions{})
+			noxuResourceClient.Delete(context.TODO(), "foo", metav1.DeleteOptions{})
 		}
 		if err := fixtures.DeleteCustomResourceDefinition(noxuDefinition, apiExtensionClient); err != nil {
 			t.Fatal(err)
@@ -325,7 +327,7 @@ func TestCustomResourceItemsValidation(t *testing.T) {
 			},
 		},
 	}}
-	_, err = client.Resource(gvr).Create(&u, metav1.CreateOptions{})
+	_, err = client.Resource(gvr).Create(context.TODO(), &u, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -451,7 +453,7 @@ func TestCustomResourceUpdateValidation(t *testing.T) {
 				t.Fatalf("unable to create noxu instance: %v", err)
 			}
 
-			gottenNoxuInstance, err := noxuResourceClient.Get("foo", metav1.GetOptions{})
+			gottenNoxuInstance, err := noxuResourceClient.Get(context.TODO(), "foo", metav1.GetOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -468,11 +470,11 @@ func TestCustomResourceUpdateValidation(t *testing.T) {
 				"delta": "hello",
 			}
 
-			_, err = noxuResourceClient.Update(gottenNoxuInstance, metav1.UpdateOptions{})
+			_, err = noxuResourceClient.Update(context.TODO(), gottenNoxuInstance, metav1.UpdateOptions{})
 			if err == nil {
 				t.Fatalf("unexpected non-error: alpha and beta should be present while updating %v", gottenNoxuInstance)
 			}
-			noxuResourceClient.Delete("foo", &metav1.DeleteOptions{})
+			noxuResourceClient.Delete(context.TODO(), "foo", metav1.DeleteOptions{})
 		}
 		if err := fixtures.DeleteCustomResourceDefinition(noxuDefinition, apiExtensionClient); err != nil {
 			t.Fatal(err)
@@ -565,7 +567,7 @@ func TestCustomResourceValidationErrors(t *testing.T) {
 				noxuResourceClient := newNamespacedCustomResourceVersionedClient(ns, dynamicClient, noxuDefinition, v.Name)
 				instanceToCreate := tc.instanceFn()
 				instanceToCreate.Object["apiVersion"] = fmt.Sprintf("%s/%s", noxuDefinition.Spec.Group, v.Name)
-				_, err := noxuResourceClient.Create(instanceToCreate, metav1.CreateOptions{})
+				_, err := noxuResourceClient.Create(context.TODO(), instanceToCreate, metav1.CreateOptions{})
 				if err == nil {
 					t.Errorf("%v: expected %v", tc.name, tc.expectedErrors)
 					continue
@@ -633,7 +635,7 @@ func TestCRValidationOnCRDUpdate(t *testing.T) {
 
 			// CR is now accepted
 			err = wait.Poll(500*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-				_, err := noxuResourceClient.Create(instanceToCreate, metav1.CreateOptions{})
+				_, err := noxuResourceClient.Create(context.TODO(), instanceToCreate, metav1.CreateOptions{})
 				if _, isStatus := err.(*apierrors.StatusError); isStatus {
 					if apierrors.IsInvalid(err) {
 						return false, nil
@@ -647,7 +649,7 @@ func TestCRValidationOnCRDUpdate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			noxuResourceClient.Delete("foo", &metav1.DeleteOptions{})
+			noxuResourceClient.Delete(context.TODO(), "foo", metav1.DeleteOptions{})
 			if err := fixtures.DeleteCustomResourceDefinition(noxuDefinition, apiExtensionClient); err != nil {
 				t.Fatal(err)
 			}
@@ -758,7 +760,7 @@ spec:
 
 	// create CRDs
 	t.Logf("Creating CRD %s", crd.Name)
-	if _, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(crd); err != nil {
+	if _, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("unexpected create error: %v", err)
 	}
 
@@ -766,7 +768,7 @@ spec:
 	t.Log("Waiting for NonStructuralSchema condition")
 	var cond *apiextensionsv1beta1.CustomResourceDefinitionCondition
 	err = wait.PollImmediate(100*time.Millisecond, 5*time.Second, func() (bool, error) {
-		obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
+		obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -779,21 +781,25 @@ spec:
 	if v := "spec.versions[0].schema.openAPIV3Schema.properties[a].type: Required value: must not be empty for specified object fields"; !strings.Contains(cond.Message, v) {
 		t.Fatalf("expected violation %q, but got: %v", v, cond.Message)
 	}
+	if v := "spec.preserveUnknownFields: Invalid value: true: must be false"; !strings.Contains(cond.Message, v) {
+		t.Fatalf("expected violation %q, but got: %v", v, cond.Message)
+	}
 
 	// remove schema
 	t.Log("Remove schema")
 	for retry := 0; retry < 5; retry++ {
-		crd, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
-		if err != nil {
-			t.Fatalf("unexpected get error: %v", err)
-		}
-		crd.Spec.Validation = nil
-		if _, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Update(crd); apierrors.IsConflict(err) {
+		// This patch fixes two fields to resolve
+		// 1. property type validation error
+		// 2. preserveUnknownFields validation error
+		patch := []byte("[{\"op\":\"add\",\"path\":\"/spec/validation/openAPIV3Schema/properties/a/type\",\"value\":\"int\"}," +
+			"{\"op\":\"replace\",\"path\":\"/spec/preserveUnknownFields\",\"value\":false}]")
+		if _, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Patch(context.TODO(), name, types.JSONPatchType, patch, metav1.PatchOptions{}); apierrors.IsConflict(err) {
 			continue
 		}
 		if err != nil {
 			t.Fatalf("unexpected update error: %v", err)
 		}
+		break
 	}
 	if err != nil {
 		t.Fatalf("unexpected update error: %v", err)
@@ -802,7 +808,7 @@ spec:
 	// wait for condition to go away
 	t.Log("Wait for condition to disappear")
 	err = wait.PollImmediate(100*time.Millisecond, 5*time.Second, func() (bool, error) {
-		obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
+		obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -813,20 +819,22 @@ spec:
 		t.Fatalf("unexpected error waiting for NonStructuralSchema condition: %v", cond)
 	}
 
-	// readd schema
-	t.Log("Readd schema")
+	// re-add schema
+	t.Log("Re-add schema")
 	for retry := 0; retry < 5; retry++ {
-		crd, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
+		crd, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("unexpected get error: %v", err)
 		}
+		crd.Spec.PreserveUnknownFields = nil
 		crd.Spec.Validation = &apiextensionsv1beta1.CustomResourceValidation{OpenAPIV3Schema: origSchema}
-		if _, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Update(crd); apierrors.IsConflict(err) {
+		if _, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Update(context.TODO(), crd, metav1.UpdateOptions{}); apierrors.IsConflict(err) {
 			continue
 		}
 		if err != nil {
 			t.Fatalf("unexpected update error: %v", err)
 		}
+		break
 	}
 	if err != nil {
 		t.Fatalf("unexpected update error: %v", err)
@@ -835,7 +843,7 @@ spec:
 	// wait for condition with violations
 	t.Log("Wait for condition to reappear")
 	err = wait.PollImmediate(100*time.Millisecond, 5*time.Second, func() (bool, error) {
-		obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(name, metav1.GetOptions{})
+		obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -846,6 +854,9 @@ spec:
 		t.Fatalf("unexpected error waiting for NonStructuralSchema condition: %v", cond)
 	}
 	if v := "spec.versions[0].schema.openAPIV3Schema.properties[a].type: Required value: must not be empty for specified object fields"; !strings.Contains(cond.Message, v) {
+		t.Fatalf("expected violation %q, but got: %v", v, cond.Message)
+	}
+	if v := "spec.preserveUnknownFields: Invalid value: true: must be false"; !strings.Contains(cond.Message, v) {
 		t.Fatalf("expected violation %q, but got: %v", v, cond.Message)
 	}
 }
@@ -861,6 +872,7 @@ func TestNonStructuralSchemaCondition(t *testing.T) {
 apiVersion: apiextensions.k8s.io/v1beta1
 kind: CustomResourceDefinition
 spec:
+  preserveUnknownFields: PRESERVE_UNKNOWN_FIELDS
   version: v1beta1
   names:
     plural: foos
@@ -881,6 +893,7 @@ spec:
 
 	type Test struct {
 		desc                                  string
+		preserveUnknownFields                 string
 		globalSchema, v1Schema, v1beta1Schema string
 		expectedCreateErrors                  []string
 		unexpectedCreateErrors                []string
@@ -888,7 +901,19 @@ spec:
 		unexpectedViolations                  []string
 	}
 	tests := []Test{
-		{"empty", "", "", "", nil, nil, nil, nil},
+		{
+			desc: "empty",
+			expectedViolations: []string{
+				"spec.preserveUnknownFields: Invalid value: true: must be false",
+			},
+		},
+		{
+			desc:                  "preserve unknown fields is false",
+			preserveUnknownFields: "false",
+			globalSchema: `
+type: object
+`,
+		},
 		{
 			desc: "int-or-string and preserve-unknown-fields true",
 			globalSchema: `
@@ -921,7 +946,8 @@ x-kubernetes-embedded-resource: true
 			},
 		},
 		{
-			desc: "embedded-resource without preserve-unknown-fields, but properties",
+			desc:                  "embedded-resource without preserve-unknown-fields, but properties",
+			preserveUnknownFields: "false",
 			globalSchema: `
 type: object
 x-kubernetes-embedded-resource: true
@@ -933,16 +959,15 @@ properties:
  metadata:
    type: object
 `,
-			expectedViolations: []string{},
 		},
 		{
-			desc: "embedded-resource with preserve-unknown-fields",
+			desc:                  "embedded-resource with preserve-unknown-fields",
+			preserveUnknownFields: "false",
 			globalSchema: `
 type: object
 x-kubernetes-embedded-resource: true
 x-kubernetes-preserve-unknown-fields: true
 `,
-			expectedViolations: []string{},
 		},
 		{
 			desc: "embedded-resource with wrong type",
@@ -1329,7 +1354,8 @@ oneOf:
 			},
 		},
 		{
-			desc: "structural complete",
+			desc:                  "structural complete",
+			preserveUnknownFields: "false",
 			globalSchema: `
 type: object
 properties:
@@ -1390,7 +1416,6 @@ oneOf:
 - properties:
    g: {}
 `,
-			expectedViolations: nil,
 		},
 		{
 			desc: "invalid v1beta1 schema",
@@ -1471,7 +1496,8 @@ properties:
 			},
 		},
 		{
-			desc: "metadata with name property",
+			desc:                  "metadata with name property",
+			preserveUnknownFields: "false",
 			globalSchema: `
 type: object
 properties:
@@ -1482,10 +1508,10 @@ properties:
        type: string
        pattern: "^[a-z]+$"
 `,
-			expectedViolations: []string{},
 		},
 		{
-			desc: "metadata with generateName property",
+			desc:                  "metadata with generateName property",
+			preserveUnknownFields: "false",
 			globalSchema: `
 type: object
 properties:
@@ -1496,10 +1522,10 @@ properties:
        type: string
        pattern: "^[a-z]+$"
 `,
-			expectedViolations: []string{},
 		},
 		{
-			desc: "metadata with name and generateName property",
+			desc:                  "metadata with name and generateName property",
+			preserveUnknownFields: "false",
 			globalSchema: `
 type: object
 properties:
@@ -1513,7 +1539,6 @@ properties:
        type: string
        pattern: "^[a-z]+$"
 `,
-			expectedViolations: []string{},
 		},
 		{
 			desc: "metadata under junctors",
@@ -1596,6 +1621,7 @@ properties:
 				"GLOBAL_SCHEMA", toValidationJSON(tst.globalSchema),
 				"V1BETA1_SCHEMA", toValidationJSON(tst.v1beta1Schema),
 				"V1_SCHEMA", toValidationJSON(tst.v1Schema),
+				"PRESERVE_UNKNOWN_FIELDS", tst.preserveUnknownFields,
 			).Replace(tmpl)
 
 			// decode CRD manifest
@@ -1608,7 +1634,7 @@ properties:
 			crd.Name = fmt.Sprintf("foos.%s", crd.Spec.Group)
 
 			// create CRDs
-			crd, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(crd)
+			crd, err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(context.TODO(), crd, metav1.CreateOptions{})
 			if len(tst.expectedCreateErrors) > 0 && err == nil {
 				t.Fatalf("expected create errors, got none")
 			} else if len(tst.expectedCreateErrors) == 0 && err != nil {
@@ -1633,7 +1659,7 @@ properties:
 				// wait for condition to not appear
 				var cond *apiextensionsv1beta1.CustomResourceDefinitionCondition
 				err := wait.PollImmediate(100*time.Millisecond, 5*time.Second, func() (bool, error) {
-					obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(crd.Name, metav1.GetOptions{})
+					obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
 					if err != nil {
 						return false, err
 					}
@@ -1652,7 +1678,7 @@ properties:
 			// wait for condition to appear with the given violations
 			var cond *apiextensionsv1beta1.CustomResourceDefinitionCondition
 			err = wait.PollImmediate(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-				obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(crd.Name, metav1.GetOptions{})
+				obj, err := apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Get(context.TODO(), crd.Name, metav1.GetOptions{})
 				if err != nil {
 					return false, err
 				}

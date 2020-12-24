@@ -17,20 +17,22 @@ limitations under the License.
 package quobyte
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	gostrings "strings"
 
 	"github.com/google/uuid"
-	"k8s.io/klog"
-	"k8s.io/utils/mount"
+	"k8s.io/klog/v2"
+	"k8s.io/mount-utils"
 	utilstrings "k8s.io/utils/strings"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	proxyutil "k8s.io/kubernetes/pkg/proxy/util"
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
 )
@@ -48,7 +50,7 @@ type quobytePlugin struct {
 // Quobyte API server and holds all information
 type quobyteAPIConfig struct {
 	quobyteUser      string
-	quobytePassword  string
+	quobytePassword  string `datapolicy:"password"`
 	quobyteAPIServer string
 }
 
@@ -64,6 +66,9 @@ const (
 )
 
 func (plugin *quobytePlugin) Init(host volume.VolumeHost) error {
+	if host == nil {
+		return errors.New("host must not be nil")
+	}
 	plugin.host = host
 	return nil
 }
@@ -111,7 +116,7 @@ func (plugin *quobytePlugin) CanSupport(spec *volume.Spec) bool {
 	return false
 }
 
-func (plugin *quobytePlugin) RequiresRemount() bool {
+func (plugin *quobytePlugin) RequiresRemount(spec *volume.Spec) bool {
 	return false
 }
 
@@ -258,7 +263,7 @@ func (mounter *quobyteMounter) SetUpAt(dir string, mounterArgs volume.MounterArg
 
 	//if a trailing slash is missing we add it here
 	mountOptions := util.JoinMountOptions(mounter.mountOptions, options)
-	if err := mounter.mounter.Mount(mounter.correctTraillingSlash(mounter.registry), dir, "quobyte", mountOptions); err != nil {
+	if err := mounter.mounter.MountSensitiveWithoutSystemd(mounter.correctTraillingSlash(mounter.registry), dir, "quobyte", mountOptions, nil); err != nil {
 		return fmt.Errorf("quobyte: mount failed: %v", err)
 	}
 
@@ -303,7 +308,8 @@ func (unmounter *quobyteUnmounter) TearDownAt(dir string) error {
 
 type quobyteVolumeDeleter struct {
 	*quobyteMounter
-	pv *v1.PersistentVolume
+	pv          *v1.PersistentVolume
+	dialOptions *proxyutil.FilteredDialOptions
 }
 
 func (plugin *quobytePlugin) NewDeleter(spec *volume.Spec) (volume.Deleter, error) {
@@ -319,6 +325,9 @@ func (plugin *quobytePlugin) newDeleterInternal(spec *volume.Spec) (volume.Delet
 	if err != nil {
 		return nil, err
 	}
+	if plugin.host == nil {
+		return nil, errors.New("host must not be nil")
+	}
 
 	return &quobyteVolumeDeleter{
 		quobyteMounter: &quobyteMounter{
@@ -333,7 +342,8 @@ func (plugin *quobytePlugin) newDeleterInternal(spec *volume.Spec) (volume.Delet
 			registry: source.Registry,
 			readOnly: readOnly,
 		},
-		pv: spec.PersistentVolume,
+		pv:          spec.PersistentVolume,
+		dialOptions: plugin.host.GetFilteredDialOptions(),
 	}, nil
 }
 
@@ -342,19 +352,24 @@ func (plugin *quobytePlugin) NewProvisioner(options volume.VolumeOptions) (volum
 }
 
 func (plugin *quobytePlugin) newProvisionerInternal(options volume.VolumeOptions) (volume.Provisioner, error) {
+	if plugin.host == nil {
+		return nil, errors.New("host must not be nil")
+	}
 	return &quobyteVolumeProvisioner{
 		quobyteMounter: &quobyteMounter{
 			quobyte: &quobyte{
 				plugin: plugin,
 			},
 		},
-		options: options,
+		options:     options,
+		dialOptions: plugin.host.GetFilteredDialOptions(),
 	}, nil
 }
 
 type quobyteVolumeProvisioner struct {
 	*quobyteMounter
-	options volume.VolumeOptions
+	options     volume.VolumeOptions
+	dialOptions *proxyutil.FilteredDialOptions
 }
 
 func (provisioner *quobyteVolumeProvisioner) Provision(selectedNode *v1.Node, allowedTopologies []v1.TopologySelectorTerm) (*v1.PersistentVolume, error) {
@@ -408,12 +423,15 @@ func (provisioner *quobyteVolumeProvisioner) Provision(selectedNode *v1.Node, al
 	provisioner.volume = fmt.Sprintf("kubernetes-dynamic-pvc-%s", uuid.New().String())
 
 	manager := &quobyteVolumeManager{
-		config: cfg,
+		config:      cfg,
+		dialOptions: provisioner.dialOptions,
 	}
 
 	vol, sizeGB, err := manager.createVolume(provisioner, createQuota)
 	if err != nil {
-		return nil, err
+		// don't log error details from client calls in events
+		klog.V(4).Infof("CreateVolume failed: %v", err)
+		return nil, errors.New("CreateVolume failed: see kube-controller-manager.log for details")
 	}
 	pv := new(v1.PersistentVolume)
 	metav1.SetMetaDataAnnotation(&pv.ObjectMeta, util.VolumeDynamicallyCreatedByKey, "quobyte-dynamic-provisioner")
@@ -446,9 +464,16 @@ func (deleter *quobyteVolumeDeleter) Delete() error {
 		return err
 	}
 	manager := &quobyteVolumeManager{
-		config: cfg,
+		config:      cfg,
+		dialOptions: deleter.dialOptions,
 	}
-	return manager.deleteVolume(deleter)
+	err = manager.deleteVolume(deleter)
+	if err != nil {
+		// don't log error details from client calls in events
+		klog.V(4).Infof("DeleteVolume failed: %v", err)
+		return errors.New("DeleteVolume failed: see kube-controller-manager.log for details")
+	}
+	return nil
 }
 
 // Parse API configuration (url, username and password) out of class.Parameters.
@@ -456,19 +481,14 @@ func parseAPIConfig(plugin *quobytePlugin, params map[string]string) (*quobyteAP
 	var apiServer, secretName string
 	secretNamespace := "default"
 
-	deleteKeys := []string{}
-
 	for k, v := range params {
 		switch gostrings.ToLower(k) {
 		case "adminsecretname":
 			secretName = v
-			deleteKeys = append(deleteKeys, k)
 		case "adminsecretnamespace":
 			secretNamespace = v
-			deleteKeys = append(deleteKeys, k)
 		case "quobyteapiserver":
 			apiServer = v
-			deleteKeys = append(deleteKeys, k)
 		}
 	}
 

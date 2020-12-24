@@ -17,31 +17,50 @@ limitations under the License.
 package queueset
 
 import (
+	"context"
 	"time"
 
+	genericrequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/util/flowcontrol/debug"
+	fq "k8s.io/apiserver/pkg/util/flowcontrol/fairqueuing"
 	"k8s.io/apiserver/pkg/util/flowcontrol/fairqueuing/promise"
 )
 
 // request is a temporary container for "requests" with additional
 // tracking fields required for the functionality FQScheduler
 type request struct {
+	ctx context.Context
+
+	qs *queueSet
+
+	flowDistinguisher string
+	fsName            string
+
+	// The relevant queue.  Is nil if this request did not go through
+	// a queue.
 	queue *queue
 
 	// startTime is the real time when the request began executing
 	startTime time.Time
 
-	// decision gets set to the decision about what to do with this request
-	decision promise.LockingMutable
+	// decision gets set to a `requestDecision` indicating what to do
+	// with this request.  It gets set exactly once, when the request
+	// is removed from its queue.  The value will be decisionReject,
+	// decisionCancel, or decisionExecute; decisionTryAnother never
+	// appears here.
+	decision promise.LockingWriteOnce
 
 	// arrivalTime is the real time when the request entered this system
 	arrivalTime time.Time
 
-	// isWaiting indicates whether the request is presently waiting in a queue
-	isWaiting bool
-
 	// descr1 and descr2 are not used in any logic but they appear in
 	// log messages
 	descr1, descr2 interface{}
+
+	// Indicates whether client has called Request::Wait()
+	waitStarted bool
+
+	queueNoteFn fq.QueueNoteFn
 }
 
 // queue is an array of requests with additional metadata required for
@@ -60,7 +79,6 @@ type queue struct {
 
 // Enqueue enqueues a request into the queue
 func (q *queue) Enqueue(request *request) {
-	request.isWaiting = true
 	q.requests = append(q.requests, request)
 }
 
@@ -71,8 +89,6 @@ func (q *queue) Dequeue() (*request, bool) {
 	}
 	request := q.requests[0]
 	q.requests = q.requests[1:]
-
-	request.isWaiting = false
 	return request, true
 }
 
@@ -85,4 +101,28 @@ func (q *queue) GetVirtualFinish(J int, G float64) float64 {
 	// counting from J=1 for the head (eg: queue.requests[0] -> J=1) - J+1
 	jg := float64(J+1) * float64(G)
 	return jg + q.virtualStart
+}
+
+func (q *queue) dump(includeDetails bool) debug.QueueDump {
+	digest := make([]debug.RequestDump, len(q.requests))
+	for i, r := range q.requests {
+		// dump requests.
+		digest[i].MatchedFlowSchema = r.fsName
+		digest[i].FlowDistinguisher = r.flowDistinguisher
+		digest[i].ArriveTime = r.arrivalTime
+		digest[i].StartTime = r.startTime
+		if includeDetails {
+			userInfo, _ := genericrequest.UserFrom(r.ctx)
+			digest[i].UserName = userInfo.GetName()
+			requestInfo, ok := genericrequest.RequestInfoFrom(r.ctx)
+			if ok {
+				digest[i].RequestInfo = *requestInfo
+			}
+		}
+	}
+	return debug.QueueDump{
+		VirtualStart:      q.virtualStart,
+		Requests:          digest,
+		ExecutingRequests: q.requestsExecuting,
+	}
 }

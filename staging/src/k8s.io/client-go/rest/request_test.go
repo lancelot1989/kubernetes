@@ -31,11 +31,12 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -94,9 +95,9 @@ func TestRequestSetsHeaders(t *testing.T) {
 	r.c.Client = server
 
 	// Check if all "issue" methods are setting headers.
-	_ = r.Do()
-	_, _ = r.Watch()
-	_, _ = r.Stream()
+	_ = r.Do(context.Background())
+	_, _ = r.Watch(context.Background())
+	_, _ = r.Stream(context.Background())
 }
 
 func TestRequestWithErrorWontChange(t *testing.T) {
@@ -337,6 +338,7 @@ func TestResultIntoWithNoBodyReturnsErr(t *testing.T) {
 
 func TestURLTemplate(t *testing.T) {
 	uri, _ := url.Parse("http://localhost/some/base/url/path")
+	uriSingleSlash, _ := url.Parse("http://localhost/")
 	testCases := []struct {
 		Request          *Request
 		ExpectedFullURL  string
@@ -483,6 +485,38 @@ func TestURLTemplate(t *testing.T) {
 				Prefix("/pre1/namespaces/namespaces/namespaces/namespaces/namespaces/namespaces/finalize"),
 			ExpectedFullURL:  "http://localhost/some/base/url/path/pre1/namespaces/namespaces/namespaces/namespaces/namespaces/namespaces/finalize",
 			ExpectedFinalURL: "http://localhost/%7Bprefix%7D",
+		},
+		{
+			// dynamic client with core group + namespace + resourceResource (with name) where baseURL is a single /
+			// /api/$RESOURCEVERSION/namespaces/$NAMESPACE/$RESOURCE/%NAME
+			Request: NewRequestWithClient(uriSingleSlash, "", ClientContentConfig{GroupVersion: schema.GroupVersion{Group: "test"}}, nil).Verb("DELETE").
+				Prefix("/api/v1/namespaces/ns/r2/name1"),
+			ExpectedFullURL:  "http://localhost/api/v1/namespaces/ns/r2/name1",
+			ExpectedFinalURL: "http://localhost/api/v1/namespaces/%7Bnamespace%7D/r2/%7Bname%7D",
+		},
+		{
+			// dynamic client with core group + namespace + resourceResource (with name) where baseURL is 'some/base/url/path'
+			// /api/$RESOURCEVERSION/namespaces/$NAMESPACE/$RESOURCE/%NAME
+			Request: NewRequestWithClient(uri, "", ClientContentConfig{GroupVersion: schema.GroupVersion{Group: "test"}}, nil).Verb("DELETE").
+				Prefix("/api/v1/namespaces/ns/r3/name1"),
+			ExpectedFullURL:  "http://localhost/some/base/url/path/api/v1/namespaces/ns/r3/name1",
+			ExpectedFinalURL: "http://localhost/some/base/url/path/api/v1/namespaces/%7Bnamespace%7D/r3/%7Bname%7D",
+		},
+		{
+			// dynamic client where baseURL is a single /
+			// /
+			Request: NewRequestWithClient(uriSingleSlash, "", ClientContentConfig{GroupVersion: schema.GroupVersion{Group: "test"}}, nil).Verb("DELETE").
+				Prefix("/"),
+			ExpectedFullURL:  "http://localhost/",
+			ExpectedFinalURL: "http://localhost/",
+		},
+		{
+			// dynamic client where baseURL is a single /
+			// /version
+			Request: NewRequestWithClient(uriSingleSlash, "", ClientContentConfig{GroupVersion: schema.GroupVersion{Group: "test"}}, nil).Verb("DELETE").
+				Prefix("/version"),
+			ExpectedFullURL:  "http://localhost/version",
+			ExpectedFinalURL: "http://localhost/version",
 		},
 	}
 	for i, testCase := range testCases {
@@ -1059,7 +1093,7 @@ func TestRequestWatch(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run("", func(t *testing.T) {
 			testCase.Request.backoff = &NoBackoff{}
-			watch, err := testCase.Request.Watch()
+			watch, err := testCase.Request.Watch(context.Background())
 			hasErr := err != nil
 			if hasErr != testCase.Err {
 				t.Fatalf("expected %t, got %t: %v", testCase.Err, hasErr, err)
@@ -1162,7 +1196,7 @@ func TestRequestStream(t *testing.T) {
 	}
 	for i, testCase := range testCases {
 		testCase.Request.backoff = &NoBackoff{}
-		body, err := testCase.Request.Stream()
+		body, err := testCase.Request.Stream(context.Background())
 		hasErr := err != nil
 		if hasErr != testCase.Err {
 			t.Errorf("%d: expected %t, got %t: %v", i, testCase.Err, hasErr, err)
@@ -1240,7 +1274,7 @@ func TestRequestDo(t *testing.T) {
 	}
 	for i, testCase := range testCases {
 		testCase.Request.backoff = &NoBackoff{}
-		body, err := testCase.Request.Do().Raw()
+		body, err := testCase.Request.Do(context.Background()).Raw()
 		hasErr := err != nil
 		if hasErr != testCase.Err {
 			t.Errorf("%d: expected %t, got %t: %v", i, testCase.Err, hasErr, err)
@@ -1272,7 +1306,7 @@ func TestDoRequestNewWay(t *testing.T) {
 		Suffix("baz").
 		Timeout(time.Second).
 		Body([]byte(reqBody)).
-		Do().Get()
+		Do(context.Background()).Get()
 	if err != nil {
 		t.Errorf("Unexpected error: %v %#v", err, err)
 		return
@@ -1323,7 +1357,7 @@ func TestBackoffLifecycle(t *testing.T) {
 			t.Errorf("Backoff is %v instead of %v", thisBackoff, sec)
 		}
 		now := clock.Now()
-		request.DoRaw()
+		request.DoRaw(context.Background())
 		elapsed := clock.Since(now)
 		if clock.Since(now) != thisBackoff {
 			t.Errorf("CalculatedBackoff not honored by clock: Expected time of %v, but got %v ", thisBackoff, elapsed)
@@ -1372,7 +1406,7 @@ func TestCheckRetryClosesBody(t *testing.T) {
 		Suffix("baz").
 		Timeout(time.Second).
 		Body([]byte(strings.Repeat("abcd", 1000))).
-		DoRaw()
+		DoRaw(context.Background())
 	if err != nil {
 		t.Fatalf("Unexpected error: %v %#v", err, err)
 	}
@@ -1402,10 +1436,11 @@ func TestConnectionResetByPeerIsRetried(t *testing.T) {
 				return nil, &net.OpError{Err: syscall.ECONNRESET}
 			}),
 		},
-		backoff: backoff,
+		backoff:    backoff,
+		maxRetries: 10,
 	}
 	// We expect two retries of "connection reset by peer" and the success.
-	_, err := req.Do().Raw()
+	_, err := req.Do(context.Background()).Raw()
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
@@ -1445,7 +1480,7 @@ func TestCheckRetryHandles429And5xx(t *testing.T) {
 		Suffix("baz").
 		Timeout(time.Second).
 		Body([]byte(strings.Repeat("abcd", 1000))).
-		DoRaw()
+		DoRaw(context.Background())
 	if err != nil {
 		t.Fatalf("Unexpected error: %v %#v", err, err)
 	}
@@ -1481,7 +1516,7 @@ func BenchmarkCheckRetryClosesBody(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := requests[i].DoRaw(); err != nil {
+		if _, err := requests[i].DoRaw(context.Background()); err != nil {
 			b.Fatalf("Unexpected error (%d/%d): %v", i, b.N, err)
 		}
 	}
@@ -1510,7 +1545,7 @@ func TestDoRequestNewWayReader(t *testing.T) {
 		Prefix("foo").
 		Timeout(time.Second).
 		Body(bytes.NewBuffer(reqBodyExpected)).
-		Do().Get()
+		Do(context.Background()).Get()
 	if err != nil {
 		t.Errorf("Unexpected error: %v %#v", err, err)
 		return
@@ -1549,7 +1584,7 @@ func TestDoRequestNewWayObj(t *testing.T) {
 		Resource("foo").
 		Timeout(time.Second).
 		Body(reqObj).
-		Do().Get()
+		Do(context.Background()).Get()
 	if err != nil {
 		t.Errorf("Unexpected error: %v %#v", err, err)
 		return
@@ -1603,7 +1638,7 @@ func TestDoRequestNewWayFile(t *testing.T) {
 		Prefix("foo/bar", "baz").
 		Timeout(time.Second).
 		Body(file.Name()).
-		Do().WasCreated(&wasCreated).Get()
+		Do(context.Background()).WasCreated(&wasCreated).Get()
 	if err != nil {
 		t.Errorf("Unexpected error: %v %#v", err, err)
 		return
@@ -1648,7 +1683,7 @@ func TestWasCreated(t *testing.T) {
 		Prefix("foo/bar", "baz").
 		Timeout(time.Second).
 		Body(reqBodyExpected).
-		Do().WasCreated(&wasCreated).Get()
+		Do(context.Background()).WasCreated(&wasCreated).Get()
 	if err != nil {
 		t.Errorf("Unexpected error: %v %#v", err, err)
 		return
@@ -1831,7 +1866,7 @@ func TestWatch(t *testing.T) {
 	defer testServer.Close()
 
 	s := testRESTClient(t, testServer)
-	watching, err := s.Get().Prefix("path/to/watch/thing").Watch()
+	watching, err := s.Get().Prefix("path/to/watch/thing").Watch(context.Background())
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1891,7 +1926,7 @@ func TestWatchNonDefaultContentType(t *testing.T) {
 	contentConfig := defaultContentConfig()
 	contentConfig.ContentType = "application/vnd.kubernetes.protobuf"
 	s := testRESTClientWithConfig(t, testServer, contentConfig)
-	watching, err := s.Get().Prefix("path/to/watch/thing").Watch()
+	watching, err := s.Get().Prefix("path/to/watch/thing").Watch(context.Background())
 	if err != nil {
 		t.Fatalf("Unexpected error")
 	}
@@ -1948,7 +1983,7 @@ func TestWatchUnknownContentType(t *testing.T) {
 	defer testServer.Close()
 
 	s := testRESTClient(t, testServer)
-	_, err := s.Get().Prefix("path/to/watch/thing").Watch()
+	_, err := s.Get().Prefix("path/to/watch/thing").Watch(context.Background())
 	if err == nil {
 		t.Fatalf("Expected to fail due to lack of known stream serialization for content type")
 	}
@@ -1970,7 +2005,7 @@ func TestStream(t *testing.T) {
 	defer testServer.Close()
 
 	s := testRESTClient(t, testServer)
-	readCloser, err := s.Get().Prefix("path/to/stream/thing").Stream()
+	readCloser, err := s.Get().Prefix("path/to/stream/thing").Stream(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -2028,9 +2063,8 @@ func TestDoContext(t *testing.T) {
 
 	c := testRESTClient(t, testServer)
 	_, err := c.Verb("GET").
-		Context(ctx).
 		Prefix("foo").
-		DoRaw()
+		DoRaw(ctx)
 	if err == nil {
 		t.Fatal("Expected context cancellation error")
 	}
@@ -2187,6 +2221,96 @@ func TestRequestPreflightCheck(t *testing.T) {
 					return
 				}
 				t.Errorf("%s: expects error: %v, has error: %v", verb, tt.expectsErr, hasErr)
+			}
+		})
+	}
+}
+
+func TestThrottledLogger(t *testing.T) {
+	now := time.Now()
+	oldClock := globalThrottledLogger.clock
+	defer func() {
+		globalThrottledLogger.clock = oldClock
+	}()
+	clock := clock.NewFakeClock(now)
+	globalThrottledLogger.clock = clock
+
+	logMessages := 0
+	for i := 0; i < 1000; i++ {
+		var wg sync.WaitGroup
+		wg.Add(10)
+		for j := 0; j < 10; j++ {
+			go func() {
+				if _, ok := globalThrottledLogger.attemptToLog(); ok {
+					logMessages++
+				}
+				wg.Done()
+			}()
+		}
+		wg.Wait()
+		now = now.Add(1 * time.Second)
+		clock.SetTime(now)
+	}
+
+	if a, e := logMessages, 100; a != e {
+		t.Fatalf("expected %v log messages, but got %v", e, a)
+	}
+}
+
+func TestRequestMaxRetries(t *testing.T) {
+	successAtNthCalls := 1
+	actualCalls := 0
+	retryOneTimeHandler := func(w http.ResponseWriter, req *http.Request) {
+		defer func() { actualCalls++ }()
+		if actualCalls >= successAtNthCalls {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		actualCalls++
+	}
+	testServer := httptest.NewServer(http.HandlerFunc(retryOneTimeHandler))
+	defer testServer.Close()
+
+	u, err := url.Parse(testServer.URL)
+	if err != nil {
+		t.Error(err)
+	}
+
+	testCases := []struct {
+		name        string
+		maxRetries  int
+		expectError bool
+	}{
+		{
+			name:        "no retrying should fail",
+			maxRetries:  0,
+			expectError: true,
+		},
+		{
+			name:        "1 max-retry should exactly work",
+			maxRetries:  1,
+			expectError: false,
+		},
+		{
+			name:        "5 max-retry should work",
+			maxRetries:  5,
+			expectError: false,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			defer func() { actualCalls = 0 }()
+			_, err := NewRequestWithClient(u, "", defaultContentConfig(), testServer.Client()).
+				Verb("get").
+				MaxRetries(testCase.maxRetries).
+				AbsPath("/foo").
+				DoRaw(context.TODO())
+			hasError := err != nil
+			if testCase.expectError != hasError {
+				t.Error(" failed checking error")
 			}
 		})
 	}

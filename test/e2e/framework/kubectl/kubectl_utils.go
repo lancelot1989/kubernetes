@@ -18,6 +18,7 @@ package kubectl
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -85,6 +86,9 @@ func (tk *TestKubeconfig) KubectlCmd(args ...string) *exec.Cmd {
 				fmt.Sprintf("--client-key=%s", filepath.Join(tk.CertDir, "kubecfg.key")))
 		}
 	}
+	if tk.Namespace != "" {
+		defaultArgs = append(defaultArgs, fmt.Sprintf("--namespace=%s", tk.Namespace))
+	}
 	kubectlArgs := append(defaultArgs, args...)
 
 	//We allow users to specify path to kubectl, so you can test either "kubectl" or "cluster/kubectl.sh"
@@ -97,7 +101,7 @@ func (tk *TestKubeconfig) KubectlCmd(args ...string) *exec.Cmd {
 
 // LogFailedContainers runs `kubectl logs` on a failed containers.
 func LogFailedContainers(c clientset.Interface, ns string, logFunc func(ftm string, args ...interface{})) {
-	podList, err := c.CoreV1().Pods(ns).List(metav1.ListOptions{})
+	podList, err := c.CoreV1().Pods(ns).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		logFunc("Error getting pods in namespace '%s': %v", ns, err)
 		return
