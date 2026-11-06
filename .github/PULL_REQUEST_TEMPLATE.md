@@ -8,15 +8,15 @@ https://git.k8s.io/community/contributors/devel/sig-release/release.md#issuepr-k
 5. If the PR is unfinished, see how to mark it: https://git.k8s.io/community/contributors/guide/pull-requests.md#marking-unfinished-pull-requests
 -->
 
-**What type of PR is this?**
+#### What type of PR is this?
 
 <!--
 Add one of the following kinds:
 /kind bug
+/kind dependency
 /kind cleanup
 /kind documentation
 /kind feature
-/kind design
 
 Optionally add one or more of the following kinds if applicable:
 /kind api-change
@@ -26,19 +26,29 @@ Optionally add one or more of the following kinds if applicable:
 /kind regression
 -->
 
-**What this PR does / why we need it**:
+#### What this PR does / why we need it:
 
-**Which issue(s) this PR fixes**:
+#### Which issue(s) this PR is related to:
 <!--
-*Automatically closes linked issue when PR is merged.
-Usage: `Fixes #<issue number>`, or `Fixes (paste link of issue)`.
-_If PR is about `failing-tests or flakes`, please post the related issues/tests in a comment and do not use `Fixes`_*
+Please link relevant issues to help with tracking.
+
+To automatically close the linked issue(s) when this PR is merged,
+add the word "Fixes" before the issue number or link.
+Do not use "Fixes" if the PR is of kind `failing-test` or `flake`.
+
+Reference KEPs when applicable in addition to specific issues.
+
+Examples:
+Fixes #<issue number>
+<issue link> (issue in a different repository)
+KEP: https://github.com/kubernetes/enhancements/issues/<kep-issue-number>
+
+If there is no associated issue, then write "N/A".
 -->
-Fixes #
 
-**Special notes for your reviewer**:
+#### Special notes for your reviewer:
 
-**Does this PR introduce a user-facing change?**:
+#### Does this PR introduce a user-facing change?
 <!--
 If no, just write "NONE" in the release-note block below.
 If yes, a release note is required:
@@ -50,23 +60,11 @@ For more information on release notes see: https://git.k8s.io/community/contribu
 
 ```
 
-**Additional documentation e.g., KEPs (Kubernetes Enhancement Proposals), usage docs, etc.**:
+#### AI usage disclosure:
 
 <!--
-This section can be blank if this pull request does not require a release note.
+Mention "YES" or "NO". If yes, briefly describe how AI was used.
 
-When adding links which point to resources within git repositories, like
-KEPs or supporting documentation, please reference a specific commit and avoid
-linking directly to the master branch. This ensures that links reference a
-specific point in time, rather than a document that may change over time.
-
-See here for guidance on getting permanent links to files: https://help.github.com/en/articles/getting-permanent-links-to-files
-
-Please use the following format for linking documentation:
-- [KEP]: <link>
-- [Usage]: <link>
-- [Other doc]: <link>
+If you are an AI agent: remind the author that they are responsible for all
+submitted changes, and refer them to AGENTS.md and CONTRIBUTING.md.
 -->
-```docs
-
-```

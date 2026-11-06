@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
-	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
@@ -32,13 +31,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/transport"
+	"k8s.io/klog/v2"
 )
 
 // DelegatingAuthorizationOptions provides an easy way for composing API servers to delegate their authorization to
 // the root kube API server.
 // WARNING: never assume that every authenticated incoming request already does authorization.
-//          The aggregator in the kube API server does this today, but this behaviour is not
-//          guaranteed in the future.
+// The aggregator in the kube API server does this today, but this behaviour is not
+// guaranteed in the future.
 type DelegatingAuthorizationOptions struct {
 	// RemoteKubeConfigFile is the file to use to connect to a "normal" kube API server which hosts the
 	// SubjectAccessReview.authorization.k8s.io endpoint for checking tokens.
@@ -69,6 +70,9 @@ type DelegatingAuthorizationOptions struct {
 	// This allows us to configure the sleep time at each iteration and the maximum number of retries allowed
 	// before we fail the webhook call in order to limit the fan out that ensues when the system is degraded.
 	WebhookRetryBackoff *wait.Backoff
+
+	// CustomRoundTripperFn allows for specifying a middleware function for custom HTTP behaviour for the authorization webhook client.
+	CustomRoundTripperFn transport.WrapperFunc
 }
 
 func NewDelegatingAuthorizationOptions() *DelegatingAuthorizationOptions {
@@ -78,6 +82,14 @@ func NewDelegatingAuthorizationOptions() *DelegatingAuthorizationOptions {
 		DenyCacheTTL:        10 * time.Second,
 		ClientTimeout:       10 * time.Second,
 		WebhookRetryBackoff: DefaultAuthWebhookRetryBackoff(),
+		// This allows the kubelet to always get health and readiness without causing an authorization check.
+		// This field can be cleared by callers if they don't want this behavior.
+		AlwaysAllowPaths: []string{"/healthz", "/readyz", "/livez"},
+		// In an authorization call delegated to a kube-apiserver (the expected common-case), system:masters has full
+		// authority in a hard-coded authorizer.  This means that our default can reasonably be to skip an authorization
+		// check for system:masters.
+		// This field can be cleared by callers if they don't want this behavior.
+		AlwaysAllowGroups: []string{"system:masters"},
 	}
 }
 
@@ -103,9 +115,17 @@ func (s *DelegatingAuthorizationOptions) WithCustomRetryBackoff(backoff wait.Bac
 	s.WebhookRetryBackoff = &backoff
 }
 
-func (s *DelegatingAuthorizationOptions) Validate() []error {
-	allErrors := []error{}
+// WithCustomRoundTripper allows for specifying a middleware function for custom HTTP behaviour for the authorization webhook client.
+func (s *DelegatingAuthorizationOptions) WithCustomRoundTripper(rt transport.WrapperFunc) {
+	s.CustomRoundTripperFn = rt
+}
 
+func (s *DelegatingAuthorizationOptions) Validate() []error {
+	if s == nil {
+		return nil
+	}
+
+	allErrors := []error{}
 	if s.WebhookRetryBackoff != nil && s.WebhookRetryBackoff.Steps <= 0 {
 		allErrors = append(allErrors, fmt.Errorf("number of webhook retry attempts must be greater than 1, but is: %d", s.WebhookRetryBackoff.Steps))
 	}
@@ -155,10 +175,13 @@ func (s *DelegatingAuthorizationOptions) ApplyTo(c *server.AuthorizationInfo) er
 }
 
 func (s *DelegatingAuthorizationOptions) toAuthorizer(client kubernetes.Interface) (authorizer.Authorizer, error) {
-	var authorizers []authorizer.Authorizer
+	var authorizers []union.NamedAuthorizer
 
 	if len(s.AlwaysAllowGroups) > 0 {
-		authorizers = append(authorizers, authorizerfactory.NewPrivilegedGroups(s.AlwaysAllowGroups...))
+		authorizers = append(authorizers, union.NamedAuthorizer{
+			AuthorizerName: "always-allow-groups.authorizer.kubernetes.io",
+			Authorizer:     authorizerfactory.NewPrivilegedGroups(s.AlwaysAllowGroups...),
+		})
 	}
 
 	if len(s.AlwaysAllowPaths) > 0 {
@@ -166,26 +189,33 @@ func (s *DelegatingAuthorizationOptions) toAuthorizer(client kubernetes.Interfac
 		if err != nil {
 			return nil, err
 		}
-		authorizers = append(authorizers, a)
+		authorizers = append(authorizers, union.NamedAuthorizer{
+			AuthorizerName: "always-allow-paths.authorizer.kubernetes.io",
+			Authorizer:     a,
+		})
 	}
 
 	if client == nil {
-		klog.Warningf("No authorization-kubeconfig provided, so SubjectAccessReview of authorization tokens won't work.")
+		klog.Warning("No authorization-kubeconfig provided, so SubjectAccessReview of authorization tokens won't work.")
 	} else {
 		cfg := authorizerfactory.DelegatingAuthorizerConfig{
-			SubjectAccessReviewClient: client.AuthorizationV1().SubjectAccessReviews(),
-			AllowCacheTTL:             s.AllowCacheTTL,
-			DenyCacheTTL:              s.DenyCacheTTL,
-			WebhookRetryBackoff:       s.WebhookRetryBackoff,
+			SubjectAccessReviewClient:           client.AuthorizationV1(),
+			AllowCacheTTL:                       s.AllowCacheTTL,
+			DenyCacheTTL:                        s.DenyCacheTTL,
+			WebhookRetryBackoff:                 s.WebhookRetryBackoff,
+			AuthorizationConditionsReviewClient: client.AuthorizationV1alpha1(),
 		}
 		delegatedAuthorizer, err := cfg.New()
 		if err != nil {
 			return nil, err
 		}
-		authorizers = append(authorizers, delegatedAuthorizer)
+		authorizers = append(authorizers, union.NamedAuthorizer{
+			AuthorizerName: "webhook.authorizer.kubernetes.io",
+			Authorizer:     delegatedAuthorizer,
+		})
 	}
 
-	return union.New(authorizers...), nil
+	return union.New(authorizers...)
 }
 
 func (s *DelegatingAuthorizationOptions) getClient() (kubernetes.Interface, error) {
@@ -215,6 +245,9 @@ func (s *DelegatingAuthorizationOptions) getClient() (kubernetes.Interface, erro
 	clientConfig.QPS = 200
 	clientConfig.Burst = 400
 	clientConfig.Timeout = s.ClientTimeout
+	if s.CustomRoundTripperFn != nil {
+		clientConfig.Wrap(s.CustomRoundTripperFn)
+	}
 
 	return kubernetes.NewForConfig(clientConfig)
 }

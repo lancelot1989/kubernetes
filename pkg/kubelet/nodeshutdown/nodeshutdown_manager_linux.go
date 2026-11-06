@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2020 The Kubernetes Authors.
@@ -20,33 +20,31 @@ limitations under the License.
 package nodeshutdown
 
 import (
+	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
-	"github.com/godbus/dbus/v5"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
+	kubeletevents "k8s.io/kubernetes/pkg/kubelet/events"
 	"k8s.io/kubernetes/pkg/kubelet/eviction"
+	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
+	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/nodeshutdown/systemd"
-	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/kubelet/util/format"
 )
 
 const (
-	nodeShutdownReason  = "Shutdown"
-	nodeShutdownMessage = "Node is shutting, evicting pods"
+	dbusReconnectPeriod = 1 * time.Second
 )
 
 var systemDbus = func() (dbusInhibiter, error) {
-	bus, err := dbus.SystemBus()
-	if err != nil {
-		return nil, err
-	}
-	return &systemd.DBusCon{SystemBus: bus}, nil
+	return systemd.NewDBusCon()
 }
 
 type dbusInhibiter interface {
@@ -54,95 +52,229 @@ type dbusInhibiter interface {
 	InhibitShutdown() (systemd.InhibitLock, error)
 	ReleaseInhibitLock(lock systemd.InhibitLock) error
 	ReloadLogindConf() error
-	MonitorShutdown() (<-chan bool, error)
+	MonitorShutdown(klog.Logger) (<-chan bool, error)
 	OverrideInhibitDelay(inhibitDelayMax time.Duration) error
+	Close() error
 }
 
-// Manager has functions that can be used to interact with the Node Shutdown Manager.
-type Manager struct {
-	shutdownGracePeriodRequested    time.Duration
-	shutdownGracePeriodCriticalPods time.Duration
+// managerImpl has functions that can be used to interact with the Node Shutdown Manager.
+type managerImpl struct {
+	logger   klog.Logger
+	recorder record.EventRecorder
+	nodeRef  *v1.ObjectReference
 
-	getPods eviction.ActivePodsFunc
-	killPod eviction.KillPodFunc
+	getPods        eviction.ActivePodsFunc
+	syncNodeStatus func(context.Context)
 
+	newDBusConn func() (dbusInhibiter, error)
 	dbusCon     dbusInhibiter
 	inhibitLock systemd.InhibitLock
 
 	nodeShuttingDownMutex sync.Mutex
 	nodeShuttingDownNow   bool
+	podManager            *podManager
 
-	clock clock.Clock
+	enableMetrics bool
+	storage       storage
 }
 
 // NewManager returns a new node shutdown manager.
-func NewManager(getPodsFunc eviction.ActivePodsFunc, killPodFunc eviction.KillPodFunc, shutdownGracePeriodRequested, shutdownGracePeriodCriticalPods time.Duration) *Manager {
-	return &Manager{
-		getPods:                         getPodsFunc,
-		killPod:                         killPodFunc,
-		shutdownGracePeriodRequested:    shutdownGracePeriodRequested,
-		shutdownGracePeriodCriticalPods: shutdownGracePeriodCriticalPods,
-		clock:                           clock.RealClock{},
+func NewManager(conf *Config) Manager {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdown) {
+		m := managerStub{}
+		return m
+	}
+
+	podManager := newPodManager(conf)
+
+	// Disable if the configuration is empty
+	if len(podManager.shutdownGracePeriodByPodPriority) == 0 {
+		m := managerStub{}
+		return m
+	}
+
+	manager := &managerImpl{
+		logger:         conf.Logger,
+		recorder:       conf.Recorder,
+		nodeRef:        conf.NodeRef,
+		getPods:        conf.GetPodsFunc,
+		syncNodeStatus: conf.SyncNodeStatusFunc,
+		newDBusConn:    systemDbus,
+		podManager:     podManager,
+		enableMetrics:  utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdownBasedOnPodPriority),
+		storage: localStorage{
+			Path: filepath.Join(conf.StateDirectory, localStorageStateFile),
+		},
+	}
+	manager.logger.Info("Creating node shutdown manager",
+		"shutdownGracePeriodRequested", conf.ShutdownGracePeriodRequested,
+		"shutdownGracePeriodCriticalPods", conf.ShutdownGracePeriodCriticalPods,
+		"shutdownGracePeriodByPodPriority", podManager.shutdownGracePeriodByPodPriority,
+	)
+	return manager
+}
+
+// Admit rejects all pods if node is shutting
+func (m *managerImpl) Admit(ctx context.Context, attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
+	nodeShuttingDown := m.ShutdownStatus() != nil
+
+	if nodeShuttingDown {
+		return lifecycle.PodAdmitResult{
+			Admit:   false,
+			Reason:  NodeShutdownNotAdmittedReason,
+			Message: nodeShutdownNotAdmittedMessage,
+		}
+	}
+	return lifecycle.PodAdmitResult{Admit: true}
+}
+
+// setMetrics sets the metrics for the node shutdown manager.
+func (m *managerImpl) setMetrics() {
+	if m.enableMetrics && m.storage != nil {
+		sta := state{}
+		err := m.storage.Load(&sta)
+		if err != nil {
+			m.logger.Error(err, "Failed to load graceful shutdown state")
+		} else {
+			if !sta.StartTime.IsZero() {
+				metrics.GracefulShutdownStartTime.Set(timestamp(sta.StartTime))
+			}
+			if !sta.EndTime.IsZero() {
+				metrics.GracefulShutdownEndTime.Set(timestamp(sta.EndTime))
+			}
+		}
 	}
 }
 
 // Start starts the node shutdown manager and will start watching the node for shutdown events.
-func (m *Manager) Start() error {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdown) {
-		return nil
-	}
-	if m.shutdownGracePeriodRequested == 0 {
-		return nil
-	}
-
-	systemBus, err := systemDbus()
+func (m *managerImpl) Start(ctx context.Context) error {
+	stop, err := m.start(ctx)
 	if err != nil {
 		return err
+	}
+	go func() {
+		for {
+			if stop != nil {
+				select {
+				case <-stop:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			t := time.NewTimer(dbusReconnectPeriod)
+			select {
+			case <-t.C:
+			case <-ctx.Done():
+				t.Stop()
+				return
+			}
+			m.logger.V(1).Info("Restarting watch for node shutdown events")
+			stop, err = m.start(ctx)
+			if err != nil {
+				m.logger.Error(err, "Unable to watch the node for shutdown events")
+			}
+		}
+	}()
+
+	m.setMetrics()
+	return nil
+}
+
+func (m *managerImpl) start(ctx context.Context) (chan struct{}, error) {
+	systemBus, err := m.newDBusConn()
+	if err != nil {
+		return nil, err
+	}
+
+	// Close any previous dbus connection before replacing it to avoid
+	// leaking goroutines and file descriptors. See #120613.
+	if m.dbusCon != nil {
+		if err := m.dbusCon.Close(); err != nil {
+			m.logger.Error(err, "Failed to close previous dbus connection, ignoring and starting a new one anyway")
+		}
 	}
 	m.dbusCon = systemBus
 
+	// If we fail after this point, close the new connection so we don't
+	// leak dbus goroutines on every retry.
+	startSucceeded := false
+	defer func() {
+		if !startSucceeded {
+			if err := m.dbusCon.Close(); err != nil {
+				m.logger.Error(err, "Failed to close dbus connection after start failure")
+			}
+			m.dbusCon = nil
+		}
+	}()
+
 	currentInhibitDelay, err := m.dbusCon.CurrentInhibitDelay()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// If the logind's InhibitDelayMaxUSec as configured in (logind.conf) is less than shutdownGracePeriodRequested, attempt to update the value to shutdownGracePeriodRequested.
-	if m.shutdownGracePeriodRequested > currentInhibitDelay {
-		err := m.dbusCon.OverrideInhibitDelay(m.shutdownGracePeriodRequested)
+	// If the logind's InhibitDelayMaxUSec as configured in (logind.conf) is less than periodRequested, attempt to update the value to periodRequested.
+	if periodRequested := m.podManager.periodRequested(); periodRequested > currentInhibitDelay {
+		err := m.dbusCon.OverrideInhibitDelay(periodRequested)
 		if err != nil {
-			return fmt.Errorf("unable to override inhibit delay by shutdown manager: %v", err)
+			return nil, fmt.Errorf("unable to override inhibit delay by shutdown manager: %v", err)
 		}
 
 		err = m.dbusCon.ReloadLogindConf()
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		// Read the current inhibitDelay again, if the override was successful, currentInhibitDelay will be equal to shutdownGracePeriodRequested.
-		updatedInhibitDelay, err := m.dbusCon.CurrentInhibitDelay()
+		// The ReloadLogindConf call is asynchronous. Poll with exponential backoff until the configuration is updated.
+		backoff := wait.Backoff{
+			Duration: 100 * time.Millisecond,
+			Factor:   2.0,
+			Steps:    5,
+		}
+		var updatedInhibitDelay time.Duration
+		attempt := 0
+		err = wait.ExponentialBackoff(backoff, func() (bool, error) {
+			attempt += 1
+			// Read the current inhibitDelay again, if the override was successful, currentInhibitDelay will be equal to shutdownGracePeriodRequested.
+			updatedInhibitDelay, err = m.dbusCon.CurrentInhibitDelay()
+			if err != nil {
+				return false, err
+			}
+			if periodRequested <= updatedInhibitDelay {
+				return true, nil
+			}
+			if attempt < backoff.Steps {
+				m.logger.V(3).Info("InhibitDelayMaxSec still less than requested, retrying", "attempt", attempt, "current", updatedInhibitDelay, "requested", periodRequested)
+			}
+			return false, nil
+		})
 		if err != nil {
-			return err
+			if !wait.Interrupted(err) {
+				return nil, err
+			}
+			if periodRequested > updatedInhibitDelay {
+				return nil, fmt.Errorf("node shutdown manager was timed out after %d attempts waiting for logind InhibitDelayMaxSec to update to %v (ShutdownGracePeriod), current value is %v", attempt, periodRequested, updatedInhibitDelay)
+			}
 		}
 
-		if updatedInhibitDelay != m.shutdownGracePeriodRequested {
-			return fmt.Errorf("node shutdown manager was unable to update logind InhibitDelayMaxSec to %v (ShutdownGracePeriod), current value of InhibitDelayMaxSec (%v) is less than requested ShutdownGracePeriod", m.shutdownGracePeriodRequested, updatedInhibitDelay)
-		}
 	}
 
-	err = m.aquireInhibitLock()
+	err = m.acquireInhibitLock()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	events, err := m.dbusCon.MonitorShutdown()
+	events, err := m.dbusCon.MonitorShutdown(m.logger)
 	if err != nil {
 		releaseErr := m.dbusCon.ReleaseInhibitLock(m.inhibitLock)
 		if releaseErr != nil {
-			return fmt.Errorf("failed releasing inhibitLock: %v and failed monitoring shutdown: %v", releaseErr, err)
+			return nil, fmt.Errorf("failed releasing inhibitLock: %v and failed monitoring shutdown: %v", releaseErr, err)
 		}
-		return fmt.Errorf("failed to monitor shutdown: %v", err)
+		return nil, fmt.Errorf("failed to monitor shutdown: %v", err)
 	}
 
+	startSucceeded = true
+	stop := make(chan struct{})
 	go func() {
 		// Monitor for shutdown events. This follows the logind Inhibit Delay pattern described on https://www.freedesktop.org/wiki/Software/systemd/inhibit/
 		// 1. When shutdown manager starts, an inhibit lock is taken.
@@ -150,39 +282,65 @@ func (m *Manager) Start() error {
 		// 3. When shutdown(false) event is received, this indicates a previous shutdown was cancelled. In this case, acquire the inhibit lock again.
 		for {
 			select {
-			case isShuttingDown := <-events:
-				klog.V(1).Infof("Shutdown manager detected new shutdown event, isNodeShuttingDownNow: %t", isShuttingDown)
+			case <-ctx.Done():
+				close(stop)
+				return
+			case isShuttingDown, ok := <-events:
+				if !ok {
+					m.logger.Error(nil, "Ended to watching the node for shutdown events")
+					close(stop)
+					return
+				}
+				m.logger.V(1).Info("Shutdown manager detected new shutdown event, isNodeShuttingDownNow", "event", isShuttingDown)
+
+				var shutdownType string
+				if isShuttingDown {
+					shutdownType = "shutdown"
+				} else {
+					shutdownType = "cancelled"
+				}
+				m.logger.V(1).Info("Shutdown manager detected new shutdown event", "event", shutdownType)
+				if isShuttingDown {
+					m.recorder.Event(m.nodeRef, v1.EventTypeNormal, kubeletevents.NodeShutdown, "Shutdown manager detected shutdown event")
+				} else {
+					m.recorder.Event(m.nodeRef, v1.EventTypeNormal, kubeletevents.NodeShutdown, "Shutdown manager detected shutdown cancellation")
+				}
 
 				m.nodeShuttingDownMutex.Lock()
 				m.nodeShuttingDownNow = isShuttingDown
 				m.nodeShuttingDownMutex.Unlock()
 
 				if isShuttingDown {
-					m.processShutdownEvent()
+					// Update node status and ready condition
+					nodeStatusCtx := klog.NewContext(ctx, m.logger)
+					go m.syncNodeStatus(nodeStatusCtx)
+
+					if err := m.processShutdownEvent(ctx); err != nil {
+						m.logger.Error(err, "Shutdown manager failed to process shutdown event")
+					}
 				} else {
-					m.aquireInhibitLock()
+					_ = m.acquireInhibitLock()
 				}
 			}
 		}
 	}()
-	return nil
+	return stop, nil
 }
 
-func (m *Manager) aquireInhibitLock() error {
+func (m *managerImpl) acquireInhibitLock() error {
 	lock, err := m.dbusCon.InhibitShutdown()
 	if err != nil {
 		return err
+	}
+	if m.inhibitLock != 0 {
+		m.dbusCon.ReleaseInhibitLock(m.inhibitLock)
 	}
 	m.inhibitLock = lock
 	return nil
 }
 
 // ShutdownStatus will return an error if the node is currently shutting down.
-func (m *Manager) ShutdownStatus() error {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.GracefulNodeShutdown) {
-		return nil
-	}
-
+func (m *managerImpl) ShutdownStatus() error {
 	m.nodeShuttingDownMutex.Lock()
 	defer m.nodeShuttingDownMutex.Unlock()
 
@@ -192,64 +350,38 @@ func (m *Manager) ShutdownStatus() error {
 	return nil
 }
 
-func (m *Manager) processShutdownEvent() error {
-	klog.V(1).Infof("Shutdown manager processing shutdown event")
+func (m *managerImpl) processShutdownEvent(ctx context.Context) error {
+	m.logger.V(1).Info("Shutdown manager processing shutdown event")
 	activePods := m.getPods()
 
-	nonCriticalPodGracePeriod := m.shutdownGracePeriodRequested - m.shutdownGracePeriodCriticalPods
-
-	var wg sync.WaitGroup
-	wg.Add(len(activePods))
-	for _, pod := range activePods {
-		go func(pod *v1.Pod) {
-			defer wg.Done()
-
-			var gracePeriodOverride int64
-			if kubelettypes.IsCriticalPod(pod) {
-				gracePeriodOverride = int64(m.shutdownGracePeriodCriticalPods.Seconds())
-				m.clock.Sleep(nonCriticalPodGracePeriod)
-			} else {
-				gracePeriodOverride = int64(nonCriticalPodGracePeriod.Seconds())
-			}
-
-			// If the pod's spec specifies a termination gracePeriod which is less than the gracePeriodOverride calculated, use the pod spec termination gracePeriod.
-			if pod.Spec.TerminationGracePeriodSeconds != nil && *pod.Spec.TerminationGracePeriodSeconds <= gracePeriodOverride {
-				gracePeriodOverride = *pod.Spec.TerminationGracePeriodSeconds
-			}
-
-			klog.V(1).Infof("Shutdown manager killing pod %q with gracePeriod: %v seconds", format.Pod(pod), gracePeriodOverride)
-
-			status := v1.PodStatus{
-				Phase:   v1.PodFailed,
-				Message: nodeShutdownMessage,
-				Reason:  nodeShutdownReason,
-			}
-
-			err := m.killPod(pod, status, &gracePeriodOverride)
-			if err != nil {
-				klog.V(1).Infof("Shutdown manager failed killing pod %q: %v", format.Pod(pod), err)
-			} else {
-				klog.V(1).Infof("Shutdown manager finished killing pod %q", format.Pod(pod))
-			}
-		}(pod)
-	}
-
-	c := make(chan struct{})
-	go func() {
-		defer close(c)
-		wg.Wait()
+	defer func() {
+		m.dbusCon.ReleaseInhibitLock(m.inhibitLock)
+		m.logger.V(1).Info("Shutdown manager completed processing shutdown event, node will shutdown shortly")
 	}()
 
-	// We want to ensure that inhibitLock is released, so only wait up to the shutdownGracePeriodRequested timeout.
-	select {
-	case <-c:
-		break
-	case <-time.After(m.shutdownGracePeriodRequested):
-		klog.V(1).Infof("Shutdown manager pod killing did not complete in %v", m.shutdownGracePeriodRequested)
+	if m.enableMetrics && m.storage != nil {
+		startTime := time.Now()
+		err := m.storage.Store(state{
+			StartTime: startTime,
+		})
+		if err != nil {
+			m.logger.Error(err, "Failed to store graceful shutdown state")
+		}
+		metrics.GracefulShutdownStartTime.Set(timestamp(startTime))
+		metrics.GracefulShutdownEndTime.Set(0)
+
+		defer func() {
+			endTime := time.Now()
+			err := m.storage.Store(state{
+				StartTime: startTime,
+				EndTime:   endTime,
+			})
+			if err != nil {
+				m.logger.Error(err, "Failed to store graceful shutdown state")
+			}
+			metrics.GracefulShutdownEndTime.Set(timestamp(endTime))
+		}()
 	}
 
-	m.dbusCon.ReleaseInhibitLock(m.inhibitLock)
-	klog.V(1).Infof("Shutdown manager completed processing shutdown event, node will shutdown shortly")
-
-	return nil
+	return m.podManager.killPods(ctx, activePods)
 }

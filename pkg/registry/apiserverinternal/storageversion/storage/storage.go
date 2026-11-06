@@ -19,6 +19,8 @@ package storage
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/generic"
@@ -44,12 +46,14 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 		ObjectNameFunc: func(obj runtime.Object) (string, error) {
 			return obj.(*apiserverinternal.StorageVersion).Name, nil
 		},
-		DefaultQualifiedResource: apiserverinternal.Resource("storageversions"),
+		DefaultQualifiedResource:  apiserverinternal.Resource("storageversions"),
+		SingularQualifiedResource: apiserverinternal.Resource("storageversion"),
 
-		CreateStrategy: strategy.Strategy,
-		UpdateStrategy: strategy.Strategy,
-		DeleteStrategy: strategy.Strategy,
-		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
+		CreateStrategy:      strategy.Strategy,
+		UpdateStrategy:      strategy.Strategy,
+		DeleteStrategy:      strategy.Strategy,
+		ResetFieldsStrategy: strategy.Strategy,
+		TableConvertor:      printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter}
 	if err := store.CompleteWithOptions(options); err != nil {
@@ -57,6 +61,7 @@ func NewREST(optsGetter generic.RESTOptionsGetter) (*REST, *StatusREST, error) {
 	}
 	statusStore := *store
 	statusStore.UpdateStrategy = strategy.StatusStrategy
+	statusStore.ResetFieldsStrategy = strategy.StatusStrategy
 	return &REST{store}, &StatusREST{store: &statusStore}, nil
 }
 
@@ -70,6 +75,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &apiserverinternal.StorageVersion{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -80,4 +91,13 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
+}
+
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
 }

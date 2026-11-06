@@ -17,48 +17,58 @@ limitations under the License.
 package features
 
 import (
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/component-base/featuregate"
 )
 
+// Every feature gate should have an entry here following this template:
+//
+// // owner: @username
+// MyFeature featuregate.Feature = "MyFeature"
+//
+// Feature gates should be listed in alphabetical, case-sensitive
+// (upper before any lower case character) order. This reduces the risk
+// of code conflicts because changes are more likely to be scattered
+// across the file.
 const (
-	// Every feature gate should add method here following this template:
-	//
-	// // owner: @username
-	// // alpha: v1.4
-	// MyFeature() bool
+	// owner: @lukasmetzner
+	// kep:  http://kep.k8s.io/5237
+	// Use watch based route controller reconciliation instead of frequent periodic reconciliation.
+	CloudControllerManagerWatchBasedRoutesReconciliation featuregate.Feature = "CloudControllerManagerWatchBasedRoutesReconciliation"
 
-	// owner @smarterclayton
-	// alpha: v1.16
-	// beta:  v1.19
-	//
-	// Enable legacy behavior to vary cluster functionality on the node-role.kubernetes.io labels. On by default (legacy), will be turned off in 1.18.
-	// Original copy from k8s.io/kubernetes/pkg/features/kube_features.go
-	LegacyNodeRoleBehavior featuregate.Feature = "LegacyNodeRoleBehavior"
+	// owner: @nckturner
+	// kep:  http://kep.k8s.io/2699
+	// Enable webhook in cloud controller manager
+	CloudControllerManagerWebhook featuregate.Feature = "CloudControllerManagerWebhook"
 
-	// owner @brendandburns
-	// alpha: v1.9
-	// beta:  v1.19
+	// owner: @stblatzheim
 	//
-	// Enable nodes to exclude themselves from service load balancers
-	// Original copy from k8s.io/kubernetes/pkg/features/kube_features.go
-	ServiceNodeExclusion featuregate.Feature = "ServiceNodeExclusion"
+	// Periodically reconcile node labels returned in InstanceMetadata.AdditionalLabels.
+	CloudNodeAdditionalLabelsReconciliation featuregate.Feature = "CloudNodeAdditionalLabelsReconciliation"
 
-	// owner: @khenidak
-	// alpha: v1.15
+	// owner: @jefftree, @tchap
 	//
-	// Enables ipv6 dual stack
-	// Original copy from k8s.io/kubernetes/pkg/features/kube_features.go
-	IPv6DualStack featuregate.Feature = "IPv6DualStack"
+	// Make kube-controller-manager release leader election lock on exit.
+	ControllerManagerReleaseLeaderElectionLockOnExit featuregate.Feature = "ControllerManagerReleaseLeaderElectionLockOnExit"
 )
 
-func SetupCurrentKubernetesSpecificFeatureGates(featuregates featuregate.MutableFeatureGate) error {
-	return featuregates.Add(cloudPublicFeatureGates)
+func SetupCurrentKubernetesSpecificFeatureGates(featuregates featuregate.MutableVersionedFeatureGate) error {
+	return featuregates.AddVersioned(versionedCloudPublicFeatureGates)
 }
 
-// cloudPublicFeatureGates consists of cloud-specific feature keys.
-// To add a new feature, define a key for it at k8s.io/api/pkg/features and add it here.
-var cloudPublicFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	LegacyNodeRoleBehavior: {Default: true, PreRelease: featuregate.Beta},
-	ServiceNodeExclusion:   {Default: true, PreRelease: featuregate.Beta},
-	IPv6DualStack:          {Default: false, PreRelease: featuregate.Alpha},
+// versionedCloudPublicFeatureGates consists of versioned cloud-specific feature keys.
+// To add a new feature, define a key for it above and add it here.
+var versionedCloudPublicFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
+	CloudControllerManagerWatchBasedRoutesReconciliation: {
+		{Version: version.MustParse("1.35"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	CloudControllerManagerWebhook: {
+		{Version: version.MustParse("1.27"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	CloudNodeAdditionalLabelsReconciliation: {
+		{Version: version.MustParse("1.38"), Default: false, PreRelease: featuregate.Alpha},
+	},
+	ControllerManagerReleaseLeaderElectionLockOnExit: {
+		{Version: version.MustParse("1.36"), Default: false, PreRelease: featuregate.Alpha},
+	},
 }

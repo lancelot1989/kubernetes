@@ -18,15 +18,14 @@ package reconcilers
 
 import (
 	"context"
+
 	corev1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
-	discoveryclient "k8s.io/client-go/kubernetes/typed/discovery/v1beta1"
-	"k8s.io/kubernetes/pkg/features"
+	discoveryclient "k8s.io/client-go/kubernetes/typed/discovery/v1"
 	utilnet "k8s.io/utils/net"
 )
 
@@ -58,8 +57,7 @@ func (adapter *EndpointsAdapter) Get(namespace, name string, getOpts metav1.GetO
 }
 
 // Create accepts a namespace and Endpoints object and creates the Endpoints
-// object. If an endpointSliceClient exists, a matching EndpointSlice will also
-// be created or updated. The created Endpoints object or an error will be
+// object and matching EndpointSlice. The created Endpoints object or an error will be
 // returned.
 func (adapter *EndpointsAdapter) Create(namespace string, endpoints *corev1.Endpoints) (*corev1.Endpoints, error) {
 	endpoints, err := adapter.endpointClient.Endpoints(namespace).Create(context.TODO(), endpoints, metav1.CreateOptions{})
@@ -69,9 +67,8 @@ func (adapter *EndpointsAdapter) Create(namespace string, endpoints *corev1.Endp
 	return endpoints, err
 }
 
-// Update accepts a namespace and Endpoints object and updates it. If an
-// endpointSliceClient exists, a matching EndpointSlice will also be created or
-// updated. The updated Endpoints object or an error will be returned.
+// Update accepts a namespace and Endpoints object and updates it and its
+// matching EndpointSlice. The updated Endpoints object or an error will be returned.
 func (adapter *EndpointsAdapter) Update(namespace string, endpoints *corev1.Endpoints) (*corev1.Endpoints, error) {
 	endpoints, err := adapter.endpointClient.Endpoints(namespace).Update(context.TODO(), endpoints, metav1.UpdateOptions{})
 	if err == nil {
@@ -81,12 +78,9 @@ func (adapter *EndpointsAdapter) Update(namespace string, endpoints *corev1.Endp
 }
 
 // EnsureEndpointSliceFromEndpoints accepts a namespace and Endpoints resource
-// and creates or updates a corresponding EndpointSlice if an endpointSliceClient
-// exists. An error will be returned if it fails to sync the EndpointSlice.
+// and creates or updates a corresponding EndpointSlice. An error will be returned
+// if it fails to sync the EndpointSlice.
 func (adapter *EndpointsAdapter) EnsureEndpointSliceFromEndpoints(namespace string, endpoints *corev1.Endpoints) error {
-	if adapter.endpointSliceClient == nil {
-		return nil
-	}
 	endpointSlice := endpointSliceFromEndpoints(endpoints)
 	currentEndpointSlice, err := adapter.endpointSliceClient.EndpointSlices(namespace).Get(context.TODO(), endpointSlice.Name, metav1.GetOptions{})
 
@@ -124,6 +118,7 @@ func (adapter *EndpointsAdapter) EnsureEndpointSliceFromEndpoints(namespace stri
 func endpointSliceFromEndpoints(endpoints *corev1.Endpoints) *discovery.EndpointSlice {
 	endpointSlice := &discovery.EndpointSlice{}
 	endpointSlice.Name = endpoints.Name
+	endpointSlice.Namespace = endpoints.Namespace
 	endpointSlice.Labels = map[string]string{discovery.LabelServiceName: endpoints.Name}
 
 	// TODO: Add support for dual stack here (and in the rest of
@@ -175,12 +170,7 @@ func endpointFromAddress(address corev1.EndpointAddress, ready bool) discovery.E
 	}
 
 	if address.NodeName != nil {
-		ep.Topology = map[string]string{
-			"kubernetes.io/hostname": *address.NodeName,
-		}
-		if utilfeature.DefaultFeatureGate.Enabled(features.EndpointSliceNodeName) {
-			ep.NodeName = address.NodeName
-		}
+		ep.NodeName = address.NodeName
 	}
 
 	return ep

@@ -25,10 +25,14 @@ import (
 	cronjobconfig "k8s.io/kubernetes/pkg/controller/cronjob/config"
 	daemonconfig "k8s.io/kubernetes/pkg/controller/daemon/config"
 	deploymentconfig "k8s.io/kubernetes/pkg/controller/deployment/config"
+	devicetaintevictionconfig "k8s.io/kubernetes/pkg/controller/devicetainteviction/config"
+	disruptionconfig "k8s.io/kubernetes/pkg/controller/disruption/config"
 	endpointconfig "k8s.io/kubernetes/pkg/controller/endpoint/config"
 	endpointsliceconfig "k8s.io/kubernetes/pkg/controller/endpointslice/config"
 	endpointslicemirroringconfig "k8s.io/kubernetes/pkg/controller/endpointslicemirroring/config"
+	evictionrequestconfig "k8s.io/kubernetes/pkg/controller/evictionrequest/config"
 	garbagecollectorconfig "k8s.io/kubernetes/pkg/controller/garbagecollector/config"
+	imperativeevictionresponder "k8s.io/kubernetes/pkg/controller/imperativeevictionresponder/config"
 	jobconfig "k8s.io/kubernetes/pkg/controller/job/config"
 	namespaceconfig "k8s.io/kubernetes/pkg/controller/namespace/config"
 	nodeipamconfig "k8s.io/kubernetes/pkg/controller/nodeipam/config"
@@ -37,11 +41,14 @@ import (
 	podgcconfig "k8s.io/kubernetes/pkg/controller/podgc/config"
 	replicasetconfig "k8s.io/kubernetes/pkg/controller/replicaset/config"
 	replicationconfig "k8s.io/kubernetes/pkg/controller/replication/config"
+	resourceclaimconfig "k8s.io/kubernetes/pkg/controller/resourceclaim/config"
 	resourcequotaconfig "k8s.io/kubernetes/pkg/controller/resourcequota/config"
 	serviceaccountconfig "k8s.io/kubernetes/pkg/controller/serviceaccount/config"
 	statefulsetconfig "k8s.io/kubernetes/pkg/controller/statefulset/config"
 	ttlafterfinishedconfig "k8s.io/kubernetes/pkg/controller/ttlafterfinished/config"
+	validatingadmissionpolicystatusconfig "k8s.io/kubernetes/pkg/controller/validatingadmissionpolicystatus/config"
 	attachdetachconfig "k8s.io/kubernetes/pkg/controller/volume/attachdetach/config"
+	ephemeralvolumeconfig "k8s.io/kubernetes/pkg/controller/volume/ephemeral/config"
 	persistentvolumeconfig "k8s.io/kubernetes/pkg/controller/volume/persistentvolume/config"
 )
 
@@ -60,6 +67,9 @@ type KubeControllerManagerConfiguration struct {
 	// AttachDetachControllerConfiguration holds configuration for
 	// AttachDetachController related features.
 	AttachDetachController attachdetachconfig.AttachDetachControllerConfiguration
+	// CronJobControllerConfiguration holds configuration for CronJobController
+	// related features.
+	CronJobController cronjobconfig.CronJobControllerConfiguration
 	// CSRSigningControllerConfiguration holds configuration for
 	// CSRSigningController related features.
 	CSRSigningController csrsigningconfig.CSRSigningControllerConfiguration
@@ -69,9 +79,11 @@ type KubeControllerManagerConfiguration struct {
 	// DeploymentControllerConfiguration holds configuration for
 	// DeploymentController related features.
 	DeploymentController deploymentconfig.DeploymentControllerConfiguration
-	// StatefulSetControllerConfiguration holds configuration for
-	// StatefulSetController related features.
-	StatefulSetController statefulsetconfig.StatefulSetControllerConfiguration
+	// DisruptionControllerConfiguration holds configuration for
+	// DisruptionController related features.
+	DisruptionController disruptionconfig.DisruptionControllerConfiguration
+	// DeviceTaintEvictionControllerConfiguration contains elements configuring the device taint eviction controller.
+	DeviceTaintEvictionController devicetaintevictionconfig.DeviceTaintEvictionControllerConfiguration
 	// DeprecatedControllerConfiguration holds configuration for some deprecated
 	// features.
 	DeprecatedController DeprecatedControllerConfiguration
@@ -84,16 +96,24 @@ type KubeControllerManagerConfiguration struct {
 	// EndpointSliceMirroringControllerConfiguration holds configuration for
 	// EndpointSliceMirroringController related features.
 	EndpointSliceMirroringController endpointslicemirroringconfig.EndpointSliceMirroringControllerConfiguration
+	// EphemeralVolumeControllerConfiguration holds configuration for EphemeralVolumeController
+	// related features.
+	EphemeralVolumeController ephemeralvolumeconfig.EphemeralVolumeControllerConfiguration
+	// EvictionRequestControllerConfiguration holds configuration for
+	// EvictionRequestController related features.
+	EvictionRequestController evictionrequestconfig.EvictionRequestControllerConfiguration
 	// GarbageCollectorControllerConfiguration holds configuration for
 	// GarbageCollectorController related features.
 	GarbageCollectorController garbagecollectorconfig.GarbageCollectorControllerConfiguration
 	// HPAControllerConfiguration holds configuration for HPAController related features.
 	HPAController poautosclerconfig.HPAControllerConfiguration
+	// ImperativeEvictionResponderControllerConfiguration contains elements configuring
+	// the imperative eviction responder controller.
+	ImperativeEvictionResponderController imperativeevictionresponder.ImperativeEvictionResponderControllerConfiguration
 	// JobControllerConfiguration holds configuration for JobController related features.
 	JobController jobconfig.JobControllerConfiguration
-	// CronJobControllerConfiguration holds configuration for CronJobController
-	// related features.
-	CronJobController cronjobconfig.CronJobControllerConfiguration
+	// LegacySATokenCleanerConfiguration holds configuration for LegacySATokenCleaner related features.
+	LegacySATokenCleaner serviceaccountconfig.LegacySATokenCleanerConfiguration
 	// NamespaceControllerConfiguration holds configuration for NamespaceController
 	// related features.
 	NamespaceController namespaceconfig.NamespaceControllerConfiguration
@@ -123,20 +143,19 @@ type KubeControllerManagerConfiguration struct {
 	// ServiceControllerConfiguration holds configuration for ServiceController
 	// related features.
 	ServiceController serviceconfig.ServiceControllerConfiguration
+	// StatefulSetControllerConfiguration holds configuration for
+	// StatefulSetController related features.
+	StatefulSetController statefulsetconfig.StatefulSetControllerConfiguration
 	// TTLAfterFinishedControllerConfiguration holds configuration for
 	// TTLAfterFinishedController related features.
 	TTLAfterFinishedController ttlafterfinishedconfig.TTLAfterFinishedControllerConfiguration
+	// ValidatingAdmissionPolicyStatusControllerConfiguration holds configuration for
+	// ValidatingAdmissionPolicyStatusController related features.
+	ValidatingAdmissionPolicyStatusController validatingadmissionpolicystatusconfig.ValidatingAdmissionPolicyStatusControllerConfiguration
+	// ResourceClaimControllerConfiguration contains elements configuring the resource claim controller.
+	ResourceClaimController resourceclaimconfig.ResourceClaimControllerConfiguration
 }
 
 // DeprecatedControllerConfiguration contains elements be deprecated.
 type DeprecatedControllerConfiguration struct {
-	// DEPRECATED: deletingPodsQps is the number of nodes per second on which pods are deleted in
-	// case of node failure.
-	DeletingPodsQPS float32
-	// DEPRECATED: deletingPodsBurst is the number of nodes on which pods are bursty deleted in
-	// case of node failure. For more details look into RateLimiter.
-	DeletingPodsBurst int32
-	// registerRetryCount is the number of retries for initial node registration.
-	// Retry interval equals node-sync-period.
-	RegisterRetryCount int32
 }

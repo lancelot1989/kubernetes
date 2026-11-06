@@ -34,21 +34,23 @@ type Config struct {
 	// LoopbackClientConfig is a config for a privileged loopback connection
 	LoopbackClientConfig *restclient.Config
 
-	// TODO: remove deprecated insecure serving
-	InsecureServing *apiserver.DeprecatedInsecureServingInfo
-	Authentication  apiserver.AuthenticationInfo
-	Authorization   apiserver.AuthorizationInfo
+	Authentication apiserver.AuthenticationInfo
+	Authorization  apiserver.AuthorizationInfo
+
+	// WebhookSecureServing is a separate SecureServing configuration from
+	// healthz, configz, and metrics.
+	WebhookSecureServing *apiserver.SecureServingInfo
 
 	// the general kube client
 	Client *clientset.Clientset
 
-	// the client only used for leader election
-	LeaderElectionClient *clientset.Clientset
-
 	// the rest config for the master
 	Kubeconfig *restclient.Config
 
-	// the event sink
+	// EventBroadcaster is broadcaster events to all sinks.
+	EventBroadcaster record.EventBroadcaster
+
+	// EventRecord is a sink for events.
 	EventRecorder record.EventRecorder
 
 	// ClientBuilder will provide a client for this controller to use

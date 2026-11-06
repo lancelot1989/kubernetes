@@ -18,7 +18,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/go-openapi/swag"
+	"github.com/go-openapi/swag/conv"
 	"k8s.io/kube-openapi/pkg/validation/errors"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	"k8s.io/kube-openapi/pkg/validation/strfmt"
@@ -132,7 +132,7 @@ func (t *typeValidator) Applies(source interface{}, kind reflect.Kind) bool {
 func (t *typeValidator) Validate(data interface{}) *Result {
 	result := new(Result)
 	result.Inc()
-	if data == nil || reflect.DeepEqual(reflect.Zero(reflect.TypeOf(data)), reflect.ValueOf(data)) {
+	if data == nil {
 		// nil or zero value for the passed structure require Type: null
 		if len(t.Type) > 0 && !t.Type.Contains(nullType) && !t.Nullable { // TODO: if a property is not required it also passes this
 			return errorHelp.sErr(errors.InvalidType(t.Path, t.In, strings.Join(t.Type, ","), nullType))
@@ -154,7 +154,7 @@ func (t *typeValidator) Validate(data interface{}) *Result {
 	// TODO: check json.Number (see schema.go)
 	isLowerInt := t.Format == integerFormatInt64 && format == integerFormatInt32
 	isLowerFloat := t.Format == numberFormatFloat64 && format == numberFormatFloat32
-	isFloatInt := schType == numberType && swag.IsFloat64AJSONInteger(val.Float()) && t.Type.Contains(integerType)
+	isFloatInt := schType == numberType && conv.IsFloat64AJSONInteger(val.Float()) && t.Type.Contains(integerType)
 	isIntFloat := schType == integerType && t.Type.Contains(numberType)
 
 	if kind != reflect.String && kind != reflect.Slice && t.Format != "" && !(t.Type.Contains(schType) || format == t.Format || isFloatInt || isIntFloat || isLowerInt || isLowerFloat) {

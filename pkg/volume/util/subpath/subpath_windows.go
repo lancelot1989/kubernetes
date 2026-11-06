@@ -1,4 +1,4 @@
-// +build windows
+//go:build windows
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -28,7 +28,6 @@ import (
 
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
-	"k8s.io/utils/nsenter"
 )
 
 // MaxPathLength is the maximum length of Windows path. Normally, it is 260, but if long path is enable,
@@ -42,12 +41,6 @@ func New(mount.Interface) Interface {
 	return &subpath{}
 }
 
-// NewNSEnter is to satisfy the compiler for having NewSubpathNSEnter exist for all
-// OS choices. however, NSEnter is only valid on Linux
-func NewNSEnter(mounter mount.Interface, ne *nsenter.Nsenter, rootDir string) Interface {
-	return nil
-}
-
 // isDriveLetterPath returns true if the given path is empty or it ends with ":" or ":\" or ":\\"
 func isDriveLetterorEmptyPath(path string) bool {
 	if path == "" || strings.HasSuffix(path, ":\\\\") || strings.HasSuffix(path, ":") || strings.HasSuffix(path, ":\\") {
@@ -56,10 +49,20 @@ func isDriveLetterorEmptyPath(path string) bool {
 	return false
 }
 
-// isVolumePrefix returns true if the given path name starts with "Volume" or volume prefix including
-// "\\.\", "\\?\" for device path or "UNC" or "\\" for UNC path. Otherwise, it returns false.
+// isDeviceOrUncPath returns true if the given path name starts with "Volume"
+// (a volume GUID path), "UNC" (a device-form UNC path with the "\\?\" prefix
+// stripped), or "\\" / "//" (any device-namespace path such as "\\?\", "\\.\"
+// or a UNC network path "\\server\share"). Otherwise, it returns false.
+//
+// Any path beginning with "\\" must not be resolved/followed: touching a remote
+// UNC target causes Windows to open an SMB session and automatically send the
+// node's credentials, enabling forced NTLM authentication (MITRE ATT&CK T1187).
+// The previous implementation only matched the "\\?\" and "\\.\" device forms
+// and let ordinary UNC paths like "\\attacker\share" through. The forward-slash
+// form is matched too so the check holds for callers that pass an unnormalized
+// path (e.g. a symlink target read before mount.NormalizeWindowsPath runs).
 func isDeviceOrUncPath(path string) bool {
-	if strings.HasPrefix(path, "Volume") || strings.HasPrefix(path, "\\\\?\\") || strings.HasPrefix(path, "\\\\.\\") || strings.HasPrefix(path, "UNC") {
+	if strings.HasPrefix(path, "Volume") || strings.HasPrefix(path, "UNC") || strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, "//") {
 		return true
 	}
 	return false
@@ -75,8 +78,10 @@ func getUpperPath(path string) string {
 // Check whether a directory/file is a link type or not
 // LinkType could be SymbolicLink, Junction, or HardLink
 func isLinkPath(path string) (bool, error) {
-	cmd := fmt.Sprintf("(Get-Item -Path %s).LinkType", path)
-	output, err := exec.Command("powershell", "/c", cmd).CombinedOutput()
+	cmd := exec.Command("powershell", "/c", "$ErrorActionPreference = 'Stop'; (Get-Item -Force -LiteralPath $env:linkpath).LinkType")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("linkpath=%s", path))
+	klog.V(8).Infof("Executing command: %q", cmd.String())
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return false, err
 	}
@@ -113,8 +118,11 @@ func evalSymlink(path string) (string, error) {
 		}
 	}
 	// This command will give the target path of a given symlink
-	cmd := fmt.Sprintf("(Get-Item -Path %s).Target", upperpath)
-	output, err := exec.Command("powershell", "/c", cmd).CombinedOutput()
+	// The -Force parameter will allow Get-Item to also evaluate hidden folders, like AppData.
+	cmd := exec.Command("powershell", "/c", "$ErrorActionPreference = 'Stop'; (Get-Item -Force -LiteralPath $env:linkpath).Target")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("linkpath=%s", upperpath))
+	klog.V(8).Infof("Executing command: %q", cmd.String())
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", err
 	}
@@ -124,7 +132,7 @@ func evalSymlink(path string) (string, error) {
 		klog.V(4).Infof("Path '%s' has a target %s. Return its original form.", path, linkedPath)
 		return path, nil
 	}
-	// If the target is not an absoluate path, join iit with the current upperpath
+	// If the target is not an absolute path, join iit with the current upperpath
 	if !filepath.IsAbs(linkedPath) {
 		linkedPath = filepath.Join(getUpperPath(upperpath), linkedPath)
 	}
@@ -199,6 +207,12 @@ func lockAndCheckSubPathWithoutSymlink(volumePath, subPath string) ([]uintptr, e
 		}
 		if stat.Mode()&os.ModeSymlink != 0 {
 			errorResult = fmt.Errorf("subpath %q is an unexpected symlink after EvalSymlinks", currentFullPath)
+			break
+		}
+
+		// go1.23 behavior change: https://github.com/golang/go/issues/63703#issuecomment-2535941458
+		if stat.Mode()&os.ModeIrregular != 0 {
+			errorResult = fmt.Errorf("subpath %q is an unexpected irregular file after EvalSymlinks", currentFullPath)
 			break
 		}
 
@@ -321,7 +335,7 @@ func doSafeMakeDir(pathname string, base string, perm os.FileMode) error {
 		currentPath = filepath.Join(currentPath, dir)
 		klog.V(4).Infof("Creating %s", dir)
 		if err := os.Mkdir(currentPath, perm); err != nil {
-			return fmt.Errorf("cannot create directory %s: %s", currentPath, err)
+			return fmt.Errorf("cannot create directory %s: %w", currentPath, err)
 		}
 		handle, err := lockPath(currentPath)
 		if err != nil {
@@ -335,6 +349,10 @@ func doSafeMakeDir(pathname string, base string, perm os.FileMode) error {
 		}
 		if stat.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("subpath %q is an unexpected symlink after Mkdir", currentPath)
+		}
+		// go1.23 behavior change: https://github.com/golang/go/issues/63703#issuecomment-2535941458
+		if stat.Mode()&os.ModeIrregular != 0 {
+			return fmt.Errorf("subpath %q is an unexpected irregular file after Mkdir", currentPath)
 		}
 	}
 

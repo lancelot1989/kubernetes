@@ -23,6 +23,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2/ktesting"
+	_ "k8s.io/klog/v2/ktesting/init"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -100,12 +102,14 @@ func TestGetFileShareInfo(t *testing.T) {
 
 func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 	translator := NewAzureFileCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
 	cases := []struct {
-		name   string
-		volume *corev1.Volume
-		expVol *corev1.PersistentVolume
-		expErr bool
+		name         string
+		volume       *corev1.Volume
+		podNamespace string
+		expVol       *corev1.PersistentVolume
+		expErr       bool
 	}{
 		{
 			name:   "empty volume",
@@ -119,6 +123,7 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 		{
 			name: "azure file volume",
 			volume: &corev1.Volume{
+				Name: "name",
 				VolumeSource: corev1.VolumeSource{
 					AzureFile: &corev1.AzureFileVolumeSource{
 						ReadOnly:   true,
@@ -129,7 +134,7 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 			},
 			expVol: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "file.csi.azure.com-sharename",
+					Name: "#secretname#sharename#name#default",
 				},
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
@@ -140,8 +145,42 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 								Namespace: "default",
 							},
 							ReadOnly:         true,
-							VolumeAttributes: map[string]string{azureFileShareName: "sharename"},
-							VolumeHandle:     "#secretname#sharename#",
+							VolumeAttributes: map[string]string{shareNameField: "sharename"},
+							VolumeHandle:     "#secretname#sharename#name#default",
+						},
+					},
+					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+				},
+			},
+		},
+		{
+			name: "azure file volume with a pod namespace",
+			volume: &corev1.Volume{
+				Name: "name",
+				VolumeSource: corev1.VolumeSource{
+					AzureFile: &corev1.AzureFileVolumeSource{
+						ReadOnly:   true,
+						SecretName: "secretname",
+						ShareName:  "sharename",
+					},
+				},
+			},
+			podNamespace: "test",
+			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "#secretname#sharename#name#test",
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver: "file.csi.azure.com",
+							NodeStageSecretRef: &corev1.SecretReference{
+								Name:      "secretname",
+								Namespace: "test",
+							},
+							ReadOnly:         true,
+							VolumeAttributes: map[string]string{shareNameField: "sharename"},
+							VolumeHandle:     "#secretname#sharename#name#test",
 						},
 					},
 					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
@@ -152,7 +191,7 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Logf("Testing %v", tc.name)
-		got, err := translator.TranslateInTreeInlineVolumeToCSI(tc.volume)
+		got, err := translator.TranslateInTreeInlineVolumeToCSI(logger, tc.volume, tc.podNamespace)
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}
@@ -169,6 +208,7 @@ func TestTranslateAzureFileInTreeStorageClassToCSI(t *testing.T) {
 
 func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 	translator := NewAzureFileCSITranslator()
+	logger, _ := ktesting.NewTestContext(t)
 
 	secretNamespace := "secretnamespace"
 
@@ -188,10 +228,29 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 			expErr: true,
 		},
 		{
+			name: "return error if secret namespace could not be found",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "uuid",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							ShareName:  "sharename",
+							SecretName: "secretname",
+							ReadOnly:   true,
+						},
+					},
+				},
+			},
+			expErr: true,
+		},
+		{
 			name: "azure file volume",
 			volume: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "file.csi.azure.com-sharename",
+					Name: "uuid",
 				},
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
@@ -206,7 +265,7 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 			},
 			expVol: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name: "file.csi.azure.com-sharename",
+					Name: "uuid",
 				},
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
@@ -217,8 +276,8 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 								Name:      "secretname",
 								Namespace: secretNamespace,
 							},
-							VolumeAttributes: map[string]string{azureFileShareName: "sharename"},
-							VolumeHandle:     "#secretname#sharename#",
+							VolumeAttributes: map[string]string{shareNameField: "sharename"},
+							VolumeHandle:     "#secretname#sharename#uuid#secretnamespace",
 						},
 					},
 				},
@@ -228,7 +287,7 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 			name: "azure file volume with rg annotation",
 			volume: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "file.csi.azure.com-sharename",
+					Name:        "uuid",
 					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
 				},
 				Spec: corev1.PersistentVolumeSpec{
@@ -244,7 +303,7 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 			},
 			expVol: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:        "file.csi.azure.com-sharename",
+					Name:        "uuid",
 					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
 				},
 				Spec: corev1.PersistentVolumeSpec{
@@ -256,9 +315,54 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 								Name:      "secretname",
 								Namespace: secretNamespace,
 							},
-							VolumeAttributes: map[string]string{azureFileShareName: "sharename"},
-							VolumeHandle:     "rg#secretname#sharename#",
+							VolumeAttributes: map[string]string{shareNameField: "sharename"},
+							VolumeHandle:     "rg#secretname#sharename#uuid#secretnamespace",
 						},
+					},
+				},
+			},
+		},
+		{
+			name: "get secret namespace from ClaimRef when it's missing in pv spec source",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "uuid",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							ShareName:  "sharename",
+							SecretName: "secretname",
+							//SecretNamespace: &secretNamespace,
+							ReadOnly: true,
+						},
+					},
+					ClaimRef: &corev1.ObjectReference{
+						Namespace: secretNamespace,
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "uuid",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							Driver:   "file.csi.azure.com",
+							ReadOnly: true,
+							NodeStageSecretRef: &corev1.SecretReference{
+								Name:      "secretname",
+								Namespace: secretNamespace,
+							},
+							VolumeAttributes: map[string]string{shareNameField: "sharename"},
+							VolumeHandle:     "rg#secretname#sharename#uuid#secretnamespace",
+						},
+					},
+					ClaimRef: &corev1.ObjectReference{
+						Namespace: secretNamespace,
 					},
 				},
 			},
@@ -267,7 +371,7 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Logf("Testing %v", tc.name)
-		got, err := translator.TranslateInTreePVToCSI(tc.volume)
+		got, err := translator.TranslateInTreePVToCSI(logger, tc.volume)
 		if err != nil && !tc.expErr {
 			t.Errorf("Did not expect error but got: %v", err)
 		}
@@ -285,9 +389,18 @@ func TestTranslateAzureFileInTreePVToCSI(t *testing.T) {
 func TestTranslateCSIPVToInTree(t *testing.T) {
 	translator := NewAzureFileCSITranslator()
 
+	secretName := "secretname"
 	secretNamespace := "secretnamespace"
+	shareName := "sharename"
+	defaultNS := "default"
 	mp := make(map[string]string)
-	mp["shareName"] = "unit-test"
+	mp["shareName"] = shareName
+
+	secretMap := make(map[string]string)
+	secretMap["shareName"] = shareName
+	secretMap["secretName"] = secretName
+	secretMap["secretNamespace"] = secretNamespace
+
 	cases := []struct {
 		name   string
 		volume *corev1.PersistentVolume
@@ -315,13 +428,16 @@ func TestTranslateCSIPVToInTree(t *testing.T) {
 				},
 			},
 			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{},
+				},
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
 						AzureFile: &corev1.AzureFilePersistentVolumeSource{
 							SecretName:      "ut",
 							SecretNamespace: &secretNamespace,
 							ReadOnly:        true,
-							ShareName:       "unit-test",
+							ShareName:       shareName,
 						},
 					},
 				},
@@ -334,7 +450,7 @@ func TestTranslateCSIPVToInTree(t *testing.T) {
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
 						CSI: &corev1.CSIPersistentVolumeSource{
-							VolumeHandle:     "unit-test",
+							VolumeHandle:     shareName,
 							ReadOnly:         true,
 							VolumeAttributes: mp,
 						},
@@ -344,7 +460,7 @@ func TestTranslateCSIPVToInTree(t *testing.T) {
 			expErr: true,
 		},
 		{
-			name: "translate from volume handle",
+			name: "translate from VolumeAttributes",
 			volume: &corev1.PersistentVolume{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "file.csi.azure.com-sharename",
@@ -367,9 +483,116 @@ func TestTranslateCSIPVToInTree(t *testing.T) {
 				Spec: corev1.PersistentVolumeSpec{
 					PersistentVolumeSource: corev1.PersistentVolumeSource{
 						AzureFile: &corev1.AzureFilePersistentVolumeSource{
-							SecretName: "azure-storage-account-st-secret",
-							ShareName:  "pvc-file-dynamic",
-							ReadOnly:   true,
+							SecretName:      "azure-storage-account-st-secret",
+							ShareName:       shareName,
+							SecretNamespace: &defaultNS,
+							ReadOnly:        true,
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+		{
+			name: "translate from SecretMap VolumeAttributes",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "file.csi.azure.com-sharename",
+					Annotations: map[string]string{},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							VolumeHandle:     "rg#st#pvc-file-dynamic#diskname.vhd",
+							ReadOnly:         true,
+							VolumeAttributes: secretMap,
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "file.csi.azure.com-sharename",
+					Annotations: map[string]string{},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							SecretName:      secretName,
+							SecretNamespace: &secretNamespace,
+							ShareName:       shareName,
+							ReadOnly:        true,
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+		{
+			name: "translate from NodeStageSecretRef",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "file.csi.azure.com-sharename",
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							VolumeHandle:     "rg#st#pvc-file-dynamic#diskname.vhd",
+							ReadOnly:         true,
+							VolumeAttributes: mp,
+							NodeStageSecretRef: &corev1.SecretReference{
+								Name:      secretName,
+								Namespace: secretNamespace,
+							},
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "file.csi.azure.com-sharename",
+					Annotations: map[string]string{},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							SecretName:      secretName,
+							ShareName:       shareName,
+							SecretNamespace: &secretNamespace,
+							ReadOnly:        true,
+						},
+					},
+				},
+			},
+			expErr: false,
+		},
+		{
+			name: "translate from VolumeHandle",
+			volume: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "file.csi.azure.com-sharename",
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{
+							VolumeHandle: "rg#st#pvc-file-dynamic#diskname.vhd",
+							ReadOnly:     true,
+						},
+					},
+				},
+			},
+			expVol: &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "file.csi.azure.com-sharename",
+					Annotations: map[string]string{resourceGroupAnnotation: "rg"},
+				},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						AzureFile: &corev1.AzureFilePersistentVolumeSource{
+							SecretName:      "azure-storage-account-st-secret",
+							ShareName:       "pvc-file-dynamic",
+							SecretNamespace: &defaultNS,
+							ReadOnly:        true,
 						},
 					},
 				},

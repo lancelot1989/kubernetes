@@ -2,24 +2,51 @@
 
 module k8s.io/code-generator
 
-go 1.15
+go 1.27.0
+
+godebug default=go1.27
 
 require (
-	github.com/emicklei/go-restful v2.9.5+incompatible // indirect
-	github.com/gogo/protobuf v1.3.1
-	github.com/google/go-cmp v0.5.2 // indirect
-	github.com/json-iterator/go v1.1.10 // indirect
-	github.com/mailru/easyjson v0.7.0 // indirect
-	github.com/spf13/pflag v1.0.5
-	github.com/stretchr/testify v1.6.1 // indirect
-	golang.org/x/mod v0.3.0 // indirect
-	golang.org/x/net v0.0.0-20201110031124-69a78807bb2b // indirect
-	golang.org/x/text v0.3.4 // indirect
-	golang.org/x/tools v0.0.0-20200616133436-c1934b75d054 // indirect
-	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
-	k8s.io/gengo v0.0.0-20201113003025-83324d819ded
-	k8s.io/klog/v2 v2.4.0
-	k8s.io/kube-openapi v0.0.0-20201113171705-d219536bb9fd
+	github.com/gogo/protobuf v1.3.2
+	github.com/google/gnostic-models v0.7.1
+	github.com/google/go-cmp v0.7.0
+	github.com/spf13/pflag v1.0.10
+	go.yaml.in/yaml/v2 v2.4.4
+	golang.org/x/text v0.43.0
+	k8s.io/apimachinery v0.0.0
+	k8s.io/gengo/v2 v2.0.0-20260408192533-25e2208e0dc3
+	k8s.io/klog/v2 v2.140.0
+	k8s.io/kube-openapi v0.0.0-20261014044854-ca3452a79603
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd
+	sigs.k8s.io/randfill v1.0.0
+	sigs.k8s.io/yaml v1.6.0
 )
 
-replace k8s.io/code-generator => ../code-generator
+require (
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/fxamacker/cbor/v2 v2.9.4 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
+	github.com/go-openapi/jsonpointer v1.0.2 // indirect
+	github.com/go-openapi/jsonreference v1.0.2 // indirect
+	github.com/go-openapi/swag/conv v0.29.2 // indirect
+	github.com/go-openapi/swag/jsonutils v0.29.2 // indirect
+	github.com/go-openapi/swag/pools v0.29.2 // indirect
+	github.com/go-openapi/swag/typeutils v0.29.2 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/tools v0.51.0 // indirect
+	golang.org/x/tools/go/expect v0.1.1-deprecated // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
+	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+	sigs.k8s.io/structured-merge-diff/v7 v7.0.1 // indirect
+)
+
+replace (
+	k8s.io/apimachinery => ../apimachinery
+	k8s.io/ktesting => ../ktesting
+	k8s.io/streaming => ../streaming
+)

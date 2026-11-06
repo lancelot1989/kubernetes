@@ -52,10 +52,10 @@ func ListerFuncForResourceFunc(f InformerForResourceFunc) quota.ListerForResourc
 
 // cachedHasSynced returns a function that calls hasSynced() until it returns true once, then returns true
 func cachedHasSynced(hasSynced func() bool) func() bool {
-	cache := &atomic.Value{}
+	cache := &atomic.Bool{}
 	cache.Store(false)
 	return func() bool {
-		if cache.Load().(bool) {
+		if cache.Load() {
 			// short-circuit if already synced
 			return true
 		}
@@ -199,7 +199,7 @@ func CalculateUsageStats(options quota.UsageStatsOptions,
 		// need to verify that the item matches the set of scopes
 		matchesScopes := true
 		for _, scope := range options.Scopes {
-			innerMatch, err := scopeFunc(corev1.ScopedResourceSelectorRequirement{ScopeName: scope}, item)
+			innerMatch, err := scopeFunc(corev1.ScopedResourceSelectorRequirement{ScopeName: scope, Operator: corev1.ScopeSelectorOpExists}, item)
 			if err != nil {
 				return result, nil
 			}
@@ -250,6 +250,9 @@ func (o *objectCountEvaluator) Constraints(required []corev1.ResourceName, item 
 
 // Handles returns true if the object count evaluator needs to track this attributes.
 func (o *objectCountEvaluator) Handles(a admission.Attributes) bool {
+	if a.GetSubresource() != "" {
+		return false
+	}
 	operation := a.GetOperation()
 	return operation == admission.Create
 }
@@ -270,7 +273,7 @@ func (o *objectCountEvaluator) MatchingScopes(item runtime.Object, scopes []core
 }
 
 // UncoveredQuotaScopes takes the input matched scopes which are limited by configuration and the matched quota scopes.
-// It returns the scopes which are in limited scopes but dont have a corresponding covering quota scope
+// It returns the scopes which are in limited scopes but don't have a corresponding covering quota scope
 func (o *objectCountEvaluator) UncoveredQuotaScopes(limitedScopes []corev1.ScopedResourceSelectorRequirement, matchedQuotaScopes []corev1.ScopedResourceSelectorRequirement) ([]corev1.ScopedResourceSelectorRequirement, error) {
 	return []corev1.ScopedResourceSelectorRequirement{}, nil
 }

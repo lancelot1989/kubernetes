@@ -1,4 +1,4 @@
-// +build !linux
+//go:build !linux
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -24,10 +24,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func (s *sourceFile) startWatch() {
-	klog.Errorf("Watching source file is unsupported in this build")
+func (s *sourceFile) startWatch(logger klog.Logger) {
+	logger.Error(nil, "Watching source file is unsupported in this build")
 }
 
-func (s *sourceFile) consumeWatchEvent(e *watchEvent) error {
+func (s *sourceFile) consumeWatchEvent(logger klog.Logger, e *watchEvent) error {
 	return fmt.Errorf("consuming watch event is unsupported in this build")
 }

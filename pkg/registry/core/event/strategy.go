@@ -36,13 +36,13 @@ import (
 )
 
 type eventStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating
 // Event objects via the REST API.
-var Strategy = eventStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = eventStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 func (eventStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
 	return rest.Unsupported
@@ -64,22 +64,30 @@ func (eventStrategy) Validate(ctx context.Context, obj runtime.Object) field.Err
 	return validation.ValidateEventCreate(event, groupVersion)
 }
 
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (eventStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string { return nil }
+
 // Canonicalize normalizes the object after validation.
 func (eventStrategy) Canonicalize(obj runtime.Object) {
 }
 
-func (eventStrategy) AllowCreateOnUpdate() bool {
+func (eventStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return true
 }
 
 func (eventStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	groupVersion := requestGroupVersion(ctx)
 	event := obj.(*api.Event)
-	oldEvent := obj.(*api.Event)
+	oldEvent := old.(*api.Event)
 	return validation.ValidateEventUpdate(event, oldEvent, groupVersion)
 }
 
-func (eventStrategy) AllowUnconditionalUpdate() bool {
+// WarningsOnUpdate returns warnings for the given update.
+func (eventStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+func (eventStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -121,7 +129,7 @@ func ToSelectableFields(event *api.Event) fields.Set {
 		"source":                         source,
 		"type":                           event.Type,
 	}
-	return generic.MergeFieldsSets(objectMetaFieldsSet, specificFieldsSet)
+	return generic.MergeFieldsSets(specificFieldsSet, objectMetaFieldsSet)
 }
 
 // requestGroupVersion returns the group/version associated with the given context, or a zero-value group/version.

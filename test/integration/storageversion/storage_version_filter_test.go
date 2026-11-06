@@ -24,7 +24,7 @@ import (
 	"k8s.io/api/apiserverinternal/v1alpha1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	v1 "k8s.io/api/core/v1"
-	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	apiextensionsclientset "k8s.io/apiextensions-api/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -37,7 +37,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	apiregistrationv1beta1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1beta1"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/etcd"
@@ -88,16 +88,16 @@ func testBuiltinResourceWrite(t *testing.T, cfg *rest.Config, shouldBlock bool) 
 
 func testCRDWrite(t *testing.T, cfg *rest.Config, shouldBlock bool) {
 	crdClient := apiextensionsclientset.NewForConfigOrDie(cfg)
-	_, err := crdClient.ApiextensionsV1beta1().CustomResourceDefinitions().Create(context.TODO(), etcd.GetCustomResourceDefinitionData()[1], metav1.CreateOptions{})
+	_, err := crdClient.ApiextensionsV1().CustomResourceDefinitions().Create(context.TODO(), etcd.GetCustomResourceDefinitionData()[1], metav1.CreateOptions{})
 	assertBlocking("writes to CRD", t, err, shouldBlock)
 }
 
 func testAPIServiceWrite(t *testing.T, cfg *rest.Config, shouldBlock bool) {
 	aggregatorClient := aggregatorclient.NewForConfigOrDie(cfg)
-	_, err := aggregatorClient.ApiregistrationV1beta1().APIServices().Create(context.TODO(), &apiregistrationv1beta1.APIService{
+	_, err := aggregatorClient.ApiregistrationV1().APIServices().Create(context.TODO(), &apiregistrationv1.APIService{
 		ObjectMeta: metav1.ObjectMeta{Name: "v1alpha1.wardle.example.com"},
-		Spec: apiregistrationv1beta1.APIServiceSpec{
-			Service: &apiregistrationv1beta1.ServiceReference{
+		Spec: apiregistrationv1.APIServiceSpec{
+			Service: &apiregistrationv1.ServiceReference{
 				Namespace: "kube-wardle",
 				Name:      "api",
 			},
@@ -148,7 +148,9 @@ func testBuiltinResourceRead(t *testing.T, cfg *rest.Config, shouldBlock bool) {
 func TestStorageVersionBootstrap(t *testing.T) {
 	// Start server and create CRD
 	etcdConfig := framework.SharedEtcd()
-	server := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, etcdConfig)
+	flags := framework.DefaultTestServerFlags()
+	flags = append(flags, "--runtime-config=api/all=true")
+	server := kubeapiservertesting.StartTestServerOrDie(t, nil, flags, etcdConfig)
 	etcd.CreateTestCRDs(t, apiextensionsclientset.NewForConfigOrDie(server.ClientConfig), false, etcd.GetCustomResourceDefinitionData()[0])
 	server.TearDownFn()
 
@@ -166,8 +168,10 @@ func TestStorageVersionBootstrap(t *testing.T) {
 		}
 	}
 	// Restart api server, enable the storage version API and the feature gates.
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StorageVersionAPI, true)()
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIServerIdentity, true)()
+	featuregatetesting.SetFeatureGatesDuringTest(t, utilfeature.DefaultFeatureGate, featuregatetesting.FeatureOverrides{
+		features.StorageVersionAPI: true,
+		features.APIServerIdentity: true,
+	})
 	server = kubeapiservertesting.StartTestServerOrDie(t,
 		&kubeapiservertesting.TestServerInstanceOptions{
 			StorageVersionWrapFunc: wrapperFunc,

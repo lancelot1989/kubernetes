@@ -1,3 +1,8 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # Controller-manager
 
 ## Purpose
@@ -31,3 +36,4 @@ Code changes are made in that location, merged into `k8s.io/kubernetes` and late
  2. Expect compatibility.  This repo is currently changing rapidly in direct support of
     Kubernetes and the controller-manager processes and the cloud provider
     extraction effort.
+

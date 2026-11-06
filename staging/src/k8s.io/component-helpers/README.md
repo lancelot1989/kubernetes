@@ -1,11 +1,16 @@
+> ⚠️ **This is an automatically published [staged repository](https://git.k8s.io/kubernetes/staging#external-repository-staging-area) for Kubernetes**.   
+> Contributions, including issues and pull requests, should be made to the main Kubernetes repository: [https://github.com/kubernetes/kubernetes](https://github.com/kubernetes/kubernetes).  
+> This repository is read-only for importing, and not used for direct contributions.  
+> See [CONTRIBUTING.md](./CONTRIBUTING.md) for more details.
+
 # component-helpers
 
-This repository provides helpers primarily for core components (core components as described in [Create a k8s.io/component-base repo](https://github.com/kubernetes/enhancements/blob/master/keps/sig-cluster-lifecycle/wgs/0032-create-a-k8s-io-component-repo.md#component-definition)) which are required by at least two separate binaries in kubernetes org.
+This repository provides helpers primarily for core components (core components as described in [Create a k8s.io/component-base repo](https://github.com/kubernetes/enhancements/blob/master/keps/sig-cluster-lifecycle/wgs/783-component-base/README.md#component-definition)) which are required by at least two separate binaries in kubernetes org.
 Yet, still with a high level of abstraction.
 
 `k8s.io/component-base` staging repository was considered as a candidate for hosting the helpers. Although, since the helpers are not required by the core components, the repository was deemed unsuitable.
 
-The only allowed kubernetes dependencies are `k8s.io/apimachinery`, `k8s.io/api` and `k8s.io/client-go`.
+To maintain a minimal footprint and prevent dependency bloat, no external direct dependencies are allowed.
 
 ## Purpose
 
@@ -27,3 +32,4 @@ There are NO compatibility guarantees for this repository. It is in direct suppo
 
 This repo is synced from https://github.com/kubernetes/kubernetes/tree/master/staging/src/k8s.io/component-helpers.
 Code changes are made in that location, merged into `k8s.io/kubernetes` and later synced here by a bot.
+

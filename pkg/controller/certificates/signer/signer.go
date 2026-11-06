@@ -22,6 +22,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"sync"
 	"time"
 
 	capi "k8s.io/api/certificates/v1"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	certificatesinformers "k8s.io/client-go/informers/certificates/v1"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/certificate/csr"
 	capihelper "k8s.io/kubernetes/pkg/apis/certificates"
 	"k8s.io/kubernetes/pkg/controller/certificates"
 	"k8s.io/kubernetes/pkg/controller/certificates/authority"
@@ -43,42 +45,47 @@ type CSRSigningController struct {
 }
 
 func NewKubeletServingCSRSigningController(
+	ctx context.Context,
 	client clientset.Interface,
 	csrInformer certificatesinformers.CertificateSigningRequestInformer,
 	caFile, caKeyFile string,
 	certTTL time.Duration,
 ) (*CSRSigningController, error) {
-	return NewCSRSigningController("csrsigning-kubelet-serving", capi.KubeletServingSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
+	return NewCSRSigningController(ctx, "csrsigning-kubelet-serving", capi.KubeletServingSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
 }
 
 func NewKubeletClientCSRSigningController(
+	ctx context.Context,
 	client clientset.Interface,
 	csrInformer certificatesinformers.CertificateSigningRequestInformer,
 	caFile, caKeyFile string,
 	certTTL time.Duration,
 ) (*CSRSigningController, error) {
-	return NewCSRSigningController("csrsigning-kubelet-client", capi.KubeAPIServerClientKubeletSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
+	return NewCSRSigningController(ctx, "csrsigning-kubelet-client", capi.KubeAPIServerClientKubeletSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
 }
 
 func NewKubeAPIServerClientCSRSigningController(
+	ctx context.Context,
 	client clientset.Interface,
 	csrInformer certificatesinformers.CertificateSigningRequestInformer,
 	caFile, caKeyFile string,
 	certTTL time.Duration,
 ) (*CSRSigningController, error) {
-	return NewCSRSigningController("csrsigning-kube-apiserver-client", capi.KubeAPIServerClientSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
+	return NewCSRSigningController(ctx, "csrsigning-kube-apiserver-client", capi.KubeAPIServerClientSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
 }
 
 func NewLegacyUnknownCSRSigningController(
+	ctx context.Context,
 	client clientset.Interface,
 	csrInformer certificatesinformers.CertificateSigningRequestInformer,
 	caFile, caKeyFile string,
 	certTTL time.Duration,
 ) (*CSRSigningController, error) {
-	return NewCSRSigningController("csrsigning-legacy-unknown", capiv1beta1.LegacyUnknownSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
+	return NewCSRSigningController(ctx, "csrsigning-legacy-unknown", capiv1beta1.LegacyUnknownSignerName, client, csrInformer, caFile, caKeyFile, certTTL)
 }
 
 func NewCSRSigningController(
+	ctx context.Context,
 	controllerName string,
 	signerName string,
 	client clientset.Interface,
@@ -93,6 +100,7 @@ func NewCSRSigningController(
 
 	return &CSRSigningController{
 		certificateController: certificates.NewCertificateController(
+			ctx,
 			controllerName,
 			client,
 			csrInformer,
@@ -103,10 +111,15 @@ func NewCSRSigningController(
 }
 
 // Run the main goroutine responsible for watching and syncing jobs.
-func (c *CSRSigningController) Run(workers int, stopCh <-chan struct{}) {
-	go c.dynamicCertReloader.Run(workers, stopCh)
-
-	c.certificateController.Run(workers, stopCh)
+func (c *CSRSigningController) Run(ctx context.Context, workers int) {
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		c.dynamicCertReloader.Run(ctx, workers)
+	})
+	wg.Go(func() {
+		c.certificateController.Run(ctx, workers)
+	})
+	wg.Wait()
 }
 
 type isRequestForSignerFunc func(req *x509.CertificateRequest, usages []capi.KeyUsage, signerName string) (bool, error)
@@ -115,7 +128,7 @@ type signer struct {
 	caProvider *caProvider
 
 	client  clientset.Interface
-	certTTL time.Duration
+	certTTL time.Duration // max TTL; individual requests may request shorter certs by setting spec.expirationSeconds
 
 	signerName           string
 	isRequestForSignerFn isRequestForSignerFunc
@@ -141,7 +154,7 @@ func newSigner(signerName, caFile, caKeyFile string, client clientset.Interface,
 	return ret, nil
 }
 
-func (s *signer) handle(csr *capi.CertificateSigningRequest) error {
+func (s *signer) handle(ctx context.Context, csr *capi.CertificateSigningRequest) error {
 	// Ignore unapproved or failed requests
 	if !certificates.IsCertificateRequestApproved(csr) || certificates.HasTrueCondition(csr, capi.CertificateFailed) {
 		return nil
@@ -164,7 +177,7 @@ func (s *signer) handle(csr *capi.CertificateSigningRequest) error {
 			Message:        err.Error(),
 			LastUpdateTime: metav1.Now(),
 		})
-		_, err = s.client.CertificatesV1().CertificateSigningRequests().UpdateStatus(context.TODO(), csr, metav1.UpdateOptions{})
+		_, err = s.client.CertificatesV1().CertificateSigningRequests().UpdateStatus(ctx, csr, metav1.UpdateOptions{})
 		if err != nil {
 			return fmt.Errorf("error adding failure condition for csr: %v", err)
 		}
@@ -173,31 +186,54 @@ func (s *signer) handle(csr *capi.CertificateSigningRequest) error {
 		// Ignore requests for kubernetes.io signerNames we don't recognize
 		return nil
 	}
-	cert, err := s.sign(x509cr, csr.Spec.Usages)
+	cert, err := s.sign(x509cr, csr.Spec.Usages, csr.Spec.ExpirationSeconds, nil)
 	if err != nil {
 		return fmt.Errorf("error auto signing csr: %v", err)
 	}
 	csr.Status.Certificate = cert
-	_, err = s.client.CertificatesV1().CertificateSigningRequests().UpdateStatus(context.TODO(), csr, metav1.UpdateOptions{})
+	_, err = s.client.CertificatesV1().CertificateSigningRequests().UpdateStatus(ctx, csr, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("error updating signature for csr: %v", err)
 	}
 	return nil
 }
 
-func (s *signer) sign(x509cr *x509.CertificateRequest, usages []capi.KeyUsage) ([]byte, error) {
+func (s *signer) sign(x509cr *x509.CertificateRequest, usages []capi.KeyUsage, expirationSeconds *int32, now func() time.Time) ([]byte, error) {
 	currCA, err := s.caProvider.currentCA()
 	if err != nil {
 		return nil, err
 	}
 	der, err := currCA.Sign(x509cr.Raw, authority.PermissiveSigningPolicy{
-		TTL:    s.certTTL,
-		Usages: usages,
+		TTL:      s.duration(expirationSeconds),
+		Usages:   usages,
+		Backdate: 5 * time.Minute, // this must always be less than the minimum TTL requested by a user (see sanity check requestedDuration below)
+		Short:    8 * time.Hour,   // 5 minutes of backdating is roughly 1% of 8 hours
+		Now:      now,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
+}
+
+func (s *signer) duration(expirationSeconds *int32) time.Duration {
+	if expirationSeconds == nil {
+		return s.certTTL
+	}
+
+	// honor requested duration is if it is less than the default TTL
+	// use 10 min (2x hard coded backdate above) as a sanity check lower bound
+	const min = 10 * time.Minute
+	switch requestedDuration := csr.ExpirationSecondsToDuration(*expirationSeconds); {
+	case requestedDuration > s.certTTL:
+		return s.certTTL
+
+	case requestedDuration < min:
+		return min
+
+	default:
+		return requestedDuration
+	}
 }
 
 // getCSRVerificationFuncForSignerName is a function that provides reliable mapping of signer names to verification so that
@@ -238,7 +274,7 @@ func isKubeAPIServerClient(req *x509.CertificateRequest, usages []capi.KeyUsage,
 	if signerName != capi.KubeAPIServerClientSignerName {
 		return false, nil
 	}
-	return true, validAPIServerClientUsages(usages)
+	return true, validAPIServerClientUsages(req, usages)
 }
 
 func isLegacyUnknown(req *x509.CertificateRequest, usages []capi.KeyUsage, signerName string) (bool, error) {
@@ -250,7 +286,7 @@ func isLegacyUnknown(req *x509.CertificateRequest, usages []capi.KeyUsage, signe
 	return true, nil
 }
 
-func validAPIServerClientUsages(usages []capi.KeyUsage) error {
+func validAPIServerClientUsages(req *x509.CertificateRequest, usages []capi.KeyUsage) error {
 	hasClientAuth := false
 	for _, u := range usages {
 		switch u {
@@ -265,6 +301,14 @@ func validAPIServerClientUsages(usages []capi.KeyUsage) error {
 	if !hasClientAuth {
 		return fmt.Errorf("missing required usage for client certificate: %s", capi.UsageClientAuth)
 	}
+
+	if req.PublicKeyAlgorithm == x509.MLDSA {
+		err := capihelper.ValidateMLDSAKeyUsages(usagesToSet(usages))
+		if err != nil {
+			return fmt.Errorf("validating usages for ml-dsa key: %w", err)
+		}
+	}
+
 	return nil
 }
 

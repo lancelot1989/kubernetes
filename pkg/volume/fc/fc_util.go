@@ -18,7 +18,6 @@ package fc
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -48,7 +47,19 @@ const (
 )
 
 func (handler *osIOHandler) ReadDir(dirname string) ([]os.FileInfo, error) {
-	return ioutil.ReadDir(dirname)
+	entries, err := os.ReadDir(dirname)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]os.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, info)
+	}
+	return infos, nil
 }
 func (handler *osIOHandler) Lstat(name string) (os.FileInfo, error) {
 	return os.Lstat(name)
@@ -57,12 +68,12 @@ func (handler *osIOHandler) EvalSymlinks(path string) (string, error) {
 	return filepath.EvalSymlinks(path)
 }
 func (handler *osIOHandler) WriteFile(filename string, data []byte, perm os.FileMode) error {
-	return ioutil.WriteFile(filename, data, perm)
+	return os.WriteFile(filename, data, perm)
 }
 
 // given a wwn and lun, find the device and associated devicemapper parent
 func findDisk(wwn, lun string, io ioHandler, deviceUtil volumeutil.DeviceUtil) (string, string) {
-	fcPathExp := "^(pci-.*-fc|fc)-0x" + wwn + "-lun-" + lun
+	fcPathExp := "^(pci-.*-fc|fc)-0x" + wwn + "-lun-" + lun + "$"
 	r := regexp.MustCompile(fcPathExp)
 	devPath := byPath
 	if dirs, err := io.ReadDir(devPath); err == nil {
@@ -71,7 +82,7 @@ func findDisk(wwn, lun string, io ioHandler, deviceUtil volumeutil.DeviceUtil) (
 			if r.MatchString(name) {
 				if disk, err1 := io.EvalSymlinks(devPath + name); err1 == nil {
 					dm := deviceUtil.FindMultipathDeviceForDevice(disk)
-					klog.Infof("fc: find disk: %v, dm: %v", disk, dm)
+					klog.Infof("fc: find disk: %v, dm: %v, fc path: %v", disk, dm, name)
 					return disk, dm
 				}
 			}
@@ -211,7 +222,7 @@ func searchDisk(b fcDiskMounter) (string, error) {
 		diskIDs = wwids
 	}
 
-	rescaned := false
+	rescanned := false
 	// two-phase search:
 	// first phase, search existing device path, if a multipath dm is found, exit loop
 	// otherwise, in second phase, rescan scsi bus and search again, return with any findings
@@ -228,13 +239,13 @@ func searchDisk(b fcDiskMounter) (string, error) {
 			}
 		}
 		// if a dm is found, exit loop
-		if rescaned || dm != "" {
+		if rescanned || dm != "" {
 			break
 		}
 		// rescan and search again
 		// rescan scsi bus
 		scsiHostRescan(io)
-		rescaned = true
+		rescanned = true
 	}
 	// if no disk matches input wwn and lun, exit
 	if disk == "" && dm == "" {
@@ -254,7 +265,15 @@ func (util *fcUtil) AttachDisk(b fcDiskMounter) (string, error) {
 		return "", err
 	}
 
-	return devicePath, nil
+	exists, err := mount.PathExists(devicePath)
+	if exists && err == nil {
+		return devicePath, nil
+	}
+	if exists == false {
+		return "", fmt.Errorf("device %s does not exist", devicePath)
+	} else {
+		return "", err
+	}
 }
 
 // DetachDisk removes scsi device file such as /dev/sdX from the node.
@@ -329,7 +348,7 @@ func (util *fcUtil) DetachBlockFCDisk(c fcDiskUnmapper, mapPath, devicePath stri
 	// Retrieve volume plugin dependent path like '50060e801049cfd1-lun-0' from global map path
 	arr := strings.Split(mapPath, "/")
 	if len(arr) < 1 {
-		return fmt.Errorf("Fail to retrieve volume plugin information from global map path: %v", mapPath)
+		return fmt.Errorf("failed to retrieve volume plugin information from global map path: %v", mapPath)
 	}
 	volumeInfo := arr[len(arr)-1]
 
@@ -339,7 +358,7 @@ func (util *fcUtil) DetachBlockFCDisk(c fcDiskUnmapper, mapPath, devicePath stri
 	if strings.Contains(volumeInfo, "-lun-") {
 		searchPath = byPath
 	}
-	fis, err := ioutil.ReadDir(searchPath)
+	fis, err := os.ReadDir(searchPath)
 	if err != nil {
 		return err
 	}
@@ -402,9 +421,9 @@ func (util *fcUtil) deleteMultipathDevice(exec utilexec.Interface, dmDevice stri
 
 func checkPathExists(path string) (bool, error) {
 	if pathExists, pathErr := mount.PathExists(path); pathErr != nil {
-		return pathExists, fmt.Errorf("Error checking if path exists: %v", pathErr)
+		return pathExists, fmt.Errorf("error checking if path exists: %w", pathErr)
 	} else if !pathExists {
-		klog.Warningf("Warning: Unmap skipped because path does not exist: %v", path)
+		klog.Warningf("Unmap skipped because path does not exist: %v", path)
 		return pathExists, nil
 	}
 	return true, nil

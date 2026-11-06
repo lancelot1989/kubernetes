@@ -1,3 +1,21 @@
+### Version 9.1.8 (Mon Mar 3 2025 Jeffrey Ying <jeffrey.ying86@live.com>)
+- Update kubectl to v1.32.2.
+- Update base image to debian-base:bookworm-v1.0.4.
+
+### Version 9.1.7 (Thu May 15 2023 Paco Xu <paco.xu@daocloud.io>)
+- Update kubectl to v1.27.1.
+- Use `--prune-allowlist` instead of deprecated `--prune-whitelist`.
+
+### Version 9.1.6 (Thu February 24 2022 Shihang Zhang <zshihang@google.com>)
+ - Clean up the wait check for service account (https://github.com/kubernetes/kubernetes/pull/108313)
+
+### Version 9.1.5 (Mon April 19 2021 Spencer Peterson <spencerjp@google.com>)
+ - Update baseimage to debian-base:v1.0.1.
+
+### Version 9.1.4 (Wed February 10 2021 Jordan Liggitt <liggitt@google.com>)
+ - Update kubectl to v1.20.2.
+ - Fix a bug in leader election (https://github.com/kubernetes/kubernetes/issues/98966)
+
 ### Version 9.1.3 (Mon November 30 2020 Spencer Peterson <spencerjp@google.com>)
  - Update kubectl to v1.19.3.
 

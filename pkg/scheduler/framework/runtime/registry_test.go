@@ -17,11 +17,14 @@ limitations under the License.
 package runtime
 
 import (
-	"reflect"
+	"context"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/uuid"
+
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
+	fwk "k8s.io/kube-scheduler/framework"
 )
 
 func TestDecodeInto(t *testing.T) {
@@ -63,9 +66,8 @@ func TestDecodeInto(t *testing.T) {
 			if err := DecodeInto(test.args, &pluginFooConf); err != nil {
 				t.Errorf("DecodeInto(): failed to decode args %+v: %v", test.args, err)
 			}
-			if !reflect.DeepEqual(test.expected, pluginFooConf) {
-				t.Errorf("DecodeInto(): failed to decode plugin config, expected: %+v, got: %+v",
-					test.expected, pluginFooConf)
+			if diff := cmp.Diff(test.expected, pluginFooConf); diff != "" {
+				t.Errorf("DecodeInto(): failed to decode plugin config (-want,+got):\n%s", diff)
 			}
 		})
 	}
@@ -76,7 +78,9 @@ func TestDecodeInto(t *testing.T) {
 func isRegistryEqual(registryX, registryY Registry) bool {
 	for name, pluginFactory := range registryY {
 		if val, ok := registryX[name]; ok {
-			if reflect.ValueOf(pluginFactory) != reflect.ValueOf(val) {
+			p1, _ := pluginFactory(nil, nil, nil)
+			p2, _ := val(nil, nil, nil)
+			if p1.Name() != p2.Name() {
 				// pluginFactory functions are not the same.
 				return false
 			}
@@ -96,19 +100,24 @@ func isRegistryEqual(registryX, registryY Registry) bool {
 	return true
 }
 
-type mockNoopPlugin struct{}
+type mockNoopPlugin struct {
+	uuid string
+}
 
 func (p *mockNoopPlugin) Name() string {
-	return "MockNoop"
+	return p.uuid
 }
 
 func NewMockNoopPluginFactory() PluginFactory {
-	return func(_ runtime.Object, _ framework.Handle) (framework.Plugin, error) {
-		return &mockNoopPlugin{}, nil
+	uuid := uuid.New().String()
+	return func(_ context.Context, _ runtime.Object, _ fwk.Handle) (fwk.Plugin, error) {
+		return &mockNoopPlugin{uuid}, nil
 	}
 }
 
 func TestMerge(t *testing.T) {
+	m1 := NewMockNoopPluginFactory()
+	m2 := NewMockNoopPluginFactory()
 	tests := []struct {
 		name            string
 		primaryRegistry Registry
@@ -119,27 +128,27 @@ func TestMerge(t *testing.T) {
 		{
 			name: "valid Merge",
 			primaryRegistry: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
 			},
 			registryToMerge: Registry{
-				"pluginFactory2": NewMockNoopPluginFactory(),
+				"pluginFactory2": m2,
 			},
 			expected: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
-				"pluginFactory2": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
+				"pluginFactory2": m2,
 			},
 			shouldError: false,
 		},
 		{
 			name: "Merge duplicate factories",
 			primaryRegistry: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
 			},
 			registryToMerge: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m2,
 			},
 			expected: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
 			},
 			shouldError: true,
 		},
@@ -162,6 +171,8 @@ func TestMerge(t *testing.T) {
 }
 
 func TestRegister(t *testing.T) {
+	m1 := NewMockNoopPluginFactory()
+	m2 := NewMockNoopPluginFactory()
 	tests := []struct {
 		name              string
 		registry          Registry
@@ -174,21 +185,21 @@ func TestRegister(t *testing.T) {
 			name:              "valid Register",
 			registry:          Registry{},
 			nameToRegister:    "pluginFactory1",
-			factoryToRegister: NewMockNoopPluginFactory(),
+			factoryToRegister: m1,
 			expected: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
 			},
 			shouldError: false,
 		},
 		{
 			name: "Register duplicate factories",
 			registry: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
 			},
 			nameToRegister:    "pluginFactory1",
-			factoryToRegister: NewMockNoopPluginFactory(),
+			factoryToRegister: m2,
 			expected: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
 			},
 			shouldError: true,
 		},
@@ -211,6 +222,8 @@ func TestRegister(t *testing.T) {
 }
 
 func TestUnregister(t *testing.T) {
+	m1 := NewMockNoopPluginFactory()
+	m2 := NewMockNoopPluginFactory()
 	tests := []struct {
 		name             string
 		registry         Registry
@@ -221,12 +234,12 @@ func TestUnregister(t *testing.T) {
 		{
 			name: "valid Unregister",
 			registry: Registry{
-				"pluginFactory1": NewMockNoopPluginFactory(),
-				"pluginFactory2": NewMockNoopPluginFactory(),
+				"pluginFactory1": m1,
+				"pluginFactory2": m2,
 			},
 			nameToUnregister: "pluginFactory1",
 			expected: Registry{
-				"pluginFactory2": NewMockNoopPluginFactory(),
+				"pluginFactory2": m2,
 			},
 			shouldError: false,
 		},

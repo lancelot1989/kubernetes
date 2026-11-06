@@ -18,22 +18,34 @@ package validation
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/mldsa"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"net/mail"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/runtime/schema"
+	apimachineryvalidation "k8s.io/apimachinery/pkg/api/validation"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/sets"
-	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	utilcert "k8s.io/client-go/util/cert"
 	"k8s.io/kubernetes/pkg/apis/certificates"
-	certificatesv1beta1 "k8s.io/kubernetes/pkg/apis/certificates/v1beta1"
 	apivalidation "k8s.io/kubernetes/pkg/apis/core/validation"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/clock"
 )
 
 var (
@@ -56,10 +68,6 @@ type certificateValidationOptions struct {
 	// allow populating status.certificate
 	allowSettingCertificate bool
 
-	// allow Approved and Denied conditions to be exist.
-	// we tolerate this when the problem is already present in the persisted object for compatibility.
-	allowBothApprovedAndDenied bool
-
 	// The following are bad things we tolerate for compatibility reasons:
 	// * in requests made via the v1beta1 API
 	// * in update requests where the problem is already present in the persisted object
@@ -78,22 +86,25 @@ type certificateValidationOptions struct {
 	allowUnknownUsages bool
 	// allow duplicate usages values
 	allowDuplicateUsages bool
+	// allow ML-DSA signed requests
+	allowMLDSASignedRequests bool
 }
 
 // validateCSR validates the signature and formatting of a base64-wrapped,
 // PEM-encoded PKCS#10 certificate signing request. If this is invalid, we must
 // not accept the CSR for further processing.
-func validateCSR(obj *certificates.CertificateSigningRequest) error {
+func validateCSR(obj *certificates.CertificateSigningRequest) (*x509.CertificateRequest, error) {
 	csr, err := certificates.ParseCSR(obj.Spec.Request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// check that the signature is valid
 	err = csr.CheckSignature()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+
+	return csr, nil
 }
 
 func validateCertificate(pemData []byte) error {
@@ -139,8 +150,8 @@ func ValidateCertificateRequestName(name string, prefix bool) []string {
 	return nil
 }
 
-func ValidateCertificateSigningRequestCreate(csr *certificates.CertificateSigningRequest, version schema.GroupVersion) field.ErrorList {
-	opts := getValidationOptions(version, csr, nil)
+func ValidateCertificateSigningRequestCreate(csr *certificates.CertificateSigningRequest) field.ErrorList {
+	opts := getValidationOptions(csr, nil)
 	return validateCertificateSigningRequest(csr, opts)
 }
 
@@ -170,6 +181,21 @@ var (
 		string(certificates.UsageMicrosoftSGC),
 		string(certificates.UsageNetscapeSGC),
 	)
+
+	mldsaDisallowedUsages = sets.NewString(
+		string(certificates.UsageKeyEncipherment),
+		string(certificates.UsageKeyAgreement),
+		string(certificates.UsageDataEncipherment),
+		string(certificates.UsageEncipherOnly),
+		string(certificates.UsageDecipherOnly),
+	)
+
+	mldsaAtLeastOneOfUsages = sets.NewString(
+		string(certificates.UsageDigitalSignature),
+		string(certificates.UsageContentCommitment),
+		string(certificates.UsageCertSign),
+		string(certificates.UsageCRLSign),
+	)
 )
 
 func validateCertificateSigningRequest(csr *certificates.CertificateSigningRequest, opts certificateValidationOptions) field.ErrorList {
@@ -177,17 +203,17 @@ func validateCertificateSigningRequest(csr *certificates.CertificateSigningReque
 	allErrs := apivalidation.ValidateObjectMeta(&csr.ObjectMeta, isNamespaced, ValidateCertificateRequestName, field.NewPath("metadata"))
 
 	specPath := field.NewPath("spec")
-	err := validateCSR(csr)
+	certReq, err := validateCSR(csr)
 	if err != nil {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("request"), csr.Spec.Request, fmt.Sprintf("%v", err)))
 	}
 	if len(csr.Spec.Usages) == 0 {
-		allErrs = append(allErrs, field.Required(specPath.Child("usages"), "usages must be provided"))
+		allErrs = append(allErrs, field.Required(specPath.Child("usages"), "").MarkCoveredByDeclarative())
 	}
 	if !opts.allowUnknownUsages {
 		for i, usage := range csr.Spec.Usages {
 			if !allValidUsages.Has(string(usage)) {
-				allErrs = append(allErrs, field.NotSupported(specPath.Child("usages").Index(i), usage, allValidUsages.List()))
+				allErrs = append(allErrs, field.NotSupported(specPath.Child("usages").Index(i), usage, allValidUsages.List()).MarkCoveredByDeclarative())
 			}
 		}
 	}
@@ -200,10 +226,47 @@ func validateCertificateSigningRequest(csr *certificates.CertificateSigningReque
 			seen[usage] = true
 		}
 	}
+
+	// As documented by https://www.rfc-editor.org/rfc/rfc9881.html#name-key-usage-bits
+	// ML-DSA certificates must contain at least one of the usages:
+	//     - digitalSignature
+	//     - nonRepudiation (also known as contentCommitment)
+	//     - keyCertSign
+	//     - cRLSign
+	// and must not contain any of the usages:
+	//     - keyEncipherment
+	//     - dataEncipherment
+	//     - keyAgreement
+	//     - encipherOnly
+	//     - decipherOnly
+	if certReq != nil && certReq.PublicKeyAlgorithm == x509.MLDSA {
+		if opts.allowMLDSASignedRequests {
+			hasAtLeastOneRequired := false
+			for i, usage := range csr.Spec.Usages {
+				if mldsaDisallowedUsages.Has(string(usage)) {
+					allErrs = append(allErrs, field.Invalid(specPath.Child("usages").Index(i), usage, fmt.Sprintf("When using ML-DSA keys, the usages %v are not allowed", mldsaDisallowedUsages.List())))
+				}
+
+				if !hasAtLeastOneRequired && mldsaAtLeastOneOfUsages.Has(string(usage)) {
+					hasAtLeastOneRequired = true
+				}
+			}
+
+			if !hasAtLeastOneRequired {
+				allErrs = append(allErrs, field.Invalid(specPath.Child("usages"), csr.Spec.Usages, fmt.Sprintf("When using ML-DSA keys, at least one of %v usages are required", mldsaAtLeastOneOfUsages.List())))
+			}
+		} else {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("request"), csr.Spec.Request, "ML-DSA keys cannot be used for requests"))
+		}
+	}
+
 	if !opts.allowLegacySignerName && csr.Spec.SignerName == certificates.LegacyUnknownSignerName {
 		allErrs = append(allErrs, field.Invalid(specPath.Child("signerName"), csr.Spec.SignerName, "the legacy signerName is not allowed via this API version"))
 	} else {
-		allErrs = append(allErrs, ValidateCertificateSigningRequestSignerName(specPath.Child("signerName"), csr.Spec.SignerName)...)
+		allErrs = append(allErrs, apivalidation.ValidateSignerName(specPath.Child("signerName"), csr.Spec.SignerName)...)
+	}
+	if csr.Spec.ExpirationSeconds != nil && *csr.Spec.ExpirationSeconds < 600 {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("expirationSeconds"), *csr.Spec.ExpirationSeconds, "may not specify a duration less than 600 seconds (10 minutes)"))
 	}
 	allErrs = append(allErrs, validateConditions(field.NewPath("status", "conditions"), csr, opts)...)
 
@@ -220,8 +283,6 @@ func validateConditions(fldPath *field.Path, csr *certificates.CertificateSignin
 	allErrs := field.ErrorList{}
 
 	seenTypes := map[certificates.RequestConditionType]bool{}
-	hasApproved := false
-	hasDenied := false
 
 	for i, c := range csr.Status.Conditions {
 
@@ -242,20 +303,7 @@ func validateConditions(fldPath *field.Path, csr *certificates.CertificateSignin
 			allErrs = append(allErrs, field.NotSupported(fldPath.Index(i).Child("status"), c.Status, allowedStatusValues.List()))
 		}
 
-		if !opts.allowBothApprovedAndDenied {
-			switch c.Type {
-			case certificates.CertificateApproved:
-				hasApproved = true
-				if hasDenied {
-					allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("type"), c.Type, "Approved and Denied conditions are mutually exclusive"))
-				}
-			case certificates.CertificateDenied:
-				hasDenied = true
-				if hasApproved {
-					allErrs = append(allErrs, field.Invalid(fldPath.Index(i).Child("type"), c.Type, "Approved and Denied conditions are mutually exclusive"))
-				}
-			}
-		}
+		// Approved and Denied are mutually exclusive, enforced by declarative validation.
 
 		if !opts.allowDuplicateConditionTypes {
 			if seenTypes[c.Type] {
@@ -268,97 +316,25 @@ func validateConditions(fldPath *field.Path, csr *certificates.CertificateSignin
 	return allErrs
 }
 
-// ensure signerName is of the form domain.com/something and up to 571 characters.
-// This length and format is specified to accommodate signerNames like:
-// <fqdn>/<resource-namespace>.<resource-name>.
-// The max length of a FQDN is 253 characters (DNS1123Subdomain max length)
-// The max length of a namespace name is 63 characters (DNS1123Label max length)
-// The max length of a resource name is 253 characters (DNS1123Subdomain max length)
-// We then add an additional 2 characters to account for the one '.' and one '/'.
-func ValidateCertificateSigningRequestSignerName(fldPath *field.Path, signerName string) field.ErrorList {
-	var el field.ErrorList
-	if len(signerName) == 0 {
-		el = append(el, field.Required(fldPath, "signerName must be provided"))
-		return el
-	}
-
-	segments := strings.Split(signerName, "/")
-	// validate that there is one '/' in the signerName.
-	// we do this after validating the domain segment to provide more info to the user.
-	if len(segments) != 2 {
-		el = append(el, field.Invalid(fldPath, signerName, "must be a fully qualified domain and path of the form 'example.com/signer-name'"))
-		// return early here as we should not continue attempting to validate a missing or malformed path segment
-		// (i.e. one containing multiple or zero `/`)
-		return el
-	}
-
-	// validate that segments[0] is less than 253 characters altogether
-	maxDomainSegmentLength := utilvalidation.DNS1123SubdomainMaxLength
-	if len(segments[0]) > maxDomainSegmentLength {
-		el = append(el, field.TooLong(fldPath, segments[0], maxDomainSegmentLength))
-	}
-	// validate that segments[0] consists of valid DNS1123 labels separated by '.'
-	domainLabels := strings.Split(segments[0], ".")
-	for _, lbl := range domainLabels {
-		// use IsDNS1123Label as we want to ensure the max length of any single label in the domain
-		// is 63 characters
-		if errs := utilvalidation.IsDNS1123Label(lbl); len(errs) > 0 {
-			for _, err := range errs {
-				el = append(el, field.Invalid(fldPath, segments[0], fmt.Sprintf("validating label %q: %s", lbl, err)))
-			}
-			// if we encounter any errors whilst parsing the domain segment, break from
-			// validation as any further error messages will be duplicates, and non-distinguishable
-			// from each other, confusing users.
-			break
-		}
-	}
-
-	// validate that there is at least one '.' in segments[0]
-	if len(domainLabels) < 2 {
-		el = append(el, field.Invalid(fldPath, segments[0], "should be a domain with at least two segments separated by dots"))
-	}
-
-	// validate that segments[1] consists of valid DNS1123 subdomains separated by '.'.
-	pathLabels := strings.Split(segments[1], ".")
-	for _, lbl := range pathLabels {
-		// use IsDNS1123Subdomain because it enforces a length restriction of 253 characters
-		// which is required in order to fit a full resource name into a single 'label'
-		if errs := utilvalidation.IsDNS1123Subdomain(lbl); len(errs) > 0 {
-			for _, err := range errs {
-				el = append(el, field.Invalid(fldPath, segments[1], fmt.Sprintf("validating label %q: %s", lbl, err)))
-			}
-			// if we encounter any errors whilst parsing the path segment, break from
-			// validation as any further error messages will be duplicates, and non-distinguishable
-			// from each other, confusing users.
-			break
-		}
-	}
-
-	// ensure that segments[1] can accommodate a dns label + dns subdomain + '.'
-	maxPathSegmentLength := utilvalidation.DNS1123SubdomainMaxLength + utilvalidation.DNS1123LabelMaxLength + 1
-	maxSignerNameLength := maxDomainSegmentLength + maxPathSegmentLength + 1
-	if len(signerName) > maxSignerNameLength {
-		el = append(el, field.TooLong(fldPath, signerName, maxSignerNameLength))
-	}
-
-	return el
+func ValidateCertificateSigningRequestUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest) field.ErrorList {
+	allErrs := apivalidation.ValidateObjectMetaUpdate(&newCSR.ObjectMeta, &oldCSR.ObjectMeta, field.NewPath("metadata"))
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(&newCSR.Spec, &oldCSR.Spec, field.NewPath("spec")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	allErrs = append(allErrs, apivalidation.ValidateImmutableField(&newCSR.Status, &oldCSR.Status, field.NewPath("status"))...)
+	return allErrs
 }
 
-func ValidateCertificateSigningRequestUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest, version schema.GroupVersion) field.ErrorList {
-	opts := getValidationOptions(version, newCSR, oldCSR)
-	return validateCertificateSigningRequestUpdate(newCSR, oldCSR, opts)
-}
-
-func ValidateCertificateSigningRequestStatusUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest, version schema.GroupVersion) field.ErrorList {
-	opts := getValidationOptions(version, newCSR, oldCSR)
+func ValidateCertificateSigningRequestStatusUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest) field.ErrorList {
+	allErrs := apivalidation.ValidateImmutableField(&newCSR.Spec, &oldCSR.Spec, field.NewPath("spec")).WithOrigin("immutable").MarkCoveredByDeclarative()
+	opts := getValidationOptions(newCSR, oldCSR)
 	opts.allowSettingCertificate = true
-	return validateCertificateSigningRequestUpdate(newCSR, oldCSR, opts)
+	return append(allErrs, validateCertificateSigningRequestUpdate(newCSR, oldCSR, opts)...)
 }
 
-func ValidateCertificateSigningRequestApprovalUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest, version schema.GroupVersion) field.ErrorList {
-	opts := getValidationOptions(version, newCSR, oldCSR)
+func ValidateCertificateSigningRequestApprovalUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest) field.ErrorList {
+	allErrs := apivalidation.ValidateImmutableField(&newCSR.Spec, &oldCSR.Spec, field.NewPath("spec")).WithOrigin("immutable").MarkCoveredByDeclarative()
+	opts := getValidationOptions(newCSR, oldCSR)
 	opts.allowSettingApprovalConditions = true
-	return validateCertificateSigningRequestUpdate(newCSR, oldCSR, opts)
+	return append(allErrs, validateCertificateSigningRequestUpdate(newCSR, oldCSR, opts)...)
 }
 
 func validateCertificateSigningRequestUpdate(newCSR, oldCSR *certificates.CertificateSigningRequest, opts certificateValidationOptions) field.ErrorList {
@@ -385,7 +361,7 @@ func validateCertificateSigningRequestUpdate(newCSR, oldCSR *certificates.Certif
 			case len(newConditions) > len(oldConditions):
 				validationErrorList = append(validationErrorList, field.Forbidden(field.NewPath("status", "conditions"), fmt.Sprintf("updates may not add a condition of type %q", t)))
 			case !apiequality.Semantic.DeepEqual(oldConditions, newConditions):
-				conditionDiff := diff.ObjectDiff(oldConditions, newConditions)
+				conditionDiff := diff.Diff(oldConditions, newConditions)
 				validationErrorList = append(validationErrorList, field.Forbidden(field.NewPath("status", "conditions"), fmt.Sprintf("updates may not modify a condition of type %q\n%v", t, conditionDiff)))
 			}
 		}
@@ -417,45 +393,21 @@ func findConditions(csr *certificates.CertificateSigningRequest, conditionType c
 // compatible with the specified version and existing CSR.
 // oldCSR may be nil if this is a create request.
 // validation options related to subresource-specific capabilities are set to false.
-func getValidationOptions(version schema.GroupVersion, newCSR, oldCSR *certificates.CertificateSigningRequest) certificateValidationOptions {
+func getValidationOptions(newCSR, oldCSR *certificates.CertificateSigningRequest) certificateValidationOptions {
 	return certificateValidationOptions{
-		allowResettingCertificate:    allowResettingCertificate(version),
-		allowBothApprovedAndDenied:   allowBothApprovedAndDenied(oldCSR),
-		allowLegacySignerName:        allowLegacySignerName(version, oldCSR),
-		allowDuplicateConditionTypes: allowDuplicateConditionTypes(version, oldCSR),
-		allowEmptyConditionType:      allowEmptyConditionType(version, oldCSR),
-		allowArbitraryCertificate:    allowArbitraryCertificate(version, newCSR, oldCSR),
-		allowDuplicateUsages:         allowDuplicateUsages(version, oldCSR),
-		allowUnknownUsages:           allowUnknownUsages(version, oldCSR),
+		allowResettingCertificate:    false,
+		allowLegacySignerName:        allowLegacySignerName(oldCSR),
+		allowDuplicateConditionTypes: allowDuplicateConditionTypes(oldCSR),
+		allowEmptyConditionType:      allowEmptyConditionType(oldCSR),
+		allowArbitraryCertificate:    allowArbitraryCertificate(newCSR, oldCSR),
+		allowDuplicateUsages:         allowDuplicateUsages(oldCSR),
+		allowUnknownUsages:           allowUnknownUsages(oldCSR),
+		allowMLDSASignedRequests:     allowMLDSASignedRequests(oldCSR),
 	}
 }
 
-func allowResettingCertificate(version schema.GroupVersion) bool {
-	// compatibility with v1beta1
-	return version == certificatesv1beta1.SchemeGroupVersion
-}
-
-func allowBothApprovedAndDenied(oldCSR *certificates.CertificateSigningRequest) bool {
-	if oldCSR == nil {
-		return false
-	}
-	approved := false
-	denied := false
-	for _, c := range oldCSR.Status.Conditions {
-		if c.Type == certificates.CertificateApproved {
-			approved = true
-		} else if c.Type == certificates.CertificateDenied {
-			denied = true
-		}
-	}
-	// compatibility with existing data
-	return approved && denied
-}
-
-func allowLegacySignerName(version schema.GroupVersion, oldCSR *certificates.CertificateSigningRequest) bool {
+func allowLegacySignerName(oldCSR *certificates.CertificateSigningRequest) bool {
 	switch {
-	case version == certificatesv1beta1.SchemeGroupVersion:
-		return true // compatibility with v1beta1
 	case oldCSR != nil && oldCSR.Spec.SignerName == certificates.LegacyUnknownSignerName:
 		return true // compatibility with existing data
 	default:
@@ -463,10 +415,8 @@ func allowLegacySignerName(version schema.GroupVersion, oldCSR *certificates.Cer
 	}
 }
 
-func allowDuplicateConditionTypes(version schema.GroupVersion, oldCSR *certificates.CertificateSigningRequest) bool {
+func allowDuplicateConditionTypes(oldCSR *certificates.CertificateSigningRequest) bool {
 	switch {
-	case version == certificatesv1beta1.SchemeGroupVersion:
-		return true // compatibility with v1beta1
 	case oldCSR != nil && hasDuplicateConditionTypes(oldCSR):
 		return true // compatibility with existing data
 	default:
@@ -484,10 +434,8 @@ func hasDuplicateConditionTypes(csr *certificates.CertificateSigningRequest) boo
 	return false
 }
 
-func allowEmptyConditionType(version schema.GroupVersion, oldCSR *certificates.CertificateSigningRequest) bool {
+func allowEmptyConditionType(oldCSR *certificates.CertificateSigningRequest) bool {
 	switch {
-	case version == certificatesv1beta1.SchemeGroupVersion:
-		return true // compatibility with v1beta1
 	case oldCSR != nil && hasEmptyConditionType(oldCSR):
 		return true // compatibility with existing data
 	default:
@@ -503,10 +451,8 @@ func hasEmptyConditionType(csr *certificates.CertificateSigningRequest) bool {
 	return false
 }
 
-func allowArbitraryCertificate(version schema.GroupVersion, newCSR, oldCSR *certificates.CertificateSigningRequest) bool {
+func allowArbitraryCertificate(newCSR, oldCSR *certificates.CertificateSigningRequest) bool {
 	switch {
-	case version == certificatesv1beta1.SchemeGroupVersion:
-		return true // compatibility with v1beta1
 	case newCSR != nil && oldCSR != nil && bytes.Equal(newCSR.Status.Certificate, oldCSR.Status.Certificate):
 		return true // tolerate updates that don't touch status.certificate
 	case oldCSR != nil && validateCertificate(oldCSR.Status.Certificate) != nil:
@@ -516,10 +462,8 @@ func allowArbitraryCertificate(version schema.GroupVersion, newCSR, oldCSR *cert
 	}
 }
 
-func allowUnknownUsages(version schema.GroupVersion, oldCSR *certificates.CertificateSigningRequest) bool {
+func allowUnknownUsages(oldCSR *certificates.CertificateSigningRequest) bool {
 	switch {
-	case version == certificatesv1beta1.SchemeGroupVersion:
-		return true // compatibility with v1beta1
 	case oldCSR != nil && hasUnknownUsage(oldCSR.Spec.Usages):
 		return true // compatibility with existing data
 	default:
@@ -536,10 +480,8 @@ func hasUnknownUsage(usages []certificates.KeyUsage) bool {
 	return false
 }
 
-func allowDuplicateUsages(version schema.GroupVersion, oldCSR *certificates.CertificateSigningRequest) bool {
+func allowDuplicateUsages(oldCSR *certificates.CertificateSigningRequest) bool {
 	switch {
-	case version == certificatesv1beta1.SchemeGroupVersion:
-		return true // compatibility with v1beta1
 	case oldCSR != nil && hasDuplicateUsage(oldCSR.Spec.Usages):
 		return true // compatibility with existing data
 	default:
@@ -556,4 +498,621 @@ func hasDuplicateUsage(usages []certificates.KeyUsage) bool {
 		seen[usage] = true
 	}
 	return false
+}
+
+func allowMLDSASignedRequests(oldCSR *certificates.CertificateSigningRequest) bool {
+	if utilfeature.DefaultFeatureGate.Enabled(features.CertificateSigningRequestMLDSA) {
+		return true
+	}
+
+	if oldCSR != nil {
+		cr, err := certificates.ParseCSR(oldCSR.Spec.Request)
+		if err != nil {
+			return false
+		}
+
+		if cr.PublicKeyAlgorithm == x509.MLDSA {
+			return true
+		}
+	}
+
+	return false
+}
+
+type ValidateClusterTrustBundleOptions struct {
+	SuppressBundleParsing bool
+}
+
+// ValidateClusterTrustBundle runs all validation checks on bundle.
+func ValidateClusterTrustBundle(bundle *certificates.ClusterTrustBundle, opts ValidateClusterTrustBundleOptions) field.ErrorList {
+	var allErrors field.ErrorList
+
+	metaErrors := apivalidation.ValidateObjectMeta(&bundle.ObjectMeta, false, apivalidation.ValidateClusterTrustBundleName(bundle.Spec.SignerName), field.NewPath("metadata"))
+	allErrors = append(allErrors, metaErrors...)
+
+	if bundle.Spec.SignerName != "" {
+		signerNameErrors := apivalidation.ValidateSignerName(field.NewPath("spec", "signerName"), bundle.Spec.SignerName)
+		allErrors = append(allErrors, signerNameErrors...)
+	}
+
+	if !opts.SuppressBundleParsing {
+		pemErrors := validateTrustBundle(field.NewPath("spec", "trustBundle"), bundle.Spec.TrustBundle)
+		allErrors = append(allErrors, pemErrors...)
+	}
+
+	return allErrors
+}
+
+// ValidateClusterTrustBundleUpdate runs all update validation checks on an
+// update.
+func ValidateClusterTrustBundleUpdate(newBundle, oldBundle *certificates.ClusterTrustBundle) field.ErrorList {
+	// If the caller isn't changing the TrustBundle field, don't parse it.
+	// This helps smoothly handle changes in Go's PEM or X.509 parsing
+	// libraries.
+	opts := ValidateClusterTrustBundleOptions{}
+	if newBundle.Spec.TrustBundle == oldBundle.Spec.TrustBundle {
+		opts.SuppressBundleParsing = true
+	}
+
+	var allErrors field.ErrorList
+	allErrors = append(allErrors, ValidateClusterTrustBundle(newBundle, opts)...)
+	allErrors = append(allErrors, apivalidation.ValidateObjectMetaUpdate(&newBundle.ObjectMeta, &oldBundle.ObjectMeta, field.NewPath("metadata"))...)
+	allErrors = append(allErrors, apivalidation.ValidateImmutableField(newBundle.Spec.SignerName, oldBundle.Spec.SignerName, field.NewPath("spec", "signerName")).WithOrigin("immutable").MarkCoveredByDeclarative()...)
+	return allErrors
+}
+
+// validateTrustBundle rejects intra-block headers, blocks
+// that don't parse as X.509 CA certificates, and duplicate trust anchors.  It
+// requires that at least one trust anchor is provided.
+func validateTrustBundle(path *field.Path, in string) field.ErrorList {
+	var allErrors field.ErrorList
+
+	if len(in) > certificates.MaxTrustBundleSize {
+		allErrors = append(allErrors, field.TooLong(path, "" /*unused*/, certificates.MaxTrustBundleSize))
+		return allErrors
+	}
+
+	blockDedupe := map[string][]int{}
+
+	rest := []byte(in)
+	var b *pem.Block
+	i := -1
+	for {
+		b, rest = pem.Decode(rest)
+		if b == nil {
+			break
+		}
+		i++
+
+		if b.Type != "CERTIFICATE" {
+			allErrors = append(allErrors, field.Invalid(path, "<value omitted>", fmt.Sprintf("entry %d has bad block type: %v", i, b.Type)))
+			continue
+		}
+
+		if len(b.Headers) != 0 {
+			allErrors = append(allErrors, field.Invalid(path, "<value omitted>", fmt.Sprintf("entry %d has PEM block headers", i)))
+			continue
+		}
+
+		cert, err := x509.ParseCertificate(b.Bytes)
+		if err != nil {
+			allErrors = append(allErrors, field.Invalid(path, "<value omitted>", fmt.Sprintf("entry %d does not parse as X.509", i)))
+			continue
+		}
+
+		if !cert.IsCA {
+			allErrors = append(allErrors, field.Invalid(path, "<value omitted>", fmt.Sprintf("entry %d does not have the CA bit set", i)))
+			continue
+		}
+
+		if !cert.BasicConstraintsValid {
+			allErrors = append(allErrors, field.Invalid(path, "<value omitted>", fmt.Sprintf("entry %d has invalid basic constraints", i)))
+			continue
+		}
+
+		blockDedupe[string(b.Bytes)] = append(blockDedupe[string(b.Bytes)], i)
+	}
+
+	// If we had a malformed block, don't also output potentially-redundant
+	// errors about duplicate or missing trust anchors.
+	if len(allErrors) != 0 {
+		return allErrors
+	}
+
+	if len(blockDedupe) == 0 {
+		allErrors = append(allErrors, field.Invalid(path, "<value omitted>", "at least one trust anchor must be provided"))
+	}
+
+	for _, indices := range blockDedupe {
+		if len(indices) > 1 {
+			allErrors = append(allErrors, field.Invalid(path, "<value omitted>", fmt.Sprintf("duplicate trust anchor (indices %v)", indices)))
+		}
+	}
+
+	return allErrors
+}
+
+// ValidatePodCertificateRequestCreate runs all validation checks on a pod certificate request create.
+func ValidatePodCertificateRequestCreate(req *certificates.PodCertificateRequest) field.ErrorList {
+	var allErrors field.ErrorList
+
+	metaErrors := apivalidation.ValidateObjectMeta(&req.ObjectMeta, true, apimachineryvalidation.NameIsDNSSubdomain, field.NewPath("metadata"))
+	allErrors = append(allErrors, metaErrors...)
+
+	signerNameErrors := apivalidation.ValidateSignerName(field.NewPath("spec", "signerName"), req.Spec.SignerName)
+	allErrors = append(allErrors, signerNameErrors...)
+
+	if req.Spec.UnverifiedUserAnnotations != nil {
+		userAnnotationsErrors := apivalidation.ValidateUserAnnotations(req.Spec.UnverifiedUserAnnotations, field.NewPath("spec", "unverifiedUserAnnotations"))
+		allErrors = append(allErrors, userAnnotationsErrors...)
+	}
+
+	for _, msg := range apivalidation.ValidatePodName(req.Spec.PodName, false) {
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "podName"), req.Spec.PodName, msg))
+	}
+	if len(req.Spec.PodUID) == 0 {
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "podUID"), req.Spec.PodUID, "must not be empty"))
+	}
+	if len(req.Spec.PodUID) > 128 {
+		allErrors = append(allErrors, field.TooLong(field.NewPath("spec", "podUID"), req.Spec.PodUID, 128))
+	}
+	for _, msg := range apivalidation.ValidateServiceAccountName(req.Spec.ServiceAccountName, false) {
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "serviceAccountName"), req.Spec.ServiceAccountName, msg))
+	}
+	if len(req.Spec.ServiceAccountUID) == 0 {
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "serviceAccountUID"), req.Spec.ServiceAccountUID, "must not be empty"))
+	}
+	if len(req.Spec.ServiceAccountUID) > 128 {
+		allErrors = append(allErrors, field.TooLong(field.NewPath("spec", "serviceAccountUID"), req.Spec.ServiceAccountUID, 128))
+	}
+	for _, msg := range apivalidation.ValidateNodeName(string(req.Spec.NodeName), false) {
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "nodeName"), req.Spec.NodeName, msg))
+	}
+	if len(req.Spec.NodeUID) == 0 {
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "nodeUID"), req.Spec.NodeUID, "must not be empty"))
+	}
+	if len(req.Spec.NodeUID) > 128 {
+		allErrors = append(allErrors, field.TooLong(field.NewPath("spec", "nodeUID"), req.Spec.NodeUID, 128))
+	}
+
+	if req.Spec.MaxExpirationSeconds == nil {
+		allErrors = append(allErrors, field.Required(field.NewPath("spec", "maxExpirationSeconds"), "must be set"))
+		return allErrors
+	}
+	if apivalidation.IsKubernetesSignerName(req.Spec.SignerName) {
+		// Kubernetes signers are restricted to max 24 hour certs
+		if !(certificates.MinMaxExpirationSeconds <= *req.Spec.MaxExpirationSeconds && *req.Spec.MaxExpirationSeconds <= certificates.KubernetesMaxMaxExpirationSeconds) {
+			allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "maxExpirationSeconds"), req.Spec.MaxExpirationSeconds, fmt.Sprintf("must be in the range [%d, %d]", certificates.MinMaxExpirationSeconds, certificates.KubernetesMaxMaxExpirationSeconds)))
+		}
+	} else {
+		// All other signers are restricted to max 91 day certs.
+		if !(certificates.MinMaxExpirationSeconds <= *req.Spec.MaxExpirationSeconds && *req.Spec.MaxExpirationSeconds <= certificates.MaxMaxExpirationSeconds) {
+			allErrors = append(allErrors, field.Invalid(field.NewPath("spec", "maxExpirationSeconds"), req.Spec.MaxExpirationSeconds, fmt.Sprintf("must be in the range [%d, %d]", certificates.MinMaxExpirationSeconds, certificates.MaxMaxExpirationSeconds)))
+		}
+	}
+
+	// Either (PKIXPublicKey, ProofOfPossession) xor (StubPKCS10Request)
+	// must be set.
+
+	//nolint:staticcheck // SA1019 this deprecated field still needs to be validated.
+	if len(req.Spec.StubPKCS10Request) != 0 && len(req.Spec.PKIXPublicKey) == 0 && len(req.Spec.ProofOfPossession) == 0 {
+		// Valid, using StubPKCS10Request
+		allErrors = append(allErrors, validateStubPKCS10Request(req)...)
+		return allErrors
+	} else if len(req.Spec.StubPKCS10Request) == 0 && len(req.Spec.PKIXPublicKey) != 0 && len(req.Spec.ProofOfPossession) != 0 {
+		// Valid, using PKIXPublicKey and ProofOfPossession
+		allErrors = append(allErrors, validateDeprecatedPKIXPublicKey(req)...)
+		return allErrors
+	} else {
+		// Invalid, any other combination.
+		allErrors = append(allErrors, field.Invalid(field.NewPath("spec"), field.OmitValueType{}, "exactly one of (stubPKCS10Request) or (pkixPublicKey, proofOfPossession) must be set"))
+		return allErrors
+	}
+}
+
+func validateDeprecatedPKIXPublicKey(req *certificates.PodCertificateRequest) field.ErrorList {
+	var allErrors field.ErrorList
+
+	//nolint:staticcheck // SA1019 this deprecated field still needs to be validated.
+	if len(req.Spec.PKIXPublicKey) > certificates.MaxPKIXPublicKeySize {
+		allErrors = append(allErrors, field.TooLong(field.NewPath("spec", "pkixPublicKey"), req.Spec.PKIXPublicKey, certificates.MaxPKIXPublicKeySize))
+		return allErrors
+	}
+
+	//nolint:staticcheck // SA1019 this deprecated field still needs to be validated.
+	if len(req.Spec.ProofOfPossession) > certificates.MaxProofOfPossessionSize {
+		allErrors = append(allErrors, field.TooLong(field.NewPath("spec", "proofOfPossession"), req.Spec.ProofOfPossession, certificates.MaxProofOfPossessionSize))
+		return allErrors
+	}
+
+	//nolint:staticcheck // SA1019 this deprecated field still needs to be validated.
+	pubAny, err := x509.ParsePKIXPublicKey(req.Spec.PKIXPublicKey)
+	if err != nil {
+		allErrors = append(allErrors, field.Invalid(pkixPath, req.Spec.PKIXPublicKey, "must be a valid PKIX-serialized public key"))
+		return allErrors
+	}
+
+	// Verify public key properties and the proof-of-possession signature.
+	switch pub := pubAny.(type) {
+	case ed25519.PublicKey:
+		// ed25519 has no key configuration to check
+		if !ed25519.Verify(pub, []byte(req.Spec.PodUID), req.Spec.ProofOfPossession) {
+			allErrors = append(allErrors, field.Invalid(popPath, field.OmitValueType{}, "could not verify proof-of-possession signature"))
+			return allErrors
+		}
+
+	case *ecdsa.PublicKey:
+		if pub.Curve != elliptic.P256() && pub.Curve != elliptic.P384() && pub.Curve != elliptic.P521() {
+			allErrors = append(allErrors, field.Invalid(pkixPath, "curve "+pub.Curve.Params().Name, "elliptic public keys must use curve P256 or P384"))
+			return allErrors
+		}
+		if !ecdsa.VerifyASN1(pub, hashBytes([]byte(req.Spec.PodUID)), req.Spec.ProofOfPossession) {
+			allErrors = append(allErrors, field.Invalid(popPath, field.OmitValueType{}, "could not verify proof-of-possession signature"))
+			return allErrors
+		}
+
+	case *rsa.PublicKey:
+		if pub.Size()*8 != 3072 && pub.Size()*8 != 4096 {
+			allErrors = append(allErrors, field.Invalid(pkixPath, fmt.Sprintf("%d-bit modulus", pub.Size()*8), "RSA keys must have modulus size 3072 or 4096"))
+			return allErrors
+		}
+		if err := rsa.VerifyPSS(pub, crypto.SHA256, hashBytes([]byte(req.Spec.PodUID)), req.Spec.ProofOfPossession, nil); err != nil {
+			allErrors = append(allErrors, field.Invalid(popPath, field.OmitValueType{}, "could not verify proof-of-possession signature"))
+			return allErrors
+		}
+
+	default:
+		allErrors = append(allErrors, field.Invalid(pkixPath, req.Spec.PKIXPublicKey, "unknown public key type; supported types are Ed25519, ECDSA, and RSA"))
+		return allErrors
+	}
+
+	return allErrors
+}
+
+func validateStubPKCS10Request(req *certificates.PodCertificateRequest) field.ErrorList {
+	var allErrors field.ErrorList
+
+	if len(req.Spec.StubPKCS10Request) > certificates.MaxStubPKCS10RequestSize {
+		allErrors = append(allErrors, field.TooLong(pkcs10ReqPath, req.Spec.StubPKCS10Request, certificates.MaxStubPKCS10RequestSize))
+		return allErrors
+	}
+
+	pkcs10Req, err := x509.ParseCertificateRequest(req.Spec.StubPKCS10Request)
+	if err != nil {
+		allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, field.OmitValueType{}, "must be a valid PKCS#10 CSR"))
+		return allErrors
+	}
+
+	// Check key type and parameters
+	switch pkcs10Pub := pkcs10Req.PublicKey.(type) {
+	case ed25519.PublicKey:
+		// ed25519 has no key configuration to check
+	case *ecdsa.PublicKey:
+		if pkcs10Pub.Curve != elliptic.P256() && pkcs10Pub.Curve != elliptic.P384() && pkcs10Pub.Curve != elliptic.P521() {
+			allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, "curve "+pkcs10Pub.Curve.Params().Name, "elliptic public keys must use curve P256, P384, or P521"))
+			return allErrors
+		}
+	case *rsa.PublicKey:
+		if pkcs10Pub.Size()*8 != 3072 && pkcs10Pub.Size()*8 != 4096 {
+			allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, fmt.Sprintf("%d-bit modulus", pkcs10Pub.Size()*8), "RSA keys must have modulus size 3072 or 4096"))
+			return allErrors
+		}
+	case *mldsa.PublicKey:
+		keyParam := pkcs10Pub.Parameters().String()
+		if keyParam != mldsa.MLDSA44().String() && keyParam != mldsa.MLDSA65().String() && keyParam != mldsa.MLDSA87().String() {
+			allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, fmt.Sprintf("key parameters %q", keyParam), fmt.Sprintf("ML-DSA keys must have key parameters of %s, %s, or %s", mldsa.MLDSA44().String(), mldsa.MLDSA65().String(), mldsa.MLDSA87().String())))
+			return allErrors
+		}
+	default:
+		allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, field.OmitValueType{}, "unknown public key type; supported types are Ed25519, ECDSA, RSA, and ML-DSA"))
+		return allErrors
+	}
+
+	// We explicitly do not validate the contents of the stub CSR.  Kubelet
+	// always generates empty CSRs.  Having kube-apiserver not care about the
+	// contents eases any future evolution we want to do here.
+	//
+	// Signers shipped by the Kubernetes project should deny the request if the
+	// CSR is not empty.
+
+	if err := pkcs10Req.CheckSignature(); err != nil {
+		allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, field.OmitValueType{}, "invalid signature"))
+		return allErrors
+	}
+
+	return allErrors
+}
+
+func hashBytes(in []byte) []byte {
+	out := sha256.Sum256(in)
+	return out[:]
+}
+
+var (
+	pkixPath         = field.NewPath("spec", "pkixPublicKey")
+	popPath          = field.NewPath("spec", "proofOfPossession")
+	pkcs10ReqPath    = field.NewPath("spec", "stubPKCS10Request")
+	certChainPath    = field.NewPath("status", "certificateChain")
+	notBeforePath    = field.NewPath("status", "notBefore")
+	notAfterPath     = field.NewPath("status", "notAfter")
+	beginRefreshPath = field.NewPath("status", "beginRefreshAt")
+)
+
+// ValidatePodCertificateRequestUpdate runs all update validation checks on a
+// non-status update.
+//
+// All spec fields are immutable after creation, and status updates must go
+// through the dedicated status update verb, so only metadata updates are
+// allowed.
+func ValidatePodCertificateRequestUpdate(newReq, oldReq *certificates.PodCertificateRequest) field.ErrorList {
+	var allErrors field.ErrorList
+	allErrors = append(allErrors, apivalidation.ValidateObjectMetaUpdate(&newReq.ObjectMeta, &oldReq.ObjectMeta, field.NewPath("metadata"))...)
+
+	// All spec fields are immutable.
+	allErrors = append(allErrors, apivalidation.ValidateImmutableField(newReq.Spec, oldReq.Spec, field.NewPath("spec"))...)
+
+	return allErrors
+}
+
+// ValidatePodCertificateRequestStatusUpdate validates a status update for a
+// PodCertificateRequest.
+func ValidatePodCertificateRequestStatusUpdate(newReq, oldReq *certificates.PodCertificateRequest, clock clock.PassiveClock) field.ErrorList {
+	var allErrors field.ErrorList
+
+	// Metadata is *mostly* immutable... ManagedFields is allowed to change.  We
+	// are reliant on the strategy that's calling us to have patched
+	// newReq.ObjectMeta using metav1.ResetObjectMetaForStatus.
+	allErrors = append(allErrors, apivalidation.ValidateObjectMetaUpdate(&newReq.ObjectMeta, &oldReq.ObjectMeta, field.NewPath("metadata"))...)
+	if len(allErrors) > 0 {
+		return allErrors
+	}
+
+	// Don't validate spec.  Strategy has stomped it.
+
+	// There can be at most one of the known conditions, and it must have status "True"
+	numKnownConditions := 0
+	for i, cond := range newReq.Status.Conditions {
+		switch cond.Type {
+		case certificates.PodCertificateRequestConditionTypeIssued, certificates.PodCertificateRequestConditionTypeDenied, certificates.PodCertificateRequestConditionTypeFailed:
+			numKnownConditions++
+			if numKnownConditions > 1 {
+				allErrors = append(allErrors, field.Invalid(field.NewPath("status", "conditions").Index(i).Child("type"), cond.Type, `There may be at most one condition with type "Issued", "Denied", or "Failed"`))
+			}
+			if cond.Status != metav1.ConditionTrue {
+				allErrors = append(allErrors, field.NotSupported(field.NewPath("status", "conditions").Index(i).Child("status"), cond.Status, []metav1.ConditionStatus{metav1.ConditionTrue}))
+			}
+		default:
+			allErrors = append(allErrors, field.NotSupported(field.NewPath("status", "conditions").Index(i).Child("type"), cond.Type, []string{certificates.PodCertificateRequestConditionTypeIssued, certificates.PodCertificateRequestConditionTypeDenied, certificates.PodCertificateRequestConditionTypeFailed}))
+		}
+	}
+
+	allErrors = append(allErrors, metav1validation.ValidateConditions(newReq.Status.Conditions, field.NewPath("status", "conditions"))...)
+
+	// Bail if something seems wrong with the conditions --- we use the
+	// conditions to drive validation of the remainder of the status fields.
+	if len(allErrors) > 0 {
+		return allErrors
+	}
+
+	// Is the original PCR in a terminal condition?  If so, the entire status
+	// field (including conditions) is immutable.  No more changes are
+	// permitted.
+	if pcrIsIssued(oldReq) || pcrIsDenied(oldReq) || pcrIsFailed(oldReq) {
+		allErrors = append(allErrors, validateSemanticEquality(newReq.Status, oldReq.Status, field.NewPath("status"), "immutable after PodCertificateRequest is issued, denied, or failed")...)
+		return allErrors
+	}
+
+	// Are we transitioning to the "denied" or "failed" terminal conditions?
+	if pcrIsDenied(newReq) || pcrIsFailed(newReq) {
+		// No other status fields may change besides conditions.
+		wantStatus := certificates.PodCertificateRequestStatus{
+			Conditions: newReq.Status.Conditions,
+		}
+		allErrors = append(allErrors, validateSemanticEquality(newReq.Status, wantStatus, field.NewPath("status"), "non-condition status fields must be empty when denying or failing the PodCertificateRequest")...)
+		return allErrors
+	}
+
+	// Are we transitioning to the "issued" terminal condition?
+	if pcrIsIssued(newReq) {
+		if len(newReq.Status.CertificateChain) > certificates.MaxCertificateChainSize {
+			allErrors = append(allErrors, field.TooLong(field.NewPath("status", "certificateChain"), newReq.Status.CertificateChain, certificates.MaxCertificateChainSize))
+			return allErrors
+		}
+
+		leafBlock, rest := pem.Decode([]byte(newReq.Status.CertificateChain))
+		if leafBlock == nil {
+			allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "issued certificate chain must contain at least one certificate"))
+			return allErrors
+		}
+		if leafBlock.Type != "CERTIFICATE" {
+			allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "issued certificate chain must consist entirely of CERTIFICATE PEM blocks"))
+			return allErrors
+		}
+
+		leafCert, err := x509.ParseCertificate(leafBlock.Bytes)
+		if err != nil {
+			allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "leaf certificate does not parse as valid X.509"))
+			return allErrors
+		}
+		for _, dnsName := range leafCert.DNSNames {
+			if dnsName == "" {
+				allErrors = append(allErrors, field.Invalid(certChainPath, dnsName, "leaf certificate should not contain empty DNSName"))
+			}
+			if strings.Contains(dnsName, "..") {
+				allErrors = append(allErrors, field.Invalid(certChainPath, dnsName, "leaf certificate's DNSName should not contain '..'"))
+			}
+			if strings.HasPrefix(dnsName, ".") || strings.HasSuffix(dnsName, ".") {
+				allErrors = append(allErrors, field.Invalid(certChainPath, dnsName, "leaf certificate's DNSName should not start or end with '.'"))
+			}
+		}
+		for _, emailAddress := range leafCert.EmailAddresses {
+			if _, err := mail.ParseAddress(emailAddress); err != nil {
+				allErrors = append(allErrors, field.Invalid(certChainPath, emailAddress, "leaf certificate should not contain invalid EmailAddress"))
+			}
+		}
+
+		// Get the public key from either StubPKCS10Request or PKIXPublicKey.
+		var wantPKAny crypto.PublicKey
+		if len(oldReq.Spec.StubPKCS10Request) != 0 {
+			pkcs10Req, err := x509.ParseCertificateRequest(oldReq.Spec.StubPKCS10Request)
+			if err != nil {
+				allErrors = append(allErrors, field.Invalid(pkcs10ReqPath, field.OmitValueType{}, "must be a valid PKCS#10 CSR"))
+				return allErrors
+			}
+			wantPKAny = pkcs10Req.PublicKey
+		} else {
+			//nolint:staticcheck // SA1019 this deprecated field still needs to be validated.
+			wantPKAny, err = x509.ParsePKIXPublicKey(oldReq.Spec.PKIXPublicKey)
+			if err != nil {
+				allErrors = append(allErrors, field.Invalid(pkixPath, field.OmitValueType{}, "must be a valid PKIX-serialized public key"))
+				return allErrors
+			}
+		}
+
+		// Was the certificate issued to the public key in the spec?
+		switch wantPK := wantPKAny.(type) {
+		case ed25519.PublicKey:
+			if !wantPK.Equal(leafCert.PublicKey) {
+				allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "leaf certificate was not issued to the requested public key"))
+				return allErrors
+			}
+		case *rsa.PublicKey:
+			if !wantPK.Equal(leafCert.PublicKey) {
+				allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "leaf certificate was not issued to the requested public key"))
+				return allErrors
+			}
+		case *ecdsa.PublicKey:
+			if !wantPK.Equal(leafCert.PublicKey) {
+				allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "leaf certificate was not issued to the requested public key"))
+				return allErrors
+			}
+		case *mldsa.PublicKey:
+			if !wantPK.Equal(leafCert.PublicKey) {
+				allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "leaf certificate was not issued to the requested public key"))
+				return allErrors
+			}
+		}
+
+		// All timestamps must be set.
+		if newReq.Status.NotBefore == nil {
+			allErrors = append(allErrors, field.Required(notBeforePath, "must be present and consistent with the issued certificate"))
+		}
+		if newReq.Status.NotAfter == nil {
+			allErrors = append(allErrors, field.Required(notAfterPath, "must be present and consistent with the issued certificate"))
+		}
+		if newReq.Status.BeginRefreshAt == nil {
+			allErrors = append(allErrors, field.Required(beginRefreshPath, "must be present and in the range [notbefore+10min, notafter-10min]"))
+		}
+		if len(allErrors) > 0 {
+			return allErrors
+		}
+
+		// Validate that NotBefore is consistent with the status field, and within 5
+		// minutes of the current time.
+		if !newReq.Status.NotBefore.Time.Equal(leafCert.NotBefore) {
+			allErrors = append(allErrors, field.Invalid(notBeforePath, newReq.Status.NotBefore.Time, "must be set to the NotBefore time encoded in the leaf certificate"))
+			return allErrors
+		}
+		if !timeNear(newReq.Status.NotBefore.Time, clock.Now(), 5*time.Minute) {
+			allErrors = append(allErrors, field.Invalid(notBeforePath, newReq.Status.NotBefore.Time, "must be set to within 5 minutes of kube-apiserver's current time"))
+			return allErrors
+		}
+
+		// Validate that NotAfter is consistent with the status field
+		if !newReq.Status.NotAfter.Time.Equal(leafCert.NotAfter) {
+			allErrors = append(allErrors, field.Invalid(notAfterPath, newReq.Status.NotAfter.Time, "must be set to the NotAfter time encoded in the leaf certificate"))
+			return allErrors
+		}
+
+		// Validate that leaf cert lifetime against minimum and maximum constraints.
+		lifetime := leafCert.NotAfter.Sub(leafCert.NotBefore)
+		if lifetime < 1*time.Hour {
+			allErrors = append(allErrors, field.Invalid(certChainPath, lifetime, "leaf certificate lifetime must be >= 1 hour"))
+			return allErrors
+		}
+		if lifetime > time.Duration(*newReq.Spec.MaxExpirationSeconds)*time.Second {
+			allErrors = append(allErrors, field.Invalid(certChainPath, lifetime, fmt.Sprintf("leaf certificate lifetime must be <= spec.maxExpirationSeconds (%v)", *newReq.Spec.MaxExpirationSeconds)))
+			return allErrors
+		}
+
+		// Validate that BeginRefreshAt is within limits.
+		if newReq.Status.BeginRefreshAt.Time.Before(newReq.Status.NotBefore.Time.Add(10 * time.Minute)) {
+			allErrors = append(allErrors, field.Invalid(beginRefreshPath, newReq.Status.BeginRefreshAt.Time, "must be at least 10 minutes after status.notBefore"))
+			return allErrors
+		}
+		if newReq.Status.BeginRefreshAt.Time.After(newReq.Status.NotAfter.Time.Add(-10 * time.Minute)) {
+			allErrors = append(allErrors, field.Invalid(beginRefreshPath, newReq.Status.BeginRefreshAt.Time, "must be at least 10 minutes before status.notAfter"))
+			return allErrors
+		}
+
+		// Check the remainder of the certificates in the chain, if any.  We cannot
+		// easily verify the chain, because the Golang X.509 libraries are wisely
+		// written to prevent us from doing stupid things like verifying a partial
+		// chain, but we can at least check that they are valid certificates.
+		for {
+			var nextBlock *pem.Block
+			nextBlock, rest = pem.Decode(rest)
+			if nextBlock == nil {
+				break
+			}
+
+			if nextBlock.Type != "CERTIFICATE" {
+				allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "issued certificate chain must consist entirely of CERTFICATE PEM blocks"))
+				return allErrors
+			}
+
+			_, err := x509.ParseCertificate(nextBlock.Bytes)
+			if err != nil {
+				allErrors = append(allErrors, field.Invalid(certChainPath, newReq.Status.CertificateChain, "intermediate certificate does not parse as valid X.509"))
+				return allErrors
+			}
+		}
+
+		return allErrors
+	}
+
+	// We are not transitioning to any terminal state.  The whole status object
+	// is immutable.
+	allErrors = append(allErrors, validateSemanticEquality(newReq.Status, oldReq.Status, field.NewPath("status"), `status is immutable unless transitioning to "Issued", "Denied", or "Failed"`)...)
+	return allErrors
+}
+
+func pcrIsIssued(pcr *certificates.PodCertificateRequest) bool {
+	for _, cond := range pcr.Status.Conditions {
+		if cond.Type == certificates.PodCertificateRequestConditionTypeIssued && cond.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func pcrIsDenied(pcr *certificates.PodCertificateRequest) bool {
+	for _, cond := range pcr.Status.Conditions {
+		if cond.Type == certificates.PodCertificateRequestConditionTypeDenied && cond.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func pcrIsFailed(pcr *certificates.PodCertificateRequest) bool {
+	for _, cond := range pcr.Status.Conditions {
+		if cond.Type == certificates.PodCertificateRequestConditionTypeFailed && cond.Status == metav1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// Similar to apivalidation.ValidateImmutableField but we can supply our own detail string.
+func validateSemanticEquality(oldVal, newVal any, fldPath *field.Path, detail string) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if !apiequality.Semantic.DeepEqual(oldVal, newVal) {
+		allErrs = append(allErrs, field.Invalid(fldPath, field.OmitValueType{}, detail))
+	}
+	return allErrs
+}
+
+func timeNear(a, b time.Time, skew time.Duration) bool {
+	return a.After(b.Add(-skew)) && a.Before(b.Add(skew))
 }

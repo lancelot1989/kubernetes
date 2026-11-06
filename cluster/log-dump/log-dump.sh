@@ -41,16 +41,15 @@ readonly master_ssh_supported_providers="gce aws"
 readonly node_ssh_supported_providers="gce gke aws"
 readonly gcloud_supported_providers="gce gke"
 
-readonly master_logfiles="kube-apiserver.log kube-apiserver-audit.log kube-scheduler.log kube-controller-manager.log etcd.log etcd-events.log glbc.log cluster-autoscaler.log kube-addon-manager.log konnectivity-server.log fluentd.log kubelet.cov"
-readonly node_logfiles="kube-proxy.log fluentd.log node-problem-detector.log kubelet.cov"
-readonly node_systemd_services="node-problem-detector"
-readonly hollow_node_logfiles="kubelet-hollow-node-*.log kubeproxy-hollow-node-*.log npd-hollow-node-*.log"
+readonly master_logfiles="kube-apiserver.log kube-apiserver-audit.log kube-scheduler.log kube-controller-manager.log cloud-controller-manager.log etcd.log etcd-events.log glbc.log cluster-autoscaler.log kube-addon-manager.log konnectivity-server.log fluentd.log kubelet.cov"
+readonly node_logfiles="kube-proxy.log containers/konnectivity-agent-*.log fluentd.log kubelet.cov kube-network-policies.log"
+readonly node_systemd_services=""
 readonly aws_logfiles="cloud-init-output.log"
 readonly gce_logfiles="startupscript.log"
 readonly kern_logfile="kern.log"
 readonly initd_logfiles="docker/log"
 readonly supervisord_logfiles="kubelet.log supervisor/supervisord.log supervisor/kubelet-stdout.log supervisor/kubelet-stderr.log supervisor/docker-stdout.log supervisor/docker-stderr.log"
-readonly systemd_services="kubelet kubelet-monitor kube-container-runtime-monitor ${LOG_DUMP_SYSTEMD_SERVICES:-docker}"
+readonly systemd_services="kubelet kubelet-monitor kube-container-runtime-monitor ${LOG_DUMP_SYSTEMD_SERVICES:-containerd}"
 readonly extra_log_files="${LOG_DUMP_EXTRA_FILES:-}"
 readonly extra_systemd_services="${LOG_DUMP_SAVE_SERVICES:-}"
 readonly dump_systemd_journal="${LOG_DUMP_SYSTEMD_JOURNAL:-false}"
@@ -84,7 +83,7 @@ function print-deprecation-note() {
 function setup() {
   KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../..
   if [[ -z "${use_custom_instance_list}" ]]; then
-    : "${KUBE_CONFIG_FILE:='config-test.sh'}"
+    : "${KUBE_CONFIG_FILE:=config-test.sh}"
     echo 'Sourcing kube-util.sh'
     source "${KUBE_ROOT}/cluster/kube-util.sh"
     echo 'Detecting project'
@@ -139,7 +138,11 @@ function copy-logs-from-node() {
     if [[ "${gcloud_supported_providers}" =~ ${KUBERNETES_PROVIDER} ]]; then
       # get-serial-port-output lets you ask for ports 1-4, but currently (11/21/2016) only port 1 contains useful information
       gcloud compute instances get-serial-port-output --project "${PROJECT}" --zone "${ZONE}" --port 1 "${node}" > "${dir}/serial-1.log" || true
-      gcloud compute scp --recurse --project "${PROJECT}" --zone "${ZONE}" "${node}:${scp_files}" "${dir}" > /dev/null || true
+      source_file_args=()
+      for single_file in "${files[@]}"; do
+        source_file_args+=( "${node}:${single_file}" )
+      done
+      gcloud compute scp --recurse --project "${PROJECT}" --zone "${ZONE}" "${source_file_args[@]}" "${dir}" > /dev/null || true
     elif  [[ "${KUBERNETES_PROVIDER}" == "aws" ]]; then
       local ip
       ip=$(get_ssh_hostname "${node}")
@@ -199,7 +202,7 @@ function save-logs() {
         log-dump-ssh "${node_name}" "sudo journalctl --output=short-precise -k" > "${dir}/kern.log" || true
 
         for svc in "${services[@]}"; do
-            log-dump-ssh "${node_name}" "sudo journalctl --output=cat -u ${svc}.service" > "${dir}/${svc}.log" || true
+            log-dump-ssh "${node_name}" "sudo journalctl --output=short-precise -u ${svc}.service" > "${dir}/${svc}.log" || true
         done
 
         if [[ "$dump_systemd_journal" == "true" ]]; then
@@ -212,6 +215,10 @@ function save-logs() {
 	    files+=("${tmpfiles[@]}")
         done
     fi
+
+    # log where we pull the images from
+    log-dump-ssh "${node_name}" "sudo ctr -n k8s.io images ls" > "${dir}/images-containerd.log" || true
+    log-dump-ssh "${node_name}" "sudo docker images --all" > "${dir}/images-docker.log" || true
 
     # Try dumping coverage profiles, if it looks like coverage is enabled in the first place.
     if log-dump-ssh "${node_name}" "stat /var/log/kubelet.cov" &> /dev/null; then
@@ -283,7 +290,7 @@ function save-windows-logs-via-diagnostics-tool() {
     logs_archive_in_gcs=$(gcloud alpha compute diagnose export-logs "${node}" "--zone=${ZONE}" "--project=${PROJECT}" | tail -n 1)
     local temp_local_path="${node}.zip"
     for retry in {1..20}; do
-      if gsutil mv "${logs_archive_in_gcs}" "${temp_local_path}"  > /dev/null 2>&1; then
+      if gcloud storage mv "${logs_archive_in_gcs}" "${temp_local_path}"  > /dev/null 2>&1; then
         echo "Downloaded diagnostics log from ${logs_archive_in_gcs}"
         break
       else
@@ -367,8 +374,6 @@ function dump_masters() {
   elif [[ ! "${master_ssh_supported_providers}" =~ ${KUBERNETES_PROVIDER} ]]; then
     echo "Master SSH not supported for ${KUBERNETES_PROVIDER}"
     return
-  elif [[ -n "${KUBEMARK_MASTER_NAME:-}" ]]; then
-    master_names=( "${KUBEMARK_MASTER_NAME}" )
   else
     if ! (detect-master); then
       echo 'Master not detected. Is the cluster up?'
@@ -436,9 +441,6 @@ function dump_nodes() {
   fi
 
   node_logfiles_all="${node_logfiles}"
-  if [[ "${ENABLE_HOLLOW_NODE_LOGS:-}" == "true" ]]; then
-    node_logfiles_all="${node_logfiles_all} ${hollow_node_logfiles}"
-  fi
 
   linux_nodes_selected_for_logs=()
   if [[ -n "${LOGDUMP_ONLY_N_RANDOM_NODES:-}" ]]; then
@@ -505,7 +507,7 @@ function dump_nodes() {
 function find_non_logexported_nodes() {
   local file="${gcs_artifacts_dir}/logexported-nodes-registry"
   echo "Listing marker files ($file) for successful nodes..."
-  succeeded_nodes=$(gsutil ls "${file}") || return 1
+  succeeded_nodes=$(gcloud storage ls "${file}") || return 1
   echo 'Successfully listed marker files for successful nodes'
   NON_LOGEXPORTED_NODES=()
   for node in "${NODE_NAMES[@]}"; do
@@ -535,7 +537,6 @@ function dump_nodes_with_logexporter() {
   # Obtain parameters required by logexporter.
   local -r service_account_credentials="$(base64 "${GOOGLE_APPLICATION_CREDENTIALS}" | tr -d '\n')"
   local -r cloud_provider="${KUBERNETES_PROVIDER}"
-  local -r enable_hollow_node_logs="${ENABLE_HOLLOW_NODE_LOGS:-false}"
   local -r logexport_sleep_seconds="$(( 90 + NUM_NODES / 3 ))"
   if [[ -z "${ZONE_NODE_SELECTOR_DISABLED:-}" ]]; then
     local -r node_selector="${ZONE_NODE_SELECTOR_LABEL:-topology.kubernetes.io/zone}: ${ZONE}"
@@ -552,7 +553,6 @@ function dump_nodes_with_logexporter() {
   sed -i'' -e "s@{{.ServiceAccountCredentials}}@${service_account_credentials}@g" "${manifest_yaml}"
   sed -i'' -e "s@{{.CloudProvider}}@${cloud_provider}@g" "${manifest_yaml}"
   sed -i'' -e "s@{{.GCSPath}}@${gcs_artifacts_dir}@g" "${manifest_yaml}"
-  sed -i'' -e "s@{{.EnableHollowNodeLogs}}@${enable_hollow_node_logs}@g" "${manifest_yaml}"
   sed -i'' -e "s@{{.DumpSystemdJournal}}@${dump_systemd_journal}@g" "${manifest_yaml}"
   sed -i'' -e "s@{{.ExtraLogFiles}}@${extra_log_files}@g" "${manifest_yaml}"
   sed -i'' -e "s@{{.ExtraSystemdServices}}@${extra_systemd_services}@g" "${manifest_yaml}"

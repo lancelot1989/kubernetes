@@ -21,10 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/ktesting"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
 func TestGetContainersToDeleteInPodWithFilter(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	pod := kubecontainer.PodStatus{
 		ContainerStatuses: []*kubecontainer.Status{
 			{
@@ -79,7 +81,7 @@ func TestGetContainersToDeleteInPodWithFilter(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		candidates := getContainersToDeleteInPod("4", &pod, test.containersToKeep)
+		candidates := getContainersToDeleteInPod(logger, "4", &pod, test.containersToKeep)
 		if !reflect.DeepEqual(candidates, test.expectedContainersToDelete) {
 			t.Errorf("expected %v got %v", test.expectedContainersToDelete, candidates)
 		}
@@ -87,6 +89,7 @@ func TestGetContainersToDeleteInPodWithFilter(t *testing.T) {
 }
 
 func TestGetContainersToDeleteInPod(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	pod := kubecontainer.PodStatus{
 		ContainerStatuses: []*kubecontainer.Status{
 			{
@@ -141,7 +144,7 @@ func TestGetContainersToDeleteInPod(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		candidates := getContainersToDeleteInPod("", &pod, test.containersToKeep)
+		candidates := getContainersToDeleteInPod(logger, "", &pod, test.containersToKeep)
 		if !reflect.DeepEqual(candidates, test.expectedContainersToDelete) {
 			t.Errorf("expected %v got %v", test.expectedContainersToDelete, candidates)
 		}
@@ -149,6 +152,7 @@ func TestGetContainersToDeleteInPod(t *testing.T) {
 }
 
 func TestGetContainersToDeleteInPodWithNoMatch(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	pod := kubecontainer.PodStatus{
 		ContainerStatuses: []*kubecontainer.Status{
 			{
@@ -195,7 +199,7 @@ func TestGetContainersToDeleteInPodWithNoMatch(t *testing.T) {
 	}
 
 	for _, test := range testCases {
-		candidates := getContainersToDeleteInPod(test.filterID, &pod, len(pod.ContainerStatuses))
+		candidates := getContainersToDeleteInPod(logger, test.filterID, &pod, len(pod.ContainerStatuses))
 		if !reflect.DeepEqual(candidates, test.expectedContainersToDelete) {
 			t.Errorf("expected %v got %v", test.expectedContainersToDelete, candidates)
 		}

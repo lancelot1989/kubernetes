@@ -22,11 +22,12 @@ import (
 	"testing"
 	"time"
 
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestWithRequestReceivedTimestamp(t *testing.T) {
+	ctx := t.Context()
 	receivedTimestampExpected := time.Now()
 
 	var (
@@ -41,9 +42,9 @@ func TestWithRequestReceivedTimestamp(t *testing.T) {
 		receivedTimestampGot, ok = request.ReceivedTimestampFrom(req.Context())
 	})
 
-	wrapped := withRequestReceivedTimestampWithClock(handler, utilclock.NewFakeClock(receivedTimestampExpected))
+	wrapped := withRequestReceivedTimestampWithClock(handler, testingclock.NewFakeClock(receivedTimestampExpected))
 
-	testRequest, err := http.NewRequest(http.MethodGet, "/api/v1/namespaces", nil)
+	testRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/namespaces", nil)
 	if err != nil {
 		t.Fatalf("failed to create new http request - %v", err)
 	}

@@ -18,62 +18,67 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
-	"os"
-	"strconv"
+	"maps"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/dynamic/dynamicinformer"
+	clientfeatures "k8s.io/client-go/features"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/informers/internalinterfaces"
 	clientset "k8s.io/client-go/kubernetes"
+	schedulinglisters "k8s.io/client-go/listers/scheduling/v1beta1"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/features"
 	schedulerapi "k8s.io/kubernetes/pkg/scheduler/apis/config"
-	"k8s.io/kubernetes/pkg/scheduler/apis/config/scheme"
-	"k8s.io/kubernetes/pkg/scheduler/core"
+	apicache "k8s.io/kubernetes/pkg/scheduler/backend/api_cache"
+	apidispatcher "k8s.io/kubernetes/pkg/scheduler/backend/api_dispatcher"
+	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	cachedebugger "k8s.io/kubernetes/pkg/scheduler/backend/cache/debugger"
+	internalqueue "k8s.io/kubernetes/pkg/scheduler/backend/queue"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	frameworkplugins "k8s.io/kubernetes/pkg/scheduler/framework/plugins"
+	"k8s.io/kubernetes/pkg/scheduler/framework/parallelize"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/gangscheduling"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
-	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
-	"k8s.io/kubernetes/pkg/scheduler/internal/parallelize"
-	internalqueue "k8s.io/kubernetes/pkg/scheduler/internal/queue"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 	"k8s.io/kubernetes/pkg/scheduler/profile"
-	"k8s.io/kubernetes/pkg/scheduler/util"
+	"k8s.io/utils/clock"
 )
 
-const (
-	// SchedulerError is the reason recorded for events when an error occurs during scheduling a pod.
-	SchedulerError = "SchedulerError"
-	// Percentage of plugin metrics to be sampled.
-	pluginMetricsSamplePercent = 10
-)
+// ErrNoNodesAvailable is used to describe the error that no nodes available to schedule pods.
+var ErrNoNodesAvailable = fmt.Errorf("no nodes available to schedule pods")
 
 // Scheduler watches for new unscheduled pods. It attempts to find
 // nodes that they fit on and writes bindings back to the api server.
 type Scheduler struct {
-	// It is expected that changes made via SchedulerCache will be observed
+	// It is expected that changes made via Cache will be observed
 	// by NodeLister and Algorithm.
-	SchedulerCache internalcache.Cache
+	Cache internalcache.Cache
 
-	Algorithm core.ScheduleAlgorithm
-
-	// NextPod should be a function that blocks until the next pod
+	// NextEntity should be a function that blocks until the next entity (pod or pod group)
 	// is available. We don't use a channel for this, because scheduling
 	// a pod may take some amount of time and we don't want pods to get
 	// stale while they sit in a channel.
-	NextPod func() *framework.QueuedPodInfo
+	NextEntity func(logger klog.Logger) (framework.QueuedEntityInfo, error)
 
-	// Error is called if there is an error. It is passed the pod in
-	// question, and the error
-	Error func(*framework.QueuedPodInfo, error)
+	// FailureHandler is called upon a scheduling failure.
+	FailureHandler FailureHandlerFn
+
+	// SchedulePod tries to schedule the given pod to one of the nodes in the node list.
+	// Return a struct of ScheduleResult with the name of suggested host on success,
+	// otherwise will return a FitError with reasons.
+	SchedulePod func(ctx context.Context, fwk framework.Framework, state fwk.CycleState, podInfo *framework.QueuedPodInfo) (ScheduleResult, error)
 
 	// Close this to shut down the scheduler.
 	StopEverything <-chan struct{}
@@ -81,62 +86,167 @@ type Scheduler struct {
 	// SchedulingQueue holds pods to be scheduled
 	SchedulingQueue internalqueue.SchedulingQueue
 
+	// If possible, indirect operation on APIDispatcher, e.g. through SchedulingQueue, is preferred.
+	// Is nil iff SchedulerAsyncAPICalls feature gate is disabled.
+	// Adding a call to APIDispatcher should not be done directly by in-tree usages.
+	// framework.APICache should be used instead.
+	APIDispatcher *apidispatcher.APIDispatcher
+
 	// Profiles are the scheduling profiles.
 	Profiles profile.Map
 
 	client clientset.Interface
+
+	compositePodGroupLister schedulinglisters.CompositePodGroupLister
+
+	nodeInfoSnapshot *internalcache.Snapshot
+
+	// logger *must* be initialized when creating a Scheduler,
+	// otherwise logging functions will access a nil sink and
+	// panic.
+	logger klog.Logger
+
+	// registeredHandlers contains the registrations of all handlers. It's used to check if all handlers have finished syncing before the scheduling cycles start.
+	registeredHandlers []cache.ResourceEventHandlerRegistration
+
+	nominatedNodeNameForExpectationEnabled              bool
+	genericWorkloadEnabled                              bool
+	inPlacePodVerticalScalingSchedulerPreemptionEnabled bool
+	podGroupHierarchyTracker                            *gangscheduling.HierarchyTracker
+
+	algorithm *SchedulingAlgorithm
+
+	podGroupAlgorithm *PodGroupSchedulingAlgorithm
 }
 
+// applyDefaultHandlers installs the default handlers. It must run after
+// initAlgorithm, whose result SchedulePod points at.
+func (sched *Scheduler) applyDefaultHandlers() {
+	sched.SchedulePod = sched.algorithm.SchedulePod
+	sched.FailureHandler = sched.handleSchedulingFailure
+}
+
+// schedulerPodStep adapts Scheduler to the PodScheduler interface, bridging single-pod
+// evaluation and tentative snapshot reservations into PodGroupSchedulingAlgorithm.
+// This decouples gang scheduling orchestration from Scheduler's queue, binding, and error-handling mechanics.
+type schedulerPodStep struct {
+	sched *Scheduler
+}
+
+// SchedulePod delegates single-pod evaluation to Scheduler.SchedulePod rather than calling
+// the underlying algorithm directly, ensuring custom handlers or test hooks configured on
+// Scheduler are respected during pod group scheduling.
+func (s *schedulerPodStep) SchedulePod(ctx context.Context, schedFramework framework.Framework, state fwk.CycleState, podInfo *framework.QueuedPodInfo) (result ScheduleResult, err error) {
+	return s.sched.SchedulePod(ctx, schedFramework, state, podInfo)
+}
+
+// AssumeAndReserveInSnapshot delegates tentative snapshot reservation to SchedulingAlgorithm,
+// allowing subsequent group members to observe simulated node allocations and reserve plugins
+// without committing mutations to the live scheduler cache before group completion.
+func (s *schedulerPodStep) AssumeAndReserveInSnapshot(ctx context.Context, state fwk.CycleState,
+	schedFramework framework.Framework, podInfo *framework.QueuedPodInfo,
+	scheduleResult ScheduleResult) (*fwk.Status, func()) {
+	return s.sched.algorithm.AssumeAndReserveInSnapshot(ctx, state, schedFramework, podInfo, scheduleResult)
+}
+
+var _ PodScheduler = (*schedulerPodStep)(nil)
+
 type schedulerOptions struct {
-	schedulerAlgorithmSource schedulerapi.SchedulerAlgorithmSource
-	percentageOfNodesToScore int32
-	podInitialBackoffSeconds int64
-	podMaxBackoffSeconds     int64
+	clock                  clock.WithTicker
+	componentConfigVersion string
+	kubeConfig             *restclient.Config
+	// Overridden by profile level percentageOfNodesToScore if set in v1.
+	percentageOfNodesToScore          int32
+	percentageOfPlacementsToScore     int32
+	podInitialBackoffSeconds          int64
+	podMaxBackoffSeconds              int64
+	podMaxInUnschedulablePodsDuration time.Duration
+	maxBatchAge                       time.Duration
 	// Contains out-of-tree plugins to be merged with the in-tree registry.
 	frameworkOutOfTreeRegistry frameworkruntime.Registry
 	profiles                   []schedulerapi.KubeSchedulerProfile
 	extenders                  []schedulerapi.Extender
 	frameworkCapturer          FrameworkCapturer
+	parallelism                int32
+	applyDefaultProfile        bool
 }
 
 // Option configures a Scheduler
 type Option func(*schedulerOptions)
+
+// ScheduleResult represents the result of scheduling a pod.
+type ScheduleResult struct {
+	// Name of the selected node.
+	SuggestedHost string
+	// The number of nodes the scheduler evaluated the pod against in the filtering
+	// phase and beyond.
+	EvaluatedNodes int
+	// The number of nodes out of the evaluated ones that fit the pod.
+	FeasibleNodes int
+	// The nominating info for scheduling cycle.
+	nominatingInfo *fwk.NominatingInfo
+}
+
+// WithComponentConfigVersion sets the component config version to the
+// KubeSchedulerConfiguration version used. The string should be the full
+// scheme group/version of the external type we converted from (for example
+// "kubescheduler.config.k8s.io/v1")
+func WithComponentConfigVersion(apiVersion string) Option {
+	return func(o *schedulerOptions) {
+		o.componentConfigVersion = apiVersion
+	}
+}
+
+// WithKubeConfig sets the kube config for Scheduler.
+func WithKubeConfig(cfg *restclient.Config) Option {
+	return func(o *schedulerOptions) {
+		o.kubeConfig = cfg
+	}
+}
 
 // WithProfiles sets profiles for Scheduler. By default, there is one profile
 // with the name "default-scheduler".
 func WithProfiles(p ...schedulerapi.KubeSchedulerProfile) Option {
 	return func(o *schedulerOptions) {
 		o.profiles = p
+		o.applyDefaultProfile = false
 	}
 }
 
 // WithParallelism sets the parallelism for all scheduler algorithms. Default is 16.
-// TODO(#95952): Remove global setter in favor of a struct that holds the configuration.
 func WithParallelism(threads int32) Option {
 	return func(o *schedulerOptions) {
-		parallelize.SetParallelism(int(threads))
+		o.parallelism = threads
 	}
 }
 
-// WithAlgorithmSource sets schedulerAlgorithmSource for Scheduler, the default is a source with DefaultProvider.
-func WithAlgorithmSource(source schedulerapi.SchedulerAlgorithmSource) Option {
+// WithPercentageOfNodesToScore sets percentageOfNodesToScore for Scheduler.
+// The default value of 0 will use an adaptive percentage: 50 - (num of nodes)/125.
+func WithPercentageOfNodesToScore(percentageOfNodesToScore *int32) Option {
 	return func(o *schedulerOptions) {
-		o.schedulerAlgorithmSource = source
+		if percentageOfNodesToScore != nil {
+			o.percentageOfNodesToScore = *percentageOfNodesToScore
+		}
 	}
 }
 
-// WithPercentageOfNodesToScore sets percentageOfNodesToScore for Scheduler, the default value is 50
-func WithPercentageOfNodesToScore(percentageOfNodesToScore int32) Option {
+// WithPercentageOfPlacementsToScore sets percentageOfPlacementsToScore for Scheduler.
+// The default value of 0 will use an adaptive percentage.
+func WithPercentageOfPlacementsToScore(percentageOfPlacementsToScore *int32) Option {
 	return func(o *schedulerOptions) {
-		o.percentageOfNodesToScore = percentageOfNodesToScore
+		if percentageOfPlacementsToScore != nil {
+			o.percentageOfPlacementsToScore = *percentageOfPlacementsToScore
+		}
 	}
 }
 
 // WithFrameworkOutOfTreeRegistry sets the registry for out-of-tree plugins. Those plugins
-// will be appended to the default registry.
+// will be appended to the default registry. It clones the map so that later caller mutations
+// do not affect subsequent NewFrameworkMap calls.
 func WithFrameworkOutOfTreeRegistry(registry frameworkruntime.Registry) Option {
+	cloned := maps.Clone(registry)
 	return func(o *schedulerOptions) {
-		o.frameworkOutOfTreeRegistry = registry
+		o.frameworkOutOfTreeRegistry = cloned
 	}
 }
 
@@ -154,10 +264,31 @@ func WithPodMaxBackoffSeconds(podMaxBackoffSeconds int64) Option {
 	}
 }
 
+// WithPodMaxInUnschedulablePodsDuration sets podMaxInUnschedulablePodsDuration for PriorityQueue.
+func WithPodMaxInUnschedulablePodsDuration(duration time.Duration) Option {
+	return func(o *schedulerOptions) {
+		o.podMaxInUnschedulablePodsDuration = duration
+	}
+}
+
+// WithMaxBatchAge sets maxBatchAge for OpportunisticBatching, the default value is 500ms.
+func WithMaxBatchAge(maxBatchAge time.Duration) Option {
+	return func(o *schedulerOptions) {
+		o.maxBatchAge = maxBatchAge
+	}
+}
+
 // WithExtenders sets extenders for the Scheduler
 func WithExtenders(e ...schedulerapi.Extender) Option {
 	return func(o *schedulerOptions) {
 		o.extenders = e
+	}
+}
+
+// WithClock sets clock for PriorityQueue, the default clock is clock.RealClock.
+func WithClock(clock clock.WithTicker) Option {
+	return func(o *schedulerOptions) {
+		o.clock = clock
 	}
 }
 
@@ -172,487 +303,374 @@ func WithBuildFrameworkCapturer(fc FrameworkCapturer) Option {
 }
 
 var defaultSchedulerOptions = schedulerOptions{
-	profiles: []schedulerapi.KubeSchedulerProfile{
-		// Profiles' default plugins are set from the algorithm provider.
-		{SchedulerName: v1.DefaultSchedulerName},
-	},
-	schedulerAlgorithmSource: schedulerapi.SchedulerAlgorithmSource{
-		Provider: defaultAlgorithmSourceProviderName(),
-	},
-	percentageOfNodesToScore: schedulerapi.DefaultPercentageOfNodesToScore,
-	podInitialBackoffSeconds: int64(internalqueue.DefaultPodInitialBackoffDuration.Seconds()),
-	podMaxBackoffSeconds:     int64(internalqueue.DefaultPodMaxBackoffDuration.Seconds()),
+	clock:                             clock.RealClock{},
+	percentageOfNodesToScore:          schedulerapi.DefaultPercentageOfNodesToScore,
+	percentageOfPlacementsToScore:     schedulerapi.DefaultPercentageOfPlacementsToScore,
+	podInitialBackoffSeconds:          int64(internalqueue.DefaultPodInitialBackoffDuration.Seconds()),
+	podMaxBackoffSeconds:              int64(internalqueue.DefaultPodMaxBackoffDuration.Seconds()),
+	podMaxInUnschedulablePodsDuration: internalqueue.DefaultPodMaxInUnschedulablePodsDuration,
+	maxBatchAge:                       frameworkruntime.DefaultMaxBatchAge,
+	parallelism:                       int32(parallelize.DefaultParallelism),
+	// Ideally we would statically set the default profile here, but we can't because
+	// creating the default profile may require testing feature gates, which may get
+	// set dynamically in tests. Therefore, we delay creating it until New is actually
+	// invoked.
+	applyDefaultProfile: true,
 }
 
 // New returns a Scheduler
-func New(client clientset.Interface,
+func New(ctx context.Context,
+	client clientset.Interface,
 	informerFactory informers.SharedInformerFactory,
+	dynInformerFactory dynamicinformer.DynamicSharedInformerFactory,
 	recorderFactory profile.RecorderFactory,
-	stopCh <-chan struct{},
 	opts ...Option) (*Scheduler, error) {
 
-	stopEverything := stopCh
-	if stopEverything == nil {
-		stopEverything = wait.NeverStop
-	}
+	logger := klog.FromContext(ctx)
+	stopEverything := ctx.Done()
 
 	options := defaultSchedulerOptions
 	for _, opt := range opts {
 		opt(&options)
 	}
 
-	schedulerCache := internalcache.New(30*time.Second, stopEverything)
+	metrics.Register()
 
-	registry := frameworkplugins.NewInTreeRegistry()
-	if err := registry.Merge(options.frameworkOutOfTreeRegistry); err != nil {
-		return nil, err
-	}
+	podLister := informerFactory.Core().V1().Pods().Lister()
+	nodeLister := informerFactory.Core().V1().Nodes().Lister()
 
 	snapshot := internalcache.NewEmptySnapshot()
 
-	configurator := &Configurator{
-		client:                   client,
-		recorderFactory:          recorderFactory,
-		informerFactory:          informerFactory,
-		schedulerCache:           schedulerCache,
-		StopEverything:           stopEverything,
-		percentageOfNodesToScore: options.percentageOfNodesToScore,
-		podInitialBackoffSeconds: options.podInitialBackoffSeconds,
-		podMaxBackoffSeconds:     options.podMaxBackoffSeconds,
-		profiles:                 append([]schedulerapi.KubeSchedulerProfile(nil), options.profiles...),
-		registry:                 registry,
-		nodeInfoSnapshot:         snapshot,
-		extenders:                options.extenders,
-		frameworkCapturer:        options.frameworkCapturer,
+	comps, err := newFrameworkComponents(ctx, client, informerFactory, options)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := NewFrameworkMap(ctx, comps, recorderFactory, snapshot)
+	if err != nil {
+		return nil, err
 	}
 
-	metrics.Register()
+	preEnqueuePluginMap := make(map[string]map[string]fwk.PreEnqueuePlugin)
+	queueingHintsPerProfile := make(internalqueue.QueueingHintMapPerProfile)
+	var returnErr error
+	for profileName, profile := range profiles {
+		plugins := profile.PreEnqueuePlugins()
+		preEnqueuePluginMap[profileName] = make(map[string]fwk.PreEnqueuePlugin, len(plugins))
+		for _, plugin := range plugins {
+			preEnqueuePluginMap[profileName][plugin.Name()] = plugin
+		}
 
-	var sched *Scheduler
-	source := options.schedulerAlgorithmSource
-	switch {
-	case source.Provider != nil:
-		// Create the config from a named algorithm provider.
-		sc, err := configurator.createFromProvider(*source.Provider)
+		queueingHintsPerProfile[profileName], err = buildQueueingHintMap(ctx, profile.EnqueueExtensions())
 		if err != nil {
-			return nil, fmt.Errorf("couldn't create scheduler using provider %q: %v", *source.Provider, err)
+			returnErr = errors.Join(returnErr, err)
 		}
-		sched = sc
-	case source.Policy != nil:
-		// Create the config from a user specified policy source.
-		policy := &schedulerapi.Policy{}
-		switch {
-		case source.Policy.File != nil:
-			if err := initPolicyFromFile(source.Policy.File.Path, policy); err != nil {
-				return nil, err
-			}
-		case source.Policy.ConfigMap != nil:
-			if err := initPolicyFromConfigMap(client, source.Policy.ConfigMap, policy); err != nil {
-				return nil, err
-			}
-		}
-		// Set extenders on the configurator now that we've decoded the policy
-		// In this case, c.extenders should be nil since we're using a policy (and therefore not componentconfig,
-		// which would have set extenders in the above instantiation of Configurator from CC options)
-		configurator.extenders = policy.Extenders
-		sc, err := configurator.createFromConfig(*policy)
-		if err != nil {
-			return nil, fmt.Errorf("couldn't create scheduler from policy: %v", err)
-		}
-		sched = sc
-	default:
-		return nil, fmt.Errorf("unsupported algorithm source: %v", source)
 	}
-	// Additional tweaks to the config produced by the configurator.
-	sched.StopEverything = stopEverything
-	sched.client = client
 
-	addAllEventHandlers(sched, informerFactory)
+	if returnErr != nil {
+		return nil, returnErr
+	}
+
+	// Extract pod signing functions from each profile
+	podSigners := make(map[string]internalqueue.PodSigner)
+	for profileName, profile := range profiles {
+		podSigners[profileName] = profile.SignPod
+	}
+
+	podQueue := internalqueue.NewSchedulingQueue(
+		profiles[comps.options.profiles[0].SchedulerName].QueueSortFunc(),
+		informerFactory,
+		internalqueue.WithClock(options.clock),
+		internalqueue.WithPodInitialBackoffDuration(time.Duration(options.podInitialBackoffSeconds)*time.Second),
+		internalqueue.WithPodMaxBackoffDuration(time.Duration(options.podMaxBackoffSeconds)*time.Second),
+		internalqueue.WithPodLister(podLister),
+		internalqueue.WithPodMaxInUnschedulablePodsDuration(options.podMaxInUnschedulablePodsDuration),
+		internalqueue.WithPreEnqueuePluginMap(preEnqueuePluginMap),
+		internalqueue.WithQueueingHintMapPerProfile(queueingHintsPerProfile),
+		internalqueue.WithPluginMetricsSamplePercent(pluginMetricsSamplePercent),
+		internalqueue.WithMetricsRecorder(comps.metricsRecorder),
+		internalqueue.WithAPIDispatcher(comps.apiDispatcher),
+		internalqueue.WithPodSigners(podSigners),
+	)
+
+	schedulerCache := comps.GetCache()
+
+	var apiCache fwk.APICacher
+	if comps.apiDispatcher != nil {
+		apiCache = apicache.New(podQueue, schedulerCache)
+	}
+
+	for _, fwk := range profiles {
+		fwk.SetPodNominator(podQueue)
+		fwk.SetPodActivator(podQueue)
+		fwk.SetAPICacher(apiCache)
+	}
+
+	// Setup cache debugger.
+	debugger := cachedebugger.New(nodeLister, podLister, schedulerCache, podQueue)
+	debugger.ListenForSignal(ctx)
+
+	var compositePodGroupLister schedulinglisters.CompositePodGroupLister
+	if feature.DefaultFeatureGate.Enabled(features.CompositePodGroup) {
+		compositePodGroupLister = informerFactory.Scheduling().V1beta1().CompositePodGroups().Lister()
+	}
+
+	sched := &Scheduler{
+		Cache:                                  schedulerCache,
+		client:                                 client,
+		nodeInfoSnapshot:                       snapshot,
+		StopEverything:                         stopEverything,
+		SchedulingQueue:                        podQueue,
+		Profiles:                               profiles,
+		logger:                                 logger,
+		APIDispatcher:                          comps.apiDispatcher,
+		compositePodGroupLister:                compositePodGroupLister,
+		nominatedNodeNameForExpectationEnabled: feature.DefaultFeatureGate.Enabled(features.NominatedNodeNameForExpectation),
+		genericWorkloadEnabled:                 feature.DefaultFeatureGate.Enabled(features.GenericWorkload),
+		inPlacePodVerticalScalingSchedulerPreemptionEnabled: feature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScalingSchedulerPreemption),
+		podGroupHierarchyTracker:                            comps.podGroupHierarchyTracker,
+	}
+	if err = sched.initAlgorithms(
+		[]AlgorithmOption{WithAlgorithmPercentageOfNodesToScore(options.percentageOfNodesToScore)},
+		[]PodGroupAlgorithmOption{WithAlgorithmPercentageOfPlacementsToScore(options.percentageOfPlacementsToScore)},
+	); err != nil {
+		return nil, fmt.Errorf("initializing scheduling algorithm: %w", err)
+	}
+	sched.NextEntity = podQueue.Pop
+	sched.applyDefaultHandlers()
+
+	if err = addAllEventHandlers(sched, informerFactory, dynInformerFactory, comps.resourceClaimCache, comps.resourceSliceTracker, comps.draManager, unionedGVKs(queueingHintsPerProfile)); err != nil {
+		return nil, fmt.Errorf("adding event handlers: %w", err)
+	}
+
 	return sched, nil
 }
 
-// initPolicyFromFile initialize policy from file
-func initPolicyFromFile(policyFile string, policy *schedulerapi.Policy) error {
-	// Use a policy serialized in a file.
-	_, err := os.Stat(policyFile)
-	if err != nil {
-		return fmt.Errorf("missing policy config file %s", policyFile)
-	}
-	data, err := ioutil.ReadFile(policyFile)
-	if err != nil {
-		return fmt.Errorf("couldn't read policy config: %v", err)
-	}
-	err = runtime.DecodeInto(scheme.Codecs.UniversalDecoder(), []byte(data), policy)
-	if err != nil {
-		return fmt.Errorf("invalid policy: %v", err)
-	}
-	return nil
+// defaultQueueingHintFn is the default queueing hint function.
+// It always returns Queue as the queueing hint.
+var defaultQueueingHintFn = func(_ klog.Logger, _ *v1.Pod, _, _ interface{}) (fwk.QueueingHint, error) {
+	return fwk.Queue, nil
 }
 
-// initPolicyFromConfigMap initialize policy from configMap
-func initPolicyFromConfigMap(client clientset.Interface, policyRef *schedulerapi.SchedulerPolicyConfigMapSource, policy *schedulerapi.Policy) error {
-	// Use a policy serialized in a config map value.
-	policyConfigMap, err := client.CoreV1().ConfigMaps(policyRef.Namespace).Get(context.TODO(), policyRef.Name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("couldn't get policy config map %s/%s: %v", policyRef.Namespace, policyRef.Name, err)
+func buildQueueingHintMap(ctx context.Context, es []fwk.EnqueueExtensions) (internalqueue.QueueingHintMap, error) {
+	queueingHintMap := make(internalqueue.QueueingHintMap)
+	var returnErr error
+	for _, e := range es {
+		events, err := e.EventsToRegister(ctx)
+		if err != nil {
+			returnErr = errors.Join(returnErr, err)
+		}
+
+		// This will happen when plugin registers with empty events, it's usually the case a pod
+		// will become reschedulable only for self-update, e.g. schedulingGates plugin, the pod
+		// will enter into the activeQ via priorityQueue.Update().
+		if len(events) == 0 {
+			continue
+		}
+
+		// Note: Rarely, a plugin implements EnqueueExtensions but returns nil.
+		// We treat it as: the plugin is not interested in any event, and hence pod failed by that plugin
+		// cannot be moved by any regular cluster event.
+		// So, we can just ignore such EventsToRegister here.
+
+		for _, event := range events {
+			fn := event.QueueingHintFn
+			if fn == nil {
+				fn = defaultQueueingHintFn
+			}
+
+			queueingHintFn := &internalqueue.QueueingHintFunction{
+				PluginName:        e.Name(),
+				QueueingHintFn:    fn,
+				PreQueueingHintFn: event.PreQueueingHintFn,
+			}
+
+			if event.Event.Resource == fwk.Pod {
+				for _, podEvent := range framework.UnrollPodEvent(event.Event) {
+					queueingHintMap[podEvent] = append(queueingHintMap[podEvent], queueingHintFn)
+				}
+			} else {
+				queueingHintMap[event.Event] = append(queueingHintMap[event.Event], queueingHintFn)
+			}
+		}
 	}
-	data, found := policyConfigMap.Data[schedulerapi.SchedulerPolicyConfigMapKey]
-	if !found {
-		return fmt.Errorf("missing policy config map value at key %q", schedulerapi.SchedulerPolicyConfigMapKey)
+	if returnErr != nil {
+		return nil, returnErr
 	}
-	err = runtime.DecodeInto(scheme.Codecs.UniversalDecoder(), []byte(data), policy)
-	if err != nil {
-		return fmt.Errorf("invalid policy: %v", err)
-	}
-	return nil
+	return queueingHintMap, nil
 }
 
 // Run begins watching and scheduling. It starts scheduling and blocked until the context is done.
 func (sched *Scheduler) Run(ctx context.Context) {
-	sched.SchedulingQueue.Run()
-	wait.UntilWithContext(ctx, sched.scheduleOne, 0)
+	logger := klog.FromContext(ctx)
+	sched.SchedulingQueue.Run(logger)
+
+	if sched.APIDispatcher != nil {
+		sched.APIDispatcher.Run(logger)
+	}
+
+	// We need to start scheduleOne loop in a dedicated goroutine,
+	// because scheduleOne function hangs on getting the next item
+	// from the SchedulingQueue.
+	// If there are no new pods to schedule, it will be hanging there
+	// and if done in this goroutine it will be blocking closing
+	// SchedulingQueue, in effect causing a deadlock on shutdown.
+	go wait.UntilWithContext(ctx, sched.ScheduleOne, 0)
+
+	<-ctx.Done()
+	if sched.APIDispatcher != nil {
+		sched.APIDispatcher.Close()
+	}
 	sched.SchedulingQueue.Close()
-}
 
-// recordSchedulingFailure records an event for the pod that indicates the
-// pod has failed to schedule. Also, update the pod condition and nominated node name if set.
-func (sched *Scheduler) recordSchedulingFailure(fwk framework.Framework, podInfo *framework.QueuedPodInfo, err error, reason string, nominatedNode string) {
-	sched.Error(podInfo, err)
-
-	// Update the scheduling queue with the nominated pod information. Without
-	// this, there would be a race condition between the next scheduling cycle
-	// and the time the scheduler receives a Pod Update for the nominated pod.
-	// Here we check for nil only for tests.
-	if sched.SchedulingQueue != nil {
-		sched.SchedulingQueue.AddNominatedPod(podInfo.Pod, nominatedNode)
-	}
-
-	pod := podInfo.Pod
-	fwk.EventRecorder().Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", err.Error())
-	if err := updatePod(sched.client, pod, &v1.PodCondition{
-		Type:    v1.PodScheduled,
-		Status:  v1.ConditionFalse,
-		Reason:  reason,
-		Message: err.Error(),
-	}, nominatedNode); err != nil {
-		klog.Errorf("Error updating pod %s/%s: %v", pod.Namespace, pod.Name, err)
-	}
-}
-
-func updatePod(client clientset.Interface, pod *v1.Pod, condition *v1.PodCondition, nominatedNode string) error {
-	klog.V(3).Infof("Updating pod condition for %s/%s to (%s==%s, Reason=%s)", pod.Namespace, pod.Name, condition.Type, condition.Status, condition.Reason)
-	podCopy := pod.DeepCopy()
-	// NominatedNodeName is updated only if we are trying to set it, and the value is
-	// different from the existing one.
-	if !podutil.UpdatePodCondition(&podCopy.Status, condition) &&
-		(len(nominatedNode) == 0 || pod.Status.NominatedNodeName == nominatedNode) {
-		return nil
-	}
-	if nominatedNode != "" {
-		podCopy.Status.NominatedNodeName = nominatedNode
-	}
-	return util.PatchPod(client, pod, podCopy)
-}
-
-// assume signals to the cache that a pod is already in the cache, so that binding can be asynchronous.
-// assume modifies `assumed`.
-func (sched *Scheduler) assume(assumed *v1.Pod, host string) error {
-	// Optimistically assume that the binding will succeed and send it to apiserver
-	// in the background.
-	// If the binding fails, scheduler will release resources allocated to assumed pod
-	// immediately.
-	assumed.Spec.NodeName = host
-
-	if err := sched.SchedulerCache.AssumePod(assumed); err != nil {
-		klog.Errorf("scheduler cache AssumePod failed: %v", err)
-		return err
-	}
-	// if "assumed" is a nominated pod, we should remove it from internal cache
-	if sched.SchedulingQueue != nil {
-		sched.SchedulingQueue.DeleteNominatedPodIfExists(assumed)
-	}
-
-	return nil
-}
-
-// bind binds a pod to a given node defined in a binding object.
-// The precedence for binding is: (1) extenders and (2) framework plugins.
-// We expect this to run asynchronously, so we handle binding metrics internally.
-func (sched *Scheduler) bind(ctx context.Context, fwk framework.Framework, assumed *v1.Pod, targetNode string, state *framework.CycleState) (err error) {
-	defer func() {
-		sched.finishBinding(fwk, assumed, targetNode, err)
-	}()
-
-	bound, err := sched.extendersBinding(assumed, targetNode)
-	if bound {
-		return err
-	}
-	bindStatus := fwk.RunBindPlugins(ctx, state, assumed, targetNode)
-	if bindStatus.IsSuccess() {
-		return nil
-	}
-	if bindStatus.Code() == framework.Error {
-		return bindStatus.AsError()
-	}
-	return fmt.Errorf("bind status: %s, %v", bindStatus.Code().String(), bindStatus.Message())
-}
-
-// TODO(#87159): Move this to a Plugin.
-func (sched *Scheduler) extendersBinding(pod *v1.Pod, node string) (bool, error) {
-	for _, extender := range sched.Algorithm.Extenders() {
-		if !extender.IsBinder() || !extender.IsInterested(pod) {
-			continue
-		}
-		return true, extender.Bind(&v1.Binding{
-			ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
-			Target:     v1.ObjectReference{Kind: "Node", Name: node},
-		})
-	}
-	return false, nil
-}
-
-func (sched *Scheduler) finishBinding(fwk framework.Framework, assumed *v1.Pod, targetNode string, err error) {
-	if finErr := sched.SchedulerCache.FinishBinding(assumed); finErr != nil {
-		klog.Errorf("scheduler cache FinishBinding failed: %v", finErr)
-	}
+	// If the plugins satisfy the io.Closer interface, they are closed.
+	err := sched.Profiles.Close()
 	if err != nil {
-		klog.V(1).Infof("Failed to bind pod: %v/%v", assumed.Namespace, assumed.Name)
-		return
+		logger.Error(err, "Failed to close plugins")
 	}
-
-	fwk.EventRecorder().Eventf(assumed, nil, v1.EventTypeNormal, "Scheduled", "Binding", "Successfully assigned %v/%v to %v", assumed.Namespace, assumed.Name, targetNode)
-}
-
-// scheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
-func (sched *Scheduler) scheduleOne(ctx context.Context) {
-	podInfo := sched.NextPod()
-	// pod could be nil when schedulerQueue is closed
-	if podInfo == nil || podInfo.Pod == nil {
-		return
-	}
-	pod := podInfo.Pod
-	fwk, err := sched.frameworkForPod(pod)
-	if err != nil {
-		// This shouldn't happen, because we only accept for scheduling the pods
-		// which specify a scheduler name that matches one of the profiles.
-		klog.Error(err)
-		return
-	}
-	if sched.skipPodSchedule(fwk, pod) {
-		return
-	}
-
-	klog.V(3).Infof("Attempting to schedule pod: %v/%v", pod.Namespace, pod.Name)
-
-	// Synchronously attempt to find a fit for the pod.
-	start := time.Now()
-	state := framework.NewCycleState()
-	state.SetRecordPluginMetrics(rand.Intn(100) < pluginMetricsSamplePercent)
-	schedulingCycleCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	scheduleResult, err := sched.Algorithm.Schedule(schedulingCycleCtx, fwk, state, pod)
-	if err != nil {
-		// Schedule() may have failed because the pod would not fit on any host, so we try to
-		// preempt, with the expectation that the next time the pod is tried for scheduling it
-		// will fit due to the preemption. It is also possible that a different pod will schedule
-		// into the resources that were preempted, but this is harmless.
-		nominatedNode := ""
-		if fitError, ok := err.(*core.FitError); ok {
-			if !fwk.HasPostFilterPlugins() {
-				klog.V(3).Infof("No PostFilter plugins are registered, so no preemption will be performed.")
-			} else {
-				// Run PostFilter plugins to try to make the pod schedulable in a future scheduling cycle.
-				result, status := fwk.RunPostFilterPlugins(ctx, state, pod, fitError.FilteredNodesStatuses)
-				if status.Code() == framework.Error {
-					klog.Errorf("Status after running PostFilter plugins for pod %v/%v: %v", pod.Namespace, pod.Name, status)
-				} else {
-					klog.V(5).Infof("Status after running PostFilter plugins for pod %v/%v: %v", pod.Namespace, pod.Name, status)
-				}
-				if status.IsSuccess() && result != nil {
-					nominatedNode = result.NominatedNodeName
-				}
-			}
-			// Pod did not fit anywhere, so it is counted as a failure. If preemption
-			// succeeds, the pod should get counted as a success the next time we try to
-			// schedule it. (hopefully)
-			metrics.PodUnschedulable(fwk.ProfileName(), metrics.SinceInSeconds(start))
-		} else if err == core.ErrNoNodesAvailable {
-			// No nodes available is counted as unschedulable rather than an error.
-			metrics.PodUnschedulable(fwk.ProfileName(), metrics.SinceInSeconds(start))
-		} else {
-			klog.ErrorS(err, "Error selecting node for pod", "pod", klog.KObj(pod))
-			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-		}
-		sched.recordSchedulingFailure(fwk, podInfo, err, v1.PodReasonUnschedulable, nominatedNode)
-		return
-	}
-	metrics.SchedulingAlgorithmLatency.Observe(metrics.SinceInSeconds(start))
-	// Tell the cache to assume that a pod now is running on a given node, even though it hasn't been bound yet.
-	// This allows us to keep scheduling without waiting on binding to occur.
-	assumedPodInfo := podInfo.DeepCopy()
-	assumedPod := assumedPodInfo.Pod
-	// assume modifies `assumedPod` by setting NodeName=scheduleResult.SuggestedHost
-	err = sched.assume(assumedPod, scheduleResult.SuggestedHost)
-	if err != nil {
-		metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-		// This is most probably result of a BUG in retrying logic.
-		// We report an error here so that pod scheduling can be retried.
-		// This relies on the fact that Error will check if the pod has been bound
-		// to a node and if so will not add it back to the unscheduled pods queue
-		// (otherwise this would cause an infinite loop).
-		sched.recordSchedulingFailure(fwk, assumedPodInfo, err, SchedulerError, "")
-		return
-	}
-
-	// Run the Reserve method of reserve plugins.
-	if sts := fwk.RunReservePluginsReserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost); !sts.IsSuccess() {
-		metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-		// trigger un-reserve to clean up state associated with the reserved Pod
-		fwk.RunReservePluginsUnreserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-		if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
-			klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
-		}
-		sched.recordSchedulingFailure(fwk, assumedPodInfo, sts.AsError(), SchedulerError, "")
-		return
-	}
-
-	// Run "permit" plugins.
-	runPermitStatus := fwk.RunPermitPlugins(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-	if runPermitStatus.Code() != framework.Wait && !runPermitStatus.IsSuccess() {
-		var reason string
-		if runPermitStatus.IsUnschedulable() {
-			metrics.PodUnschedulable(fwk.ProfileName(), metrics.SinceInSeconds(start))
-			reason = v1.PodReasonUnschedulable
-		} else {
-			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-			reason = SchedulerError
-		}
-		// One of the plugins returned status different than success or wait.
-		fwk.RunReservePluginsUnreserve(schedulingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-		if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
-			klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
-		}
-		sched.recordSchedulingFailure(fwk, assumedPodInfo, runPermitStatus.AsError(), reason, "")
-		return
-	}
-
-	// bind the pod to its host asynchronously (we can do this b/c of the assumption step above).
-	go func() {
-		bindingCycleCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		metrics.SchedulerGoroutines.WithLabelValues(metrics.Binding).Inc()
-		defer metrics.SchedulerGoroutines.WithLabelValues(metrics.Binding).Dec()
-
-		waitOnPermitStatus := fwk.WaitOnPermit(bindingCycleCtx, assumedPod)
-		if !waitOnPermitStatus.IsSuccess() {
-			var reason string
-			if waitOnPermitStatus.IsUnschedulable() {
-				metrics.PodUnschedulable(fwk.ProfileName(), metrics.SinceInSeconds(start))
-				reason = v1.PodReasonUnschedulable
-			} else {
-				metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-				reason = SchedulerError
-			}
-			// trigger un-reserve plugins to clean up state associated with the reserved Pod
-			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-			if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
-				klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
-			}
-			sched.recordSchedulingFailure(fwk, assumedPodInfo, waitOnPermitStatus.AsError(), reason, "")
-			return
-		}
-
-		// Run "prebind" plugins.
-		preBindStatus := fwk.RunPreBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-		if !preBindStatus.IsSuccess() {
-			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-			// trigger un-reserve plugins to clean up state associated with the reserved Pod
-			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-			if forgetErr := sched.SchedulerCache.ForgetPod(assumedPod); forgetErr != nil {
-				klog.Errorf("scheduler cache ForgetPod failed: %v", forgetErr)
-			}
-			sched.recordSchedulingFailure(fwk, assumedPodInfo, preBindStatus.AsError(), SchedulerError, "")
-			return
-		}
-
-		err := sched.bind(bindingCycleCtx, fwk, assumedPod, scheduleResult.SuggestedHost, state)
-		if err != nil {
-			metrics.PodScheduleError(fwk.ProfileName(), metrics.SinceInSeconds(start))
-			// trigger un-reserve plugins to clean up state associated with the reserved Pod
-			fwk.RunReservePluginsUnreserve(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-			if err := sched.SchedulerCache.ForgetPod(assumedPod); err != nil {
-				klog.Errorf("scheduler cache ForgetPod failed: %v", err)
-			}
-			sched.recordSchedulingFailure(fwk, assumedPodInfo, fmt.Errorf("binding rejected: %w", err), SchedulerError, "")
-		} else {
-			// Calculating nodeResourceString can be heavy. Avoid it if klog verbosity is below 2.
-			if klog.V(2).Enabled() {
-				klog.InfoS("Successfully bound pod to node", "pod", klog.KObj(pod), "node", scheduleResult.SuggestedHost, "evaluatedNodes", scheduleResult.EvaluatedNodes, "feasibleNodes", scheduleResult.FeasibleNodes)
-			}
-			metrics.PodScheduled(fwk.ProfileName(), metrics.SinceInSeconds(start))
-			metrics.PodSchedulingAttempts.Observe(float64(podInfo.Attempts))
-			metrics.PodSchedulingDuration.WithLabelValues(getAttemptsLabel(podInfo)).Observe(metrics.SinceInSeconds(podInfo.InitialAttemptTimestamp))
-
-			// Run "postbind" plugins.
-			fwk.RunPostBindPlugins(bindingCycleCtx, state, assumedPod, scheduleResult.SuggestedHost)
-		}
-	}()
-}
-
-func getAttemptsLabel(p *framework.QueuedPodInfo) string {
-	// We breakdown the pod scheduling duration by attempts capped to a limit
-	// to avoid ending up with a high cardinality metric.
-	if p.Attempts >= 15 {
-		return "15+"
-	}
-	return strconv.Itoa(p.Attempts)
-}
-
-func (sched *Scheduler) frameworkForPod(pod *v1.Pod) (framework.Framework, error) {
-	fwk, ok := sched.Profiles[pod.Spec.SchedulerName]
-	if !ok {
-		return nil, fmt.Errorf("profile not found for scheduler name %q", pod.Spec.SchedulerName)
-	}
-	return fwk, nil
-}
-
-// skipPodSchedule returns true if we could skip scheduling the pod for specified cases.
-func (sched *Scheduler) skipPodSchedule(fwk framework.Framework, pod *v1.Pod) bool {
-	// Case 1: pod is being deleted.
-	if pod.DeletionTimestamp != nil {
-		fwk.EventRecorder().Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", "skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
-		klog.V(3).Infof("Skip schedule deleting pod: %v/%v", pod.Namespace, pod.Name)
-		return true
-	}
-
-	// Case 2: pod has been assumed and pod updates could be skipped.
-	// An assumed pod can be added again to the scheduling queue if it got an update event
-	// during its previous scheduling cycle but before getting assumed.
-	if sched.skipPodUpdate(pod) {
-		return true
-	}
-
-	return false
-}
-
-func defaultAlgorithmSourceProviderName() *string {
-	provider := schedulerapi.SchedulerDefaultProviderName
-	return &provider
 }
 
 // NewInformerFactory creates a SharedInformerFactory and initializes a scheduler specific
 // in-place podInformer.
-func NewInformerFactory(cs clientset.Interface, resyncPeriod time.Duration) informers.SharedInformerFactory {
-	informerFactory := informers.NewSharedInformerFactory(cs, resyncPeriod)
-	informerFactory.InformerFor(&v1.Pod{}, newPodInformer)
+func NewInformerFactory(cs clientset.Interface, resyncPeriod time.Duration, informerName *cache.InformerName) informers.SharedInformerFactory {
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(cs, resyncPeriod, informers.WithInformerName(informerName))
+	informerFactory.InformerFor(&v1.Pod{}, func(cs clientset.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+		return newPodInformer(cs, resyncPeriod, informerName)
+	})
 	return informerFactory
 }
 
+func buildExtenders(logger klog.Logger, extenders []schedulerapi.Extender, profiles []schedulerapi.KubeSchedulerProfile) ([]fwk.Extender, error) {
+	var fExtenders []fwk.Extender
+	if len(extenders) == 0 {
+		return nil, nil
+	}
+
+	var ignoredExtendedResources []string
+	var ignorableExtenders []fwk.Extender
+	for i := range extenders {
+		logger.V(2).Info("Creating extender", "extender", extenders[i])
+		extender, err := NewHTTPExtender(&extenders[i])
+		if err != nil {
+			return nil, err
+		}
+		if !extender.IsIgnorable() {
+			fExtenders = append(fExtenders, extender)
+		} else {
+			ignorableExtenders = append(ignorableExtenders, extender)
+		}
+		for _, r := range extenders[i].ManagedResources {
+			if r.IgnoredByScheduler {
+				ignoredExtendedResources = append(ignoredExtendedResources, r.Name)
+			}
+		}
+	}
+	// place ignorable extenders to the tail of extenders
+	fExtenders = append(fExtenders, ignorableExtenders...)
+
+	// If there are any extended resources found from the Extenders, append them to the pluginConfig for each profile.
+	// This should only have an effect on ComponentConfig, where it is possible to configure Extenders and
+	// plugin args (and in which case the extender ignored resources take precedence).
+	if len(ignoredExtendedResources) == 0 {
+		return fExtenders, nil
+	}
+
+	for i := range profiles {
+		prof := &profiles[i]
+		var found = false
+		for k := range prof.PluginConfig {
+			if prof.PluginConfig[k].Name == noderesources.Name {
+				// Update the existing args
+				pc := &prof.PluginConfig[k]
+				args, ok := pc.Args.(*schedulerapi.NodeResourcesFitArgs)
+				if !ok {
+					return nil, fmt.Errorf("want args to be of type NodeResourcesFitArgs, got %T", pc.Args)
+				}
+				args.IgnoredResources = ignoredExtendedResources
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("can't find NodeResourcesFitArgs in plugin config")
+		}
+	}
+	return fExtenders, nil
+}
+
+type FailureHandlerFn func(ctx context.Context, fwk framework.Framework, podInfo *framework.QueuedPodInfo, status *fwk.Status, nominatingInfo *fwk.NominatingInfo, start time.Time)
+
+func unionedGVKs(queueingHintsPerProfile internalqueue.QueueingHintMapPerProfile) map[fwk.EventResource]fwk.ActionType {
+	gvkMap := make(map[fwk.EventResource]fwk.ActionType)
+	for _, queueingHints := range queueingHintsPerProfile {
+		for evt := range queueingHints {
+			if _, ok := gvkMap[evt.Resource]; ok {
+				gvkMap[evt.Resource] |= evt.ActionType
+			} else {
+				gvkMap[evt.Resource] = evt.ActionType
+			}
+		}
+	}
+	return gvkMap
+}
+
 // newPodInformer creates a shared index informer that returns only non-terminal pods.
-func newPodInformer(cs clientset.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+// The PodInformer allows indexers to be added, but note that only non-conflict indexers are allowed.
+func newPodInformer(cs clientset.Interface, resyncPeriod time.Duration, informerName *cache.InformerName) cache.SharedIndexInformer {
 	selector := fmt.Sprintf("status.phase!=%v,status.phase!=%v", v1.PodSucceeded, v1.PodFailed)
 	tweakListOptions := func(options *metav1.ListOptions) {
 		options.FieldSelector = selector
 	}
-	return coreinformers.NewFilteredPodInformer(cs, metav1.NamespaceAll, resyncPeriod, nil, tweakListOptions)
+	informer := coreinformers.NewPodInformerWithOptions(cs, metav1.NamespaceAll, internalinterfaces.InformerOptions{
+		ResyncPeriod:     resyncPeriod,
+		Indexers:         cache.Indexers{},
+		TweakListOptions: tweakListOptions,
+		InformerName:     informerName,
+	})
+
+	// With ManagedFieldsOptOutClient, kube-scheduler's informer client drops managedFields instead.
+	if !clientfeatures.FeatureGates().Enabled(clientfeatures.ManagedFieldsOptOutClient) {
+		// Dropping `.metadata.managedFields` to improve memory usage.
+		// The Extract workflow (i.e. `ExtractPod`) should be unused.
+		trim := func(obj interface{}) (interface{}, error) {
+			if accessor, err := meta.Accessor(obj); err == nil {
+				if accessor.GetManagedFields() != nil {
+					accessor.SetManagedFields(nil)
+				}
+			}
+			return obj, nil
+		}
+		_ = informer.SetTransform(trim)
+	}
+	return informer
+}
+
+func (sched *Scheduler) CurrentCycle() int64 {
+	if sched.SchedulingQueue != nil {
+		return sched.SchedulingQueue.SchedulingCycle()
+	}
+	return 0
+}
+
+// initAlgorithm builds the scheduling algorithms from the Scheduler's fields
+// with default options. It has to run before any scheduling method, and before
+// applyDefaultHandlers, which hands SchedulePod the algorithm's method value.
+// A Scheduler assembled field by field in tests must call it.
+func (sched *Scheduler) initAlgorithm() error {
+	return sched.initAlgorithms(nil, nil)
+}
+
+// initAlgorithms builds both the single-pod and pod-group scheduling algorithms
+// from the Scheduler's fields.
+//
+// CurrentCycle is passed as a bound method value, so a SchedulingQueue installed
+// after this call is still picked up.
+func (sched *Scheduler) initAlgorithms(algOpts []AlgorithmOption, podGroupAlgOpts []PodGroupAlgorithmOption) error {
+	algorithm, err := NewSchedulingAlgorithm(sched.nodeInfoSnapshot, sched.Cache, append(algOpts, WithCurrentCycleProvider(sched.CurrentCycle))...)
+	if err != nil {
+		return err
+	}
+
+	sched.algorithm = algorithm
+	sched.podGroupAlgorithm = NewPodGroupAlgorithm(sched.nodeInfoSnapshot, &schedulerPodStep{sched: sched}, podGroupAlgOpts...)
+	return nil
 }

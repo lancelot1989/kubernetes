@@ -26,9 +26,7 @@ import (
 	"time"
 
 	"github.com/lithammer/dedent"
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"k8s.io/klog/v2"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -38,18 +36,21 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
 	bootstraputil "k8s.io/cluster-bootstrap/token/util"
-	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+	"k8s.io/klog/v2"
+
+	bootstraptokenv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/bootstraptoken/v1"
 	kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/validation"
 	outputapischeme "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/scheme"
-	outputapiv1alpha1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha1"
+	outputapiv1alpha3 "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/v1alpha3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd/options"
 	cmdutil "k8s.io/kubernetes/cmd/kubeadm/app/cmd/util"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	tokenphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
 	configutil "k8s.io/kubernetes/cmd/kubeadm/app/util/config"
+	"k8s.io/kubernetes/cmd/kubeadm/app/util/errors"
 	kubeconfigutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/output"
 )
@@ -79,20 +80,14 @@ func newCmdToken(out io.Writer, errW io.Writer) *cobra.Command {
 			You can read more about bootstrap tokens here:
 			  https://kubernetes.io/docs/admin/bootstrap-tokens/
 		`),
-
-		// Without this callback, if a user runs just the "token"
-		// command without a subcommand, or with an invalid subcommand,
-		// cobra will print usage information, but still exit cleanly.
-		// We want to return an error code in these cases so that the
-		// user knows that their command was invalid.
-		RunE: cmdutil.SubCmdRunE("token"),
 	}
+	cmdutil.RequireSubcommand(tokenCmd)
 
 	options.AddKubeConfigFlag(tokenCmd.PersistentFlags(), &kubeConfigFile)
 	tokenCmd.PersistentFlags().BoolVar(&dryRun,
 		options.DryRun, dryRun, "Whether to enable dry-run mode or not")
 
-	cfg := &kubeadmapiv1beta2.InitConfiguration{}
+	cfg := &kubeadmapiv1.InitConfiguration{}
 
 	// Default values for the cobra help text
 	kubeadmscheme.Scheme.Default(cfg)
@@ -129,7 +124,7 @@ func newCmdToken(out io.Writer, errW io.Writer) *cobra.Command {
 
 			klog.V(1).Infoln("[token] getting Clientsets from kubeconfig file")
 			kubeConfigFile = cmdutil.GetKubeConfigPath(kubeConfigFile)
-			client, err := getClientset(kubeConfigFile, dryRun)
+			client, err := getClientForTokenCommands(kubeConfigFile, dryRun)
 			if err != nil {
 				return err
 			}
@@ -161,14 +156,14 @@ func newCmdToken(out io.Writer, errW io.Writer) *cobra.Command {
 		`),
 		RunE: func(tokenCmd *cobra.Command, args []string) error {
 			kubeConfigFile = cmdutil.GetKubeConfigPath(kubeConfigFile)
-			client, err := getClientset(kubeConfigFile, dryRun)
+			client, err := getClientForTokenCommands(kubeConfigFile, dryRun)
 			if err != nil {
 				return err
 			}
 
 			printer, err := outputFlags.ToPrinter()
 			if err != nil {
-				return err
+				return errors.Wrap(err, "could not construct output printer")
 			}
 
 			return RunListTokens(out, errW, client, printer)
@@ -192,10 +187,10 @@ func newCmdToken(out io.Writer, errW io.Writer) *cobra.Command {
 		`),
 		RunE: func(tokenCmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
-				return errors.Errorf("missing subcommand; 'token delete' is missing token of form %q", bootstrapapi.BootstrapTokenIDPattern)
+				return errors.Errorf("missing argument; 'token delete' is missing token of form %q or %q", bootstrapapi.BootstrapTokenPattern, bootstrapapi.BootstrapTokenIDPattern)
 			}
 			kubeConfigFile = cmdutil.GetKubeConfigPath(kubeConfigFile)
-			client, err := getClientset(kubeConfigFile, dryRun)
+			client, err := getClientForTokenCommands(kubeConfigFile, dryRun)
 			if err != nil {
 				return err
 			}
@@ -232,9 +227,9 @@ func newCmdTokenGenerate(out io.Writer) *cobra.Command {
 }
 
 // RunCreateToken generates a new bootstrap token and stores it as a secret on the server.
-func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, initCfg *kubeadmapiv1beta2.InitConfiguration, printJoinCommand bool, certificateKey string, kubeConfigFile string) error {
+func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, initCfg *kubeadmapiv1.InitConfiguration, printJoinCommand bool, certificateKey string, kubeConfigFile string) error {
 	// ClusterConfiguration is needed just for the call to LoadOrDefaultInitConfiguration
-	clusterCfg := &kubeadmapiv1beta2.ClusterConfiguration{
+	clusterCfg := &kubeadmapiv1.ClusterConfiguration{
 		// KubernetesVersion is not used, but we set this explicitly to avoid
 		// the lookup of the version from the internet when executing LoadOrDefaultInitConfiguration
 		KubernetesVersion: kubeadmconstants.CurrentKubernetesVersion.String(),
@@ -244,12 +239,9 @@ func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, i
 	// This call returns the ready-to-use configuration based on the configuration file that might or might not exist and the default cfg populated by flags
 	klog.V(1).Infoln("[token] loading configurations")
 
-	// In fact, we don't do any CRI ops at all.
-	// This is just to force skipping the CRI detection.
-	// Ref: https://github.com/kubernetes/kubeadm/issues/1559
-	initCfg.NodeRegistration.CRISocket = kubeadmconstants.DefaultDockerCRISocket
-
-	internalcfg, err := configutil.LoadOrDefaultInitConfiguration(cfgPath, initCfg, clusterCfg)
+	internalcfg, err := configutil.LoadOrDefaultInitConfiguration(cfgPath, initCfg, clusterCfg, configutil.LoadOrDefaultConfigurationOptions{
+		SkipCRIDetect: true,
+	})
 	if err != nil {
 		return err
 	}
@@ -283,7 +275,7 @@ func RunCreateToken(out io.Writer, client clientset.Interface, cfgPath string, i
 		}
 	} else {
 		if certificateKey != "" {
-			return errors.Wrap(err, "cannot use --certificate-key without --print-join-command")
+			return errors.New("cannot use --certificate-key without --print-join-command")
 		}
 		fmt.Fprintln(out, internalcfg.BootstrapTokens[0].Token.String())
 	}
@@ -303,7 +295,7 @@ func RunGenerateToken(out io.Writer) error {
 	return nil
 }
 
-func formatBootstrapToken(obj *outputapiv1alpha1.BootstrapToken) string {
+func formatBootstrapToken(obj *outputapiv1alpha3.BootstrapToken) string {
 	ttl := "<forever>"
 	expires := "<never>"
 	if obj.Expires != nil {
@@ -350,7 +342,7 @@ func (ttp *tokenTextPrinter) PrintObj(obj runtime.Object, writer io.Writer) erro
 	}
 
 	// Print token
-	fmt.Fprint(tabw, formatBootstrapToken(obj.(*outputapiv1alpha1.BootstrapToken)))
+	fmt.Fprint(tabw, formatBootstrapToken(obj.(*outputapiv1alpha3.BootstrapToken)))
 
 	return tabw.Flush()
 }
@@ -358,7 +350,7 @@ func (ttp *tokenTextPrinter) PrintObj(obj runtime.Object, writer io.Writer) erro
 // tokenTextPrintFlags provides flags necessary for printing bootstrap token in a text form.
 type tokenTextPrintFlags struct{}
 
-// ToPrinter returns kubeadm printer for the text output format
+// ToPrinter returns a kubeadm printer for the text output format
 func (tpf *tokenTextPrintFlags) ToPrinter(outputFormat string) (output.Printer, error) {
 	if outputFormat == output.TextOutput {
 		return &tokenTextPrinter{columns: []string{"TOKEN", "TTL", "EXPIRES", "USAGES", "DESCRIPTION", "EXTRA GROUPS"}}, nil
@@ -372,9 +364,6 @@ func RunListTokens(out io.Writer, errW io.Writer, client clientset.Interface, pr
 	klog.V(1).Infoln("[token] preparing selector for bootstrap token")
 	tokenSelector := fields.SelectorFromSet(
 		map[string]string{
-			// TODO: We hard-code "type" here until `field_constants.go` that is
-			// currently in `pkg/apis/core/` exists in the external API, i.e.
-			// k8s.io/api/v1. Should be v1.SecretTypeField
 			"type": string(bootstrapapi.SecretTypeBootstrapToken),
 		},
 	)
@@ -390,16 +379,16 @@ func RunListTokens(out io.Writer, errW io.Writer, client clientset.Interface, pr
 
 	for _, secret := range secrets.Items {
 		// Get the BootstrapToken struct representation from the Secret object
-		token, err := kubeadmapi.BootstrapTokenFromSecret(&secret)
+		token, err := bootstraptokenv1.BootstrapTokenFromSecret(&secret)
 		if err != nil {
 			fmt.Fprintf(errW, "%v", err)
 			continue
 		}
 
 		// Convert token into versioned output structure
-		outputToken := outputapiv1alpha1.BootstrapToken{
-			BootstrapToken: kubeadmapiv1beta2.BootstrapToken{
-				Token:       &kubeadmapiv1beta2.BootstrapTokenString{ID: token.Token.ID, Secret: token.Token.Secret},
+		outputToken := outputapiv1alpha3.BootstrapToken{
+			BootstrapToken: bootstraptokenv1.BootstrapToken{
+				Token:       &bootstraptokenv1.BootstrapTokenString{ID: token.Token.ID, Secret: token.Token.Secret},
 				Description: token.Description,
 				TTL:         token.TTL,
 				Expires:     token.Expires,
@@ -423,10 +412,10 @@ func RunDeleteTokens(out io.Writer, client clientset.Interface, tokenIDsOrTokens
 		klog.V(1).Info("[token] parsing token")
 		if !bootstraputil.IsValidBootstrapTokenID(tokenIDOrToken) {
 			// Okay, the full token with both id and secret was probably passed. Parse it and extract the ID only
-			bts, err := kubeadmapiv1beta2.NewBootstrapTokenString(tokenIDOrToken)
+			bts, err := bootstraptokenv1.NewBootstrapTokenString(tokenIDOrToken)
 			if err != nil {
 				return errors.Errorf("given token didn't match pattern %q or %q",
-					bootstrapapi.BootstrapTokenIDPattern, bootstrapapi.BootstrapTokenIDPattern)
+					bootstrapapi.BootstrapTokenPattern, bootstrapapi.BootstrapTokenIDPattern)
 			}
 			tokenID = bts.ID
 		}
@@ -441,13 +430,16 @@ func RunDeleteTokens(out io.Writer, client clientset.Interface, tokenIDsOrTokens
 	return nil
 }
 
-func getClientset(file string, dryRun bool) (clientset.Interface, error) {
+// getClientForTokenCommands returns a client to be used with token commands.
+// When dry-running it includes token specific reactors.
+func getClientForTokenCommands(file string, dryRun bool) (clientset.Interface, error) {
 	if dryRun {
-		dryRunGetter, err := apiclient.NewClientBackedDryRunGetterFromKubeconfig(file)
-		if err != nil {
+		dryRun := apiclient.NewDryRun().WithDefaultMarshalFunction().WithWriter(os.Stdout)
+		dryRun.AppendReactor(dryRun.DeleteBootstrapTokenReactor())
+		if err := dryRun.WithKubeConfigFile(file); err != nil {
 			return nil, err
 		}
-		return apiclient.NewDryRunClient(dryRunGetter, os.Stdout), nil
+		return dryRun.FakeClient(), nil
 	}
 	return kubeconfigutil.ClientSetFromFile(file)
 }

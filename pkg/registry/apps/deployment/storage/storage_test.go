@@ -21,24 +21,24 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
 	"k8s.io/apiserver/pkg/registry/rest"
 	storeerr "k8s.io/apiserver/pkg/storage/errors"
 	etcd3testing "k8s.io/apiserver/pkg/storage/etcd3/testing"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	"k8s.io/kubernetes/pkg/apis/autoscaling"
 	api "k8s.io/kubernetes/pkg/apis/core"
@@ -71,26 +71,15 @@ func validNewDeployment() *apps.Deployment {
 			Strategy: apps.DeploymentStrategy{
 				Type: apps.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &apps.RollingUpdateDeployment{
-					MaxSurge:       intstr.FromInt(1),
-					MaxUnavailable: intstr.FromInt(1),
+					MaxSurge:       intstr.FromInt32(1),
+					MaxUnavailable: intstr.FromInt32(1),
 				},
 			},
 			Template: api.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"a": "b"},
 				},
-				Spec: api.PodSpec{
-					Containers: []api.Container{
-						{
-							Name:                     "test",
-							Image:                    "test_image",
-							ImagePullPolicy:          api.PullIfNotPresent,
-							TerminationMessagePolicy: api.TerminationMessageReadFile,
-						},
-					},
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSClusterFirst,
-				},
+				Spec: podtest.MakePodSpec(),
 			},
 			Replicas: 7,
 		},
@@ -210,7 +199,8 @@ func TestScaleGet(t *testing.T) {
 	defer server.Terminate(t)
 	defer storage.Deployment.Store.DestroyFunc()
 	var deployment apps.Deployment
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	scaleCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "scale")
 	key := "/deployments/" + namespace + "/" + name
 	if err := storage.Deployment.Storage.Create(ctx, key, &validDeployment, &deployment, 0, false); err != nil {
 		t.Fatalf("error setting new deployment (key: %s) %v: %v", key, validDeployment, err)
@@ -236,13 +226,13 @@ func TestScaleGet(t *testing.T) {
 			Selector: selector.String(),
 		},
 	}
-	obj, err := storage.Scale.Get(ctx, name, &metav1.GetOptions{})
+	obj, err := storage.Scale.Get(scaleCtx, name, &metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("error fetching scale for %s: %v", name, err)
 	}
 	got := obj.(*autoscaling.Scale)
 	if !apiequality.Semantic.DeepEqual(want, got) {
-		t.Errorf("unexpected scale: %s", diff.ObjectDiff(want, got))
+		t.Errorf("unexpected scale: %s", cmp.Diff(want, got))
 	}
 }
 
@@ -251,7 +241,8 @@ func TestScaleUpdate(t *testing.T) {
 	defer server.Terminate(t)
 	defer storage.Deployment.Store.DestroyFunc()
 	var deployment apps.Deployment
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	scaleCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "scale")
 	key := "/deployments/" + namespace + "/" + name
 	if err := storage.Deployment.Storage.Create(ctx, key, &validDeployment, &deployment, 0, false); err != nil {
 		t.Fatalf("error setting new deployment (key: %s) %v: %v", key, validDeployment, err)
@@ -264,10 +255,10 @@ func TestScaleUpdate(t *testing.T) {
 		},
 	}
 
-	if _, _, err := storage.Scale.Update(ctx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
+	if _, _, err := storage.Scale.Update(scaleCtx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("error updating scale %v: %v", update, err)
 	}
-	obj, err := storage.Scale.Get(ctx, name, &metav1.GetOptions{})
+	obj, err := storage.Scale.Get(scaleCtx, name, &metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("error fetching scale for %s: %v", name, err)
 	}
@@ -279,7 +270,7 @@ func TestScaleUpdate(t *testing.T) {
 	update.ResourceVersion = deployment.ResourceVersion
 	update.Spec.Replicas = 15
 
-	if _, _, err = storage.Scale.Update(ctx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil && !errors.IsConflict(err) {
+	if _, _, err = storage.Scale.Update(scaleCtx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil && !apierrors.IsConflict(err) {
 		t.Fatalf("unexpected error, expecting an update conflict but got %v", err)
 	}
 }
@@ -288,7 +279,8 @@ func TestStatusUpdate(t *testing.T) {
 	storage, server := newStorage(t)
 	defer server.Terminate(t)
 	defer storage.Deployment.Store.DestroyFunc()
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	statusCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "status")
 	key := "/deployments/" + namespace + "/" + name
 	if err := storage.Deployment.Storage.Create(ctx, key, &validDeployment, nil, 0, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -303,7 +295,7 @@ func TestStatusUpdate(t *testing.T) {
 		},
 	}
 
-	if _, _, err := storage.Status.Update(ctx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
+	if _, _, err := storage.Status.Update(statusCtx, update.Name, rest.DefaultUpdatedObjectInfo(&update), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	obj, err := storage.Deployment.Get(ctx, name, &metav1.GetOptions{})
@@ -321,8 +313,6 @@ func TestStatusUpdate(t *testing.T) {
 }
 
 func TestEtcdCreateDeploymentRollback(t *testing.T) {
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
-
 	testCases := map[string]struct {
 		rollback apps.DeploymentRollback
 		errOK    func(error) bool
@@ -350,14 +340,20 @@ func TestEtcdCreateDeploymentRollback(t *testing.T) {
 			errOK: func(err error) bool { return err != nil },
 		},
 	}
+	storage, server := newStorage(t)
+	defer server.Terminate(t)
+	defer storage.Deployment.Store.DestroyFunc()
 	for k, test := range testCases {
-		storage, server := newStorage(t)
 		rollbackStorage := storage.Rollback
+		deployment := validNewDeployment()
+		deployment.Namespace = fmt.Sprintf("namespace-%s", strings.ToLower(k))
+		ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, deployment.Namespace)
+		rollbackCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, deployment.Namespace, "rollback")
 
-		if _, err := storage.Deployment.Create(ctx, validNewDeployment(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
+		if _, err := storage.Deployment.Create(ctx, deployment, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
 			t.Fatalf("%s: unexpected error: %v", k, err)
 		}
-		rollbackRespStatus, err := rollbackStorage.Create(ctx, test.rollback.Name, &test.rollback, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
+		rollbackRespStatus, err := rollbackStorage.Create(rollbackCtx, test.rollback.Name, &test.rollback, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 		if !test.errOK(err) {
 			t.Errorf("%s: unexpected error: %v", k, err)
 		} else if err == nil {
@@ -369,15 +365,13 @@ func TestEtcdCreateDeploymentRollback(t *testing.T) {
 			if status.Code != http.StatusOK || status.Status != metav1.StatusSuccess {
 				t.Errorf("%s: unexpected response, code: %d, status: %s", k, status.Code, status.Status)
 			}
-			d, err := storage.Deployment.Get(ctx, validNewDeployment().ObjectMeta.Name, &metav1.GetOptions{})
+			d, err := storage.Deployment.Get(ctx, deployment.ObjectMeta.Name, &metav1.GetOptions{})
 			if err != nil {
 				t.Errorf("%s: unexpected error: %v", k, err)
 			} else if !reflect.DeepEqual(*d.(*apps.Deployment).Spec.RollbackTo, test.rollback.RollbackTo) {
 				t.Errorf("%s: expected: %v, got: %v", k, *d.(*apps.Deployment).Spec.RollbackTo, test.rollback.RollbackTo)
 			}
 		}
-		storage.Deployment.Store.DestroyFunc()
-		server.Terminate(t)
 	}
 }
 
@@ -390,7 +384,8 @@ func TestCreateDeploymentRollbackValidation(t *testing.T) {
 		RollbackTo:         apps.RollbackConfig{Revision: 1},
 	}
 
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	rollbackCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "rollback")
 
 	if _, err := storage.Deployment.Create(ctx, validNewDeployment(), rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -398,7 +393,7 @@ func TestCreateDeploymentRollbackValidation(t *testing.T) {
 
 	validationError := fmt.Errorf("admission deny")
 	alwaysDenyValidationFunc := func(ctx context.Context, obj runtime.Object) error { return validationError }
-	_, err := rollbackStorage.Create(ctx, rollback.Name, &rollback, alwaysDenyValidationFunc, &metav1.CreateOptions{})
+	_, err := rollbackStorage.Create(rollbackCtx, rollback.Name, &rollback, alwaysDenyValidationFunc, &metav1.CreateOptions{})
 
 	if err == nil || validationError != err {
 		t.Errorf("expected: %v, got: %v", validationError, err)
@@ -415,9 +410,10 @@ func TestEtcdCreateDeploymentRollbackNoDeployment(t *testing.T) {
 	defer server.Terminate(t)
 	defer storage.Deployment.Store.DestroyFunc()
 	rollbackStorage := storage.Rollback
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	rollbackCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "rollback")
 
-	_, err := rollbackStorage.Create(ctx, name, &apps.DeploymentRollback{
+	_, err := rollbackStorage.Create(rollbackCtx, name, &apps.DeploymentRollback{
 		Name:               name,
 		UpdatedAnnotations: map[string]string{},
 		RollbackTo:         apps.RollbackConfig{Revision: 1},
@@ -425,7 +421,7 @@ func TestEtcdCreateDeploymentRollbackNoDeployment(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected not-found-error but got nothing")
 	}
-	if !errors.IsNotFound(storeerr.InterpretGetError(err, apps.Resource("deployments"), name)) {
+	if !apierrors.IsNotFound(storeerr.InterpretGetError(err, apps.Resource("deployments"), name)) {
 		t.Fatalf("Unexpected error returned: %#v", err)
 	}
 
@@ -433,7 +429,7 @@ func TestEtcdCreateDeploymentRollbackNoDeployment(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected not-found-error but got nothing")
 	}
-	if !errors.IsNotFound(storeerr.InterpretGetError(err, apps.Resource("deployments"), name)) {
+	if !apierrors.IsNotFound(storeerr.InterpretGetError(err, apps.Resource("deployments"), name)) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 }
@@ -462,7 +458,8 @@ func TestScalePatchErrors(t *testing.T) {
 	scaleStore := storage.Scale
 
 	defer resourceStore.DestroyFunc()
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	scaleCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "scale")
 
 	{
 		applyNotFoundPatch := func() rest.TransformFunc {
@@ -471,7 +468,7 @@ func TestScalePatchErrors(t *testing.T) {
 				return currentObject, nil
 			}
 		}
-		_, _, err := scaleStore.Update(ctx, "bad-name", rest.DefaultUpdatedObjectInfo(nil, applyNotFoundPatch()), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+		_, _, err := scaleStore.Update(scaleCtx, "bad-name", rest.DefaultUpdatedObjectInfo(nil, applyNotFoundPatch()), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 		if !apierrors.IsNotFound(err) {
 			t.Errorf("expected notfound, got %v", err)
 		}
@@ -488,7 +485,7 @@ func TestScalePatchErrors(t *testing.T) {
 				return currentObject, nil
 			}
 		}
-		_, _, err := scaleStore.Update(ctx, name, rest.DefaultUpdatedObjectInfo(nil, applyBadUIDPatch()), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+		_, _, err := scaleStore.Update(scaleCtx, name, rest.DefaultUpdatedObjectInfo(nil, applyBadUIDPatch()), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 		if !apierrors.IsConflict(err) {
 			t.Errorf("expected conflict, got %v", err)
 		}
@@ -501,7 +498,7 @@ func TestScalePatchErrors(t *testing.T) {
 				return currentObject, nil
 			}
 		}
-		_, _, err := scaleStore.Update(ctx, name, rest.DefaultUpdatedObjectInfo(nil, applyBadResourceVersionPatch()), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+		_, _, err := scaleStore.Update(scaleCtx, name, rest.DefaultUpdatedObjectInfo(nil, applyBadResourceVersionPatch()), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 		if !apierrors.IsConflict(err) {
 			t.Errorf("expected conflict, got %v", err)
 		}
@@ -516,7 +513,8 @@ func TestScalePatchConflicts(t *testing.T) {
 	scaleStore := storage.Scale
 
 	defer resourceStore.DestroyFunc()
-	ctx := genericapirequest.WithNamespace(genericapirequest.NewContext(), namespace)
+	ctx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace)
+	scaleCtx := genericregistrytest.NewNamespaceScopeContext(storage.Deployment.Store, namespace, "scale")
 	if _, err := resourceStore.Create(ctx, validObj, rest.ValidateAllObjectFunc, &metav1.CreateOptions{}); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -561,7 +559,7 @@ func TestScalePatchConflicts(t *testing.T) {
 		}
 	}
 	for i := 0; i < 100; i++ {
-		result, _, err := scaleStore.Update(ctx, name, rest.DefaultUpdatedObjectInfo(nil, applyReplicaPatch(i)), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
+		result, _, err := scaleStore.Update(scaleCtx, name, rest.DefaultUpdatedObjectInfo(nil, applyReplicaPatch(i)), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})
 		if err != nil {
 			t.Fatalf("error patching scale: %v", err)
 		}

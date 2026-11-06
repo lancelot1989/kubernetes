@@ -46,12 +46,12 @@ if [ -z "${KUBECTL_PRUNE_WHITELIST_OVERRIDE:-}" ]; then
     core/v1/Secret
     core/v1/Service
     batch/v1/Job
-    batch/v1beta1/CronJob
+    batch/v1/CronJob
     apps/v1/DaemonSet
     apps/v1/Deployment
     apps/v1/ReplicaSet
     apps/v1/StatefulSet
-    extensions/v1beta1/Ingress
+    networking.k8s.io/v1/Ingress
   )
 else
   read -ra KUBECTL_PRUNE_WHITELIST <<< "${KUBECTL_PRUNE_WHITELIST_OVERRIDE}"
@@ -114,28 +114,28 @@ function log() {
   esac
 }
 
-# Generate kubectl prune-whitelist flags from provided resource list.
-function generate_prune_whitelist_flags() {
+# Generate kubectl prune-allowlist flags from provided resource list.
+function generate_prune_allowlist_flags() {
   local -r resources=( "$@" )
   for resource in "${resources[@]}"; do
     # Check if $resource isn't composed just of whitespaces by replacing ' '
     # with '' and checking whether the resulting string is not empty.
     if [[ -n "${resource// /}" ]]; then
-      printf "%s" "--prune-whitelist ${resource} "
+      printf "%s" "--prune-allowlist ${resource} "
     fi
   done
 }
 
-# KUBECTL_EXTRA_PRUNE_WHITELIST is a list of extra whitelisted resources
+# KUBECTL_EXTRA_PRUNE_WHITELIST is a list of extra allowed resources
 # besides the default ones.
-extra_prune_whitelist=
+extra_prune_allowlist=
 if [ -n "${KUBECTL_EXTRA_PRUNE_WHITELIST:-}" ]; then
-  read -ra extra_prune_whitelist <<< "${KUBECTL_EXTRA_PRUNE_WHITELIST}"
+  read -ra extra_prune_allowlist <<< "${KUBECTL_EXTRA_PRUNE_WHITELIST}"
 fi
-prune_whitelist=( "${KUBECTL_PRUNE_WHITELIST[@]}"  "${extra_prune_whitelist[@]}" )
-prune_whitelist_flags=$(generate_prune_whitelist_flags "${prune_whitelist[@]}")
+prune_allowlist=( "${KUBECTL_PRUNE_WHITELIST[@]}"  "${extra_prune_allowlist[@]}" )
+prune_allowlist_flags=$(generate_prune_allowlist_flags "${prune_allowlist[@]}")
 
-log INFO "== Generated kubectl prune whitelist flags: $prune_whitelist_flags =="
+log INFO "== Generated kubectl prune allowlist flags: $prune_allowlist_flags =="
 
 # $1 filename of addon to start.
 # $2 count of tries to start the addon.
@@ -240,14 +240,14 @@ function reconcile_addons() {
   # Disabling because "${KUBECTL_OPTS}" needs to allow for expansion here
   ${KUBECTL} ${KUBECTL_OPTS} apply -f ${ADDON_PATH} \
     -l ${CLUSTER_SERVICE_LABEL}=true,${ADDON_MANAGER_LABEL}!=EnsureExists \
-    --prune=true ${prune_whitelist_flags} --recursive | grep -v configured
+    --prune=true ${prune_allowlist_flags} --recursive | grep -v configured
 
   log INFO "== Reconciling with addon-manager label =="
   # shellcheck disable=SC2086
   # Disabling because "${KUBECTL_OPTS}" needs to allow for expansion here
   ${KUBECTL} ${KUBECTL_OPTS} apply -f ${ADDON_PATH} \
     -l ${CLUSTER_SERVICE_LABEL}!=true,${ADDON_MANAGER_LABEL}=Reconcile \
-    --prune=true ${prune_whitelist_flags} --recursive | grep -v configured
+    --prune=true ${prune_allowlist_flags} --recursive | grep -v configured
 
   log INFO "== Kubernetes addon reconcile completed at $(date -Is) =="
 }
@@ -273,15 +273,22 @@ function is_leader() {
   fi
   # shellcheck disable=SC2086
   # Disabling because "${KUBECTL_OPTS}" needs to allow for expansion here
-  KUBE_CONTROLLER_MANAGER_LEADER=$(${KUBECTL} ${KUBECTL_OPTS} -n kube-system get ep kube-controller-manager \
-    -o go-template=$'{{index .metadata.annotations "control-plane.alpha.kubernetes.io/leader"}}' \
-    | sed 's/^.*"holderIdentity":"\([^"]*\)".*/\1/')
-  # If there was any problem with getting the leader election results, var will
-  # be empty. Since it's better to have multiple addon managers than no addon
-  # managers at all, we're going to assume that we're the leader in such case.
-  log INFO "Leader is $KUBE_CONTROLLER_MANAGER_LEADER"
-  # KUBE_CONTROLLER_MANAGER_LEADER value is in the form "${HOSTNAME}_*"
-  # Here we verify that the value is either empty or is in the expected form for the leader
-  KUBE_CONTROLLER_MANAGER_LEADER="${KUBE_CONTROLLER_MANAGER_LEADER##${HOSTNAME}_*}"
-  [[ "$KUBE_CONTROLLER_MANAGER_LEADER" == "" ]]
+  KUBE_CONTROLLER_MANAGER_LEADER=$(${KUBECTL} ${KUBECTL_OPTS} -n kube-system get leases.v1.coordination.k8s.io kube-controller-manager -o "jsonpath={.spec.holderIdentity}")
+
+  case "${KUBE_CONTROLLER_MANAGER_LEADER}" in
+  "")
+    log ERR "No leader election info found."
+    return 1
+    ;;
+
+  "${HOSTNAME}"_*)
+    log INFO "Leader is $KUBE_CONTROLLER_MANAGER_LEADER"
+    return 0
+    ;;
+
+  *)
+    log INFO "Leader is $KUBE_CONTROLLER_MANAGER_LEADER, not ${HOSTNAME}_*"
+    return 1
+    ;;
+  esac
 }

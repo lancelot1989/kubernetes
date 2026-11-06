@@ -25,15 +25,14 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientsetfake "k8s.io/client-go/kubernetes/fake"
 	componentbaseconfig "k8s.io/component-base/config/v1alpha1"
 	kubeproxyconfig "k8s.io/kube-proxy/config/v1alpha1"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
-	"k8s.io/kubernetes/cmd/kubeadm/app/features"
 )
 
 func testKubeProxyConfigMap(contents string) *v1.ConfigMap {
@@ -49,6 +48,8 @@ func testKubeProxyConfigMap(contents string) *v1.ConfigMap {
 }
 
 func TestKubeProxyDefault(t *testing.T) {
+	const defaultMode = "iptables"
+
 	tests := []struct {
 		name       string
 		clusterCfg kubeadmapi.ClusterConfiguration
@@ -62,10 +63,11 @@ func TestKubeProxyDefault(t *testing.T) {
 			expected: kubeProxyConfig{
 				config: kubeproxyconfig.KubeProxyConfiguration{
 					FeatureGates: map[string]bool{},
-					BindAddress:  kubeadmapiv1beta2.DefaultProxyBindAddressv6,
+					BindAddress:  kubeadmapiv1.DefaultProxyBindAddressv6,
 					ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
 						Kubeconfig: kubeproxyKubeConfigFileName,
 					},
+					Mode: defaultMode,
 				},
 			},
 		},
@@ -78,10 +80,11 @@ func TestKubeProxyDefault(t *testing.T) {
 			expected: kubeProxyConfig{
 				config: kubeproxyconfig.KubeProxyConfiguration{
 					FeatureGates: map[string]bool{},
-					BindAddress:  kubeadmapiv1beta2.DefaultProxyBindAddressv4,
+					BindAddress:  kubeadmapiv1.DefaultProxyBindAddressv4,
 					ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
 						Kubeconfig: kubeproxyKubeConfigFileName,
 					},
+					Mode: defaultMode,
 				},
 			},
 		},
@@ -96,51 +99,12 @@ func TestKubeProxyDefault(t *testing.T) {
 			expected: kubeProxyConfig{
 				config: kubeproxyconfig.KubeProxyConfiguration{
 					FeatureGates: map[string]bool{},
-					BindAddress:  kubeadmapiv1beta2.DefaultProxyBindAddressv6,
+					BindAddress:  kubeadmapiv1.DefaultProxyBindAddressv6,
 					ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
 						Kubeconfig: kubeproxyKubeConfigFileName,
 					},
 					ClusterCIDR: "192.168.0.0/16",
-				},
-			},
-		},
-		{
-			name: "IPv6DualStack feature gate set to true",
-			clusterCfg: kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{
-					features.IPv6DualStack: true,
-				},
-			},
-			endpoint: kubeadmapi.APIEndpoint{},
-			expected: kubeProxyConfig{
-				config: kubeproxyconfig.KubeProxyConfiguration{
-					FeatureGates: map[string]bool{
-						features.IPv6DualStack: true,
-					},
-					BindAddress: kubeadmapiv1beta2.DefaultProxyBindAddressv6,
-					ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
-						Kubeconfig: kubeproxyKubeConfigFileName,
-					},
-				},
-			},
-		},
-		{
-			name: "IPv6DualStack feature gate set to false",
-			clusterCfg: kubeadmapi.ClusterConfiguration{
-				FeatureGates: map[string]bool{
-					features.IPv6DualStack: false,
-				},
-			},
-			endpoint: kubeadmapi.APIEndpoint{},
-			expected: kubeProxyConfig{
-				config: kubeproxyconfig.KubeProxyConfiguration{
-					FeatureGates: map[string]bool{
-						features.IPv6DualStack: false,
-					},
-					BindAddress: kubeadmapiv1beta2.DefaultProxyBindAddressv6,
-					ClientConnection: componentbaseconfig.ClientConnectionConfiguration{
-						Kubeconfig: kubeproxyKubeConfigFileName,
-					},
+					Mode:        defaultMode,
 				},
 			},
 		},
@@ -159,7 +123,95 @@ func TestKubeProxyDefault(t *testing.T) {
 			}
 			got.Default(&test.clusterCfg, &test.endpoint, &kubeadmapi.NodeRegistrationOptions{})
 			if !reflect.DeepEqual(got, &expected) {
-				t.Fatalf("Missmatch between expected and got:\nExpected:\n%v\n---\nGot:\n%v", expected, got)
+				t.Fatalf("Mismatch between expected and got:\nExpected:\n%v\n---\nGot:\n%v", expected, got)
+			}
+		})
+	}
+}
+
+func TestKubeProxyDefaultBindAddress(t *testing.T) {
+	tests := []struct {
+		name     string
+		address  string
+		expected string
+	}{
+		{
+			name:     "IPv4 address",
+			address:  "1.2.3.4",
+			expected: kubeadmapiv1.DefaultProxyBindAddressv4,
+		},
+		{
+			name:     "IPv6 address",
+			address:  "fd00::1",
+			expected: kubeadmapiv1.DefaultProxyBindAddressv6,
+		},
+		{
+			name:     "empty address",
+			address:  "",
+			expected: kubeadmapiv1.DefaultProxyBindAddressv6,
+		},
+		{
+			name:     "unparseable address",
+			address:  "not-an-ip",
+			expected: kubeadmapiv1.DefaultProxyBindAddressv6,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := kubeProxyDefaultBindAddress(test.address); got != test.expected {
+				t.Fatalf("kubeProxyDefaultBindAddress(%q) = %q, want %q",
+					test.address, got, test.expected)
+			}
+		})
+	}
+}
+
+func TestIsWildcardBindAddress(t *testing.T) {
+	tests := []struct {
+		bindAddress string
+		expect      bool
+	}{
+		{bindAddress: kubeadmapiv1.DefaultProxyBindAddressv4, expect: true},
+		{bindAddress: kubeadmapiv1.DefaultProxyBindAddressv6, expect: true},
+		{bindAddress: "10.0.0.5", expect: false},
+		{bindAddress: "fd00::5", expect: false},
+		{bindAddress: "not-an-ip", expect: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.bindAddress, func(t *testing.T) {
+			if got := isWildcardBindAddress(test.bindAddress); got != test.expect {
+				t.Fatalf("isWildcardBindAddress(%q) = %v, want %v",
+					test.bindAddress, got, test.expect)
+			}
+		})
+	}
+}
+
+func TestKubeProxyDefaultBindAddressPreserved(t *testing.T) {
+	clusterCfg := kubeadmapi.ClusterConfiguration{}
+	endpoint := kubeadmapi.APIEndpoint{
+		AdvertiseAddress: "1.2.3.4",
+	}
+
+	for _, bindAddress := range []string{
+		kubeadmapiv1.DefaultProxyBindAddressv4,
+		kubeadmapiv1.DefaultProxyBindAddressv6,
+		"10.0.0.5",
+	} {
+		t.Run(bindAddress, func(t *testing.T) {
+			got := &kubeProxyConfig{
+				configBase: configBase{
+					GroupVersion: kubeproxyconfig.SchemeGroupVersion,
+				},
+				config: kubeproxyconfig.KubeProxyConfiguration{
+					BindAddress: bindAddress,
+				},
+			}
+			got.Default(&clusterCfg, &endpoint, &kubeadmapi.NodeRegistrationOptions{})
+			if got.config.BindAddress != bindAddress {
+				t.Fatalf("expected bindAddress %q to be preserved, got %q", bindAddress, got.config.BindAddress)
 			}
 		})
 	}

@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -20,7 +20,6 @@ package kubelet
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,12 +28,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2/ktesting"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	"k8s.io/mount-utils"
 )
 
 func validateDirExists(dir string) error {
-	_, err := ioutil.ReadDir(dir)
+	_, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
@@ -42,7 +42,7 @@ func validateDirExists(dir string) error {
 }
 
 func validateDirNotExists(dir string) error {
-	_, err := ioutil.ReadDir(dir)
+	_, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -53,6 +53,10 @@ func validateDirNotExists(dir string) error {
 }
 
 func TestCleanupOrphanedPodDirs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
 	testCases := map[string]struct {
 		pods         []*v1.Pod
 		prepareFunc  func(kubelet *Kubelet) error
@@ -101,7 +105,17 @@ func TestCleanupOrphanedPodDirs(t *testing.T) {
 			},
 			validateFunc: func(kubelet *Kubelet) error {
 				podDir := kubelet.getPodDir("pod1uid")
-				return validateDirExists(filepath.Join(podDir, "volumes/plugin/name"))
+				return validateDirNotExists(podDir)
+			},
+		},
+		"pod-doesnot-exist-with-volume-subdir": {
+			prepareFunc: func(kubelet *Kubelet) error {
+				podDir := kubelet.getPodDir("pod1uid")
+				return os.MkdirAll(filepath.Join(podDir, "volumes/plugin/name/subdir"), 0750)
+			},
+			validateFunc: func(kubelet *Kubelet) error {
+				podDir := kubelet.getPodDir("pod1uid")
+				return validateDirNotExists(filepath.Join(podDir, "volumes"))
 			},
 		},
 		"pod-doesnot-exist-with-subpath": {
@@ -111,7 +125,7 @@ func TestCleanupOrphanedPodDirs(t *testing.T) {
 			},
 			validateFunc: func(kubelet *Kubelet) error {
 				podDir := kubelet.getPodDir("pod1uid")
-				return validateDirExists(filepath.Join(podDir, "volume-subpaths/volume/container/index"))
+				return validateDirNotExists(podDir)
 			},
 		},
 		"pod-doesnot-exist-with-subpath-top": {
@@ -121,7 +135,35 @@ func TestCleanupOrphanedPodDirs(t *testing.T) {
 			},
 			validateFunc: func(kubelet *Kubelet) error {
 				podDir := kubelet.getPodDir("pod1uid")
-				return validateDirExists(filepath.Join(podDir, "volume-subpaths"))
+				return validateDirNotExists(podDir)
+			},
+		},
+		"pod-doesnot-exists-with-populated-volume": {
+			prepareFunc: func(kubelet *Kubelet) error {
+				podDir := kubelet.getPodDir("pod1uid")
+				volumePath := filepath.Join(podDir, "volumes/plugin/name")
+				if err := os.MkdirAll(volumePath, 0750); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(volumePath, "test.txt"), []byte("test1"), 0640)
+			},
+			validateFunc: func(kubelet *Kubelet) error {
+				podDir := kubelet.getPodDir("pod1uid")
+				return validateDirExists(filepath.Join(podDir, "volumes/plugin/name"))
+			},
+		},
+		"pod-doesnot-exists-with-populated-subpath": {
+			prepareFunc: func(kubelet *Kubelet) error {
+				podDir := kubelet.getPodDir("pod1uid")
+				subPath := filepath.Join(podDir, "volume-subpaths/volume/container/index")
+				if err := os.MkdirAll(subPath, 0750); err != nil {
+					return err
+				}
+				return os.WriteFile(filepath.Join(subPath, "test.txt"), []byte("test1"), 0640)
+			},
+			validateFunc: func(kubelet *Kubelet) error {
+				podDir := kubelet.getPodDir("pod1uid")
+				return validateDirExists(filepath.Join(podDir, "volume-subpaths/volume/container/index"))
 			},
 		},
 		// TODO: test volume in volume-manager
@@ -129,6 +171,7 @@ func TestCleanupOrphanedPodDirs(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			logger, _ := ktesting.NewTestContext(t)
 			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
 			defer testKubelet.Cleanup()
 			kubelet := testKubelet.kubelet
@@ -139,7 +182,7 @@ func TestCleanupOrphanedPodDirs(t *testing.T) {
 				}
 			}
 
-			err := kubelet.cleanupOrphanedPodDirs(tc.pods, nil)
+			err := kubelet.cleanupOrphanedPodDirs(logger, tc.pods, nil)
 			if tc.expectErr && err == nil {
 				t.Errorf("%s failed: expected error, got success", name)
 			}
@@ -251,6 +294,7 @@ func TestPodVolumesExistWithMount(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			logger, _ := ktesting.NewTestContext(t)
 			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
 			defer testKubelet.Cleanup()
 			kubelet := testKubelet.kubelet
@@ -261,7 +305,7 @@ func TestPodVolumesExistWithMount(t *testing.T) {
 				}
 			}
 
-			exist := kubelet.podVolumesExist(poduid)
+			exist := kubelet.podVolumesExist(logger, poduid)
 			if tc.expected != exist {
 				t.Errorf("%s failed: expected %t, got %t", name, tc.expected, exist)
 			}

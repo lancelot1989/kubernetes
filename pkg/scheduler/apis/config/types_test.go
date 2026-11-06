@@ -17,276 +17,68 @@ limitations under the License.
 package config
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-func TestPluginsAppend(t *testing.T) {
+func TestPluginsNames(t *testing.T) {
 	tests := []struct {
-		name            string
-		customPlugins   *Plugins
-		defaultPlugins  *Plugins
-		expectedPlugins *Plugins
+		name    string
+		plugins *Plugins
+		want    []string
 	}{
 		{
-			name: "AppendPlugin",
-			customPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "CustomPlugin"},
-					},
-				},
-			},
-			defaultPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			expectedPlugins: &Plugins{
-				QueueSort: &PluginSet{},
-				PreFilter: &PluginSet{},
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-						{Name: "CustomPlugin"},
-					},
-				},
-				PostFilter: &PluginSet{},
-				PreScore:   &PluginSet{},
-				Score:      &PluginSet{},
-				Reserve:    &PluginSet{},
-				Permit:     &PluginSet{},
-				PreBind:    &PluginSet{},
-				Bind:       &PluginSet{},
-				PostBind:   &PluginSet{},
-			},
+			name: "empty",
 		},
 		{
-			name:            "AppendNilPlugin",
-			customPlugins:   nil,
-			defaultPlugins:  &Plugins{},
-			expectedPlugins: &Plugins{},
+			name: "with duplicates",
+			plugins: &Plugins{
+				Filter: PluginSet{
+					Enabled: []Plugin{
+						{Name: "CustomFilter"},
+					},
+				},
+				PreFilter: PluginSet{
+					Enabled: []Plugin{
+						{Name: "CustomFilter"},
+					},
+				},
+				Score: PluginSet{
+					Enabled: []Plugin{
+						{Name: "CustomScore"},
+					},
+				},
+			},
+			want: []string{"CustomFilter", "CustomScore"},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			test.defaultPlugins.Append(test.customPlugins)
-			if d := cmp.Diff(test.expectedPlugins, test.defaultPlugins); d != "" {
+			if d := cmp.Diff(test.want, test.plugins.Names()); d != "" {
 				t.Fatalf("plugins mismatch (-want +got):\n%s", d)
 			}
 		})
 	}
 }
 
-func TestPluginsApply(t *testing.T) {
-	tests := []struct {
-		name            string
-		customPlugins   *Plugins
-		defaultPlugins  *Plugins
-		expectedPlugins *Plugins
-	}{
-		{
-			name: "AppendCustomPlugin",
-			customPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "CustomPlugin"},
-					},
-				},
-			},
-			defaultPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			expectedPlugins: &Plugins{
-				QueueSort: &PluginSet{Enabled: []Plugin{}},
-				PreFilter: &PluginSet{Enabled: []Plugin{}},
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-						{Name: "CustomPlugin"},
-					},
-				},
-				PostFilter: &PluginSet{Enabled: []Plugin{}},
-				PreScore:   &PluginSet{Enabled: []Plugin{}},
-				Score:      &PluginSet{Enabled: []Plugin{}},
-				Reserve:    &PluginSet{Enabled: []Plugin{}},
-				Permit:     &PluginSet{Enabled: []Plugin{}},
-				PreBind:    &PluginSet{Enabled: []Plugin{}},
-				Bind:       &PluginSet{Enabled: []Plugin{}},
-				PostBind:   &PluginSet{Enabled: []Plugin{}},
-			},
-		},
-		{
-			name: "InsertAfterDefaultPlugins2",
-			customPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "CustomPlugin"},
-						{Name: "DefaultPlugin2"},
-					},
-					Disabled: []Plugin{
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			defaultPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			expectedPlugins: &Plugins{
-				QueueSort: &PluginSet{Enabled: []Plugin{}},
-				PreFilter: &PluginSet{Enabled: []Plugin{}},
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "CustomPlugin"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-				PostFilter: &PluginSet{Enabled: []Plugin{}},
-				PreScore:   &PluginSet{Enabled: []Plugin{}},
-				Score:      &PluginSet{Enabled: []Plugin{}},
-				Reserve:    &PluginSet{Enabled: []Plugin{}},
-				Permit:     &PluginSet{Enabled: []Plugin{}},
-				PreBind:    &PluginSet{Enabled: []Plugin{}},
-				Bind:       &PluginSet{Enabled: []Plugin{}},
-				PostBind:   &PluginSet{Enabled: []Plugin{}},
-			},
-		},
-		{
-			name: "InsertBeforeAllPlugins",
-			customPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "CustomPlugin"},
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-					Disabled: []Plugin{
-						{Name: "*"},
-					},
-				},
-			},
-			defaultPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			expectedPlugins: &Plugins{
-				QueueSort: &PluginSet{Enabled: []Plugin{}},
-				PreFilter: &PluginSet{Enabled: []Plugin{}},
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "CustomPlugin"},
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-				PostFilter: &PluginSet{Enabled: []Plugin{}},
-				PreScore:   &PluginSet{Enabled: []Plugin{}},
-				Score:      &PluginSet{Enabled: []Plugin{}},
-				Reserve:    &PluginSet{Enabled: []Plugin{}},
-				Permit:     &PluginSet{Enabled: []Plugin{}},
-				PreBind:    &PluginSet{Enabled: []Plugin{}},
-				Bind:       &PluginSet{Enabled: []Plugin{}},
-				PostBind:   &PluginSet{Enabled: []Plugin{}},
-			},
-		},
-		{
-			name: "ReorderDefaultPlugins",
-			customPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin2"},
-						{Name: "DefaultPlugin1"},
-					},
-					Disabled: []Plugin{
-						{Name: "*"},
-					},
-				},
-			},
-			defaultPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			expectedPlugins: &Plugins{
-				QueueSort: &PluginSet{Enabled: []Plugin{}},
-				PreFilter: &PluginSet{Enabled: []Plugin{}},
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin2"},
-						{Name: "DefaultPlugin1"},
-					},
-				},
-				PostFilter: &PluginSet{Enabled: []Plugin{}},
-				PreScore:   &PluginSet{Enabled: []Plugin{}},
-				Score:      &PluginSet{Enabled: []Plugin{}},
-				Reserve:    &PluginSet{Enabled: []Plugin{}},
-				Permit:     &PluginSet{Enabled: []Plugin{}},
-				PreBind:    &PluginSet{Enabled: []Plugin{}},
-				Bind:       &PluginSet{Enabled: []Plugin{}},
-				PostBind:   &PluginSet{Enabled: []Plugin{}},
-			},
-		},
-		{
-			name:          "ApplyNilCustomPlugin",
-			customPlugins: nil,
-			defaultPlugins: &Plugins{
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-			},
-			expectedPlugins: &Plugins{
-				QueueSort: nil,
-				PreFilter: nil,
-				Filter: &PluginSet{
-					Enabled: []Plugin{
-						{Name: "DefaultPlugin1"},
-						{Name: "DefaultPlugin2"},
-					},
-				},
-				PreScore: nil,
-				Score:    nil,
-				Reserve:  nil,
-				Permit:   nil,
-				PreBind:  nil,
-				Bind:     nil,
-				PostBind: nil,
-			},
-		},
+func TestPluginsNamesAllExtensionPoints(t *testing.T) {
+	plugins := &Plugins{}
+	val := reflect.ValueOf(plugins).Elem()
+
+	want := sets.New[string]()
+	for i := 0; i < val.NumField(); i++ {
+		name := val.Type().Field(i).Name
+		val.Field(i).Set(reflect.ValueOf(PluginSet{
+			Enabled: []Plugin{{Name: name}},
+		}))
+		want.Insert(name)
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			test.defaultPlugins.Apply(test.customPlugins)
-			if d := cmp.Diff(test.expectedPlugins, test.defaultPlugins); d != "" {
-				t.Fatalf("plugins mismatch (-want +got):\n%s", d)
-			}
-		})
+	gotNames := plugins.Names()
+	if diff := cmp.Diff(sets.List(want), gotNames); diff != "" {
+		t.Errorf("plugins.Names() doesn't contain all extension points (-want,+got):\n%s", diff)
 	}
 }

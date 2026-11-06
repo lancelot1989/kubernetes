@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2020 The Kubernetes Authors.
@@ -26,6 +26,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 	"github.com/stretchr/testify/assert"
+	"k8s.io/klog/v2/ktesting"
 )
 
 type fakeDBusObject struct {
@@ -71,6 +72,10 @@ func (obj *fakeDBusObject) SetProperty(p string, v interface{}) error {
 	return nil
 }
 
+func (obj *fakeDBusObject) StoreProperty(p string, v interface{}) error {
+	return nil
+}
+
 func (obj *fakeDBusObject) Destination() string {
 	return ""
 }
@@ -93,6 +98,10 @@ func (f *fakeSystemDBus) Signal(ch chan<- *dbus.Signal) {
 }
 
 func (f *fakeSystemDBus) AddMatchSignal(options ...dbus.MatchOption) error {
+	return nil
+}
+
+func (f *fakeSystemDBus) Close() error {
 	return nil
 }
 
@@ -140,6 +149,7 @@ func TestReloadLogindConf(t *testing.T) {
 }
 
 func TestMonitorShutdown(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	var tests = []struct {
 		desc           string
 		shutdownActive bool
@@ -161,7 +171,7 @@ func TestMonitorShutdown(t *testing.T) {
 				SystemBus: fakeSystemBus,
 			}
 
-			outChan, err := bus.MonitorShutdown()
+			outChan, err := bus.MonitorShutdown(logger)
 			assert.NoError(t, err)
 
 			done := make(chan bool)

@@ -17,106 +17,129 @@ limitations under the License.
 package framework
 
 import (
-	"errors"
+	"fmt"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/util/sets"
+	fwk "k8s.io/kube-scheduler/framework"
+	st "k8s.io/kubernetes/pkg/scheduler/testing"
 )
 
-func TestStatus(t *testing.T) {
+type nodeInfoLister []fwk.NodeInfo
+
+func (nodes nodeInfoLister) Get(nodeName string) (fwk.NodeInfo, error) {
+	for _, node := range nodes {
+		if node != nil && node.Node().Name == nodeName {
+			return node, nil
+		}
+	}
+	return nil, fmt.Errorf("unable to find node: %s", nodeName)
+}
+
+func (nodes nodeInfoLister) List() ([]fwk.NodeInfo, error) {
+	return nodes, nil
+}
+
+func (nodes nodeInfoLister) HavePodsWithAffinityList() ([]fwk.NodeInfo, error) {
+	return nodes, nil
+}
+
+func (nodes nodeInfoLister) HavePodsWithRequiredAntiAffinityList() ([]fwk.NodeInfo, error) {
+	return nodes, nil
+}
+
+func (nodes nodeInfoLister) HavePodsWithRequiredNonHostScopedAntiAffinityList() ([]fwk.NodeInfo, error) {
+	return nodes, nil
+}
+
+func TestNodesForStatusCode(t *testing.T) {
+	// Prepare 4 nodes names.
+	nodeNames := []string{"node1", "node2", "node3", "node4"}
 	tests := []struct {
-		status            *Status
-		expectedCode      Code
-		expectedMessage   string
-		expectedIsSuccess bool
-		expectedAsError   error
+		name          string
+		nodesStatuses *NodeToStatus
+		code          fwk.Code
+		expected      sets.Set[string] // set of expected node names.
 	}{
 		{
-			status:            NewStatus(Success, ""),
-			expectedCode:      Success,
-			expectedMessage:   "",
-			expectedIsSuccess: true,
-			expectedAsError:   nil,
+			name: "No node should be attempted",
+			nodesStatuses: NewNodeToStatus(map[string]*fwk.Status{
+				"node1": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node2": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node3": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node4": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+			}, fwk.NewStatus(fwk.UnschedulableAndUnresolvable)),
+			code:     fwk.Unschedulable,
+			expected: sets.New[string](),
 		},
 		{
-			status:            NewStatus(Error, "unknown error"),
-			expectedCode:      Error,
-			expectedMessage:   "unknown error",
-			expectedIsSuccess: false,
-			expectedAsError:   errors.New("unknown error"),
+			name: "All nodes should be attempted",
+			nodesStatuses: NewNodeToStatus(map[string]*fwk.Status{
+				"node1": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node2": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node3": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node4": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+			}, fwk.NewStatus(fwk.UnschedulableAndUnresolvable)),
+			code:     fwk.UnschedulableAndUnresolvable,
+			expected: sets.New[string]("node1", "node2", "node3", "node4"),
 		},
 		{
-			status:            nil,
-			expectedCode:      Success,
-			expectedMessage:   "",
-			expectedIsSuccess: true,
-			expectedAsError:   nil,
+			name:          "No node should be attempted, as all are implicitly not matching the code",
+			nodesStatuses: NewDefaultNodeToStatus(),
+			code:          fwk.Unschedulable,
+			expected:      sets.New[string](),
+		},
+		{
+			name:          "All nodes should be attempted, as all are implicitly matching the code",
+			nodesStatuses: NewDefaultNodeToStatus(),
+			code:          fwk.UnschedulableAndUnresolvable,
+			expected:      sets.New[string]("node1", "node2", "node3", "node4"),
+		},
+		{
+			name: "UnschedulableAndUnresolvable status should be skipped but Unschedulable should be tried",
+			nodesStatuses: NewNodeToStatus(map[string]*fwk.Status{
+				"node1": fwk.NewStatus(fwk.Unschedulable),
+				"node2": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node3": fwk.NewStatus(fwk.Unschedulable),
+				// node4 is UnschedulableAndUnresolvable by absence
+			}, fwk.NewStatus(fwk.UnschedulableAndUnresolvable)),
+			code:     fwk.Unschedulable,
+			expected: sets.New("node1", "node3"),
+		},
+		{
+			name: "Unschedulable status should be skipped but UnschedulableAndUnresolvable should be tried",
+			nodesStatuses: NewNodeToStatus(map[string]*fwk.Status{
+				"node1": fwk.NewStatus(fwk.Unschedulable),
+				"node2": fwk.NewStatus(fwk.UnschedulableAndUnresolvable),
+				"node3": fwk.NewStatus(fwk.Unschedulable),
+				// node4 is UnschedulableAndUnresolvable by absence
+			}, fwk.NewStatus(fwk.UnschedulableAndUnresolvable)),
+			code:     fwk.UnschedulableAndUnresolvable,
+			expected: sets.New("node2", "node4"),
 		},
 	}
 
-	for i, test := range tests {
-		if test.status.Code() != test.expectedCode {
-			t.Errorf("test #%v, expect status.Code() returns %v, but %v", i, test.expectedCode, test.status.Code())
-		}
-
-		if test.status.Message() != test.expectedMessage {
-			t.Errorf("test #%v, expect status.Message() returns %v, but %v", i, test.expectedMessage, test.status.Message())
-		}
-
-		if test.status.IsSuccess() != test.expectedIsSuccess {
-			t.Errorf("test #%v, expect status.IsSuccess() returns %v, but %v", i, test.expectedIsSuccess, test.status.IsSuccess())
-		}
-
-		if test.status.AsError() == test.expectedAsError {
-			continue
-		}
-
-		if test.status.AsError().Error() != test.expectedAsError.Error() {
-			t.Errorf("test #%v, expect status.AsError() returns %v, but %v", i, test.expectedAsError, test.status.AsError())
-		}
-	}
-}
-
-// The String() method relies on the value and order of the status codes to function properly.
-func TestStatusCodes(t *testing.T) {
-	assertStatusCode(t, Success, 0)
-	assertStatusCode(t, Error, 1)
-	assertStatusCode(t, Unschedulable, 2)
-	assertStatusCode(t, UnschedulableAndUnresolvable, 3)
-	assertStatusCode(t, Wait, 4)
-	assertStatusCode(t, Skip, 5)
-}
-
-func assertStatusCode(t *testing.T, code Code, value int) {
-	if int(code) != value {
-		t.Errorf("Status code %q should have a value of %v but got %v", code.String(), value, int(code))
-	}
-}
-
-func TestPluginToStatusMerge(t *testing.T) {
-	tests := []struct {
-		statusMap PluginToStatus
-		wantCode  Code
-	}{
-		{
-			statusMap: PluginToStatus{"p1": NewStatus(Error), "p2": NewStatus(Unschedulable)},
-			wantCode:  Error,
-		},
-		{
-			statusMap: PluginToStatus{"p1": NewStatus(Success), "p2": NewStatus(Unschedulable)},
-			wantCode:  Unschedulable,
-		},
-		{
-			statusMap: PluginToStatus{"p1": NewStatus(Success), "p2": NewStatus(UnschedulableAndUnresolvable), "p3": NewStatus(Unschedulable)},
-			wantCode:  UnschedulableAndUnresolvable,
-		},
-		{
-			wantCode: Success,
-		},
-	}
-
-	for i, test := range tests {
-		gotStatus := test.statusMap.Merge()
-		if test.wantCode != gotStatus.Code() {
-			t.Errorf("test #%v, wantCode %v, gotCode %v", i, test.wantCode, gotStatus.Code())
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var nodeInfos nodeInfoLister
+			for _, name := range nodeNames {
+				ni := NewNodeInfo()
+				ni.SetNode(st.MakeNode().Name(name).Obj())
+				nodeInfos = append(nodeInfos, ni)
+			}
+			nodes, err := tt.nodesStatuses.NodesForStatusCode(nodeInfos, tt.code)
+			if err != nil {
+				t.Fatalf("Failed to get nodes for status code: %s", err)
+			}
+			if len(tt.expected) != len(nodes) {
+				t.Errorf("Number of nodes is not the same as expected. expected: %d, got: %d. Nodes: %v", len(tt.expected), len(nodes), nodes)
+			}
+			for _, node := range nodes {
+				name := node.Node().Name
+				if _, found := tt.expected[name]; !found {
+					t.Errorf("Node %v is not expected", name)
+				}
+			}
+		})
 	}
 }

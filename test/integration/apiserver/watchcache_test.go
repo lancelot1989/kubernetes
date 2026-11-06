@@ -17,33 +17,45 @@ limitations under the License.
 package apiserver
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	stdruntime "runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer/protobuf"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apiserver/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	storagetesting "k8s.io/apiserver/pkg/storage/testing"
 	clientset "k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/kubernetes/pkg/controlplane"
 	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
 	"k8s.io/kubernetes/test/integration/framework"
+	netutils "k8s.io/utils/net"
 )
 
 // setup create kube-apiserver backed up by two separate etcds,
 // with one of them containing events and the other all other objects.
-func multiEtcdSetup(t testing.TB) (clientset.Interface, framework.CloseFunc) {
-	etcdArgs := []string{"--experimental-watch-progress-notify-interval", "1s"}
-	etcd0URL, stopEtcd0, err := framework.RunCustomEtcd("etcd_watchcache0", etcdArgs)
+func multiEtcdSetup(ctx context.Context, t *testing.T) (clientset.Interface, framework.TearDownFunc) {
+	etcdArgs := []string{"--watch-progress-notify-interval", "1s"}
+	etcd0URL, stopEtcd0, err := framework.RunCustomEtcd(klog.FromContext(ctx).WithName("etcd0"), "etcd_watchcache0", etcdArgs)
 	if err != nil {
 		t.Fatalf("Couldn't start etcd: %v", err)
 	}
 
-	etcd1URL, stopEtcd1, err := framework.RunCustomEtcd("etcd_watchcache1", etcdArgs)
+	etcd1URL, stopEtcd1, err := framework.RunCustomEtcd(klog.FromContext(ctx).WithName("etcd1"), "etcd_watchcache1", etcdArgs)
 	if err != nil {
 		t.Fatalf("Couldn't start etcd: %v", err)
 	}
@@ -54,28 +66,27 @@ func multiEtcdSetup(t testing.TB) (clientset.Interface, framework.CloseFunc) {
 	etcdOptions.EtcdServersOverrides = []string{fmt.Sprintf("/events#%s", etcd1URL)}
 	etcdOptions.EnableWatchCache = true
 
-	opts := framework.MasterConfigOptions{EtcdOptions: etcdOptions}
-	masterConfig := framework.NewIntegrationTestMasterConfigWithOptions(&opts)
-	// Switch off endpoints reconciler to avoid unnecessary operations.
-	masterConfig.ExtraConfig.EndpointReconcilerType = reconcilers.NoneEndpointReconcilerType
-	_, s, stopMaster := framework.RunAMaster(masterConfig)
+	clientSet, _, tearDownFn := framework.StartTestServer(ctx, t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Ensure we're using the same etcd across apiserver restarts.
+			opts.Etcd = etcdOptions
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			// Switch off endpoints reconciler to avoid unnecessary operations.
+			config.Extra.EndpointReconcilerType = reconcilers.NoneEndpointReconcilerType
+		},
+	})
 
 	closeFn := func() {
-		stopMaster()
+		tearDownFn()
 		stopEtcd1()
 		stopEtcd0()
 	}
 
-	clientSet, err := clientset.NewForConfig(&restclient.Config{Host: s.URL, QPS: -1})
-	if err != nil {
-		t.Fatalf("Error in create clientset: %v", err)
-	}
-
 	// Wait for apiserver to be stabilized.
-	// Everything but default service creation is checked in RunAMaster above by
+	// Everything but default service creation is checked in StartTestServer above by
 	// waiting for post start hooks, so we just wait for default service to exist.
 	// TODO(wojtek-t): Figure out less fragile way.
-	ctx := context.Background()
 	if err := wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
 		_, err := clientSet.CoreV1().Services("default").Get(ctx, "kubernetes", metav1.GetOptions{})
 		return err == nil, nil
@@ -86,12 +97,9 @@ func multiEtcdSetup(t testing.TB) (clientset.Interface, framework.CloseFunc) {
 }
 
 func TestWatchCacheUpdatedByEtcd(t *testing.T) {
-	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.EfficientWatchResumption, true)()
-
-	c, closeFn := multiEtcdSetup(t)
+	tCtx := ktesting.Init(t)
+	c, closeFn := multiEtcdSetup(tCtx, t)
 	defer closeFn()
-
-	ctx := context.Background()
 
 	makeConfigMap := func(name string) *v1.ConfigMap {
 		return &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name}}
@@ -103,11 +111,11 @@ func TestWatchCacheUpdatedByEtcd(t *testing.T) {
 		return &v1.Event{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	}
 
-	cm, err := c.CoreV1().ConfigMaps("default").Create(ctx, makeConfigMap("name"), metav1.CreateOptions{})
+	cm, err := c.CoreV1().ConfigMaps("default").Create(tCtx, makeConfigMap("name"), metav1.CreateOptions{})
 	if err != nil {
 		t.Errorf("Couldn't create configmap: %v", err)
 	}
-	ev, err := c.CoreV1().Events("default").Create(ctx, makeEvent("name"), metav1.CreateOptions{})
+	ev, err := c.CoreV1().Events("default").Create(tCtx, makeEvent("name"), metav1.CreateOptions{})
 	if err != nil {
 		t.Errorf("Couldn't create event: %v", err)
 	}
@@ -121,7 +129,7 @@ func TestWatchCacheUpdatedByEtcd(t *testing.T) {
 	// resources (being the last updates).
 	t.Logf("Waiting for configmaps watchcache synced to %s", cm.ResourceVersion)
 	if err := wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		res, err := c.CoreV1().ConfigMaps("default").List(ctx, listOptions)
+		res, err := c.CoreV1().ConfigMaps("default").List(tCtx, listOptions)
 		if err != nil {
 			return false, nil
 		}
@@ -131,7 +139,7 @@ func TestWatchCacheUpdatedByEtcd(t *testing.T) {
 	}
 	t.Logf("Waiting for events watchcache synced to %s", ev.ResourceVersion)
 	if err := wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		res, err := c.CoreV1().Events("default").List(ctx, listOptions)
+		res, err := c.CoreV1().Events("default").List(tCtx, listOptions)
 		if err != nil {
 			return false, nil
 		}
@@ -142,14 +150,14 @@ func TestWatchCacheUpdatedByEtcd(t *testing.T) {
 
 	// Create a secret, that is stored in the same etcd as configmap, but
 	// different than events.
-	se, err := c.CoreV1().Secrets("default").Create(ctx, makeSecret("name"), metav1.CreateOptions{})
+	se, err := c.CoreV1().Secrets("default").Create(tCtx, makeSecret("name"), metav1.CreateOptions{})
 	if err != nil {
 		t.Errorf("Couldn't create secret: %v", err)
 	}
 
 	t.Logf("Waiting for configmaps watchcache synced to %s", se.ResourceVersion)
 	if err := wait.Poll(100*time.Millisecond, wait.ForeverTestTimeout, func() (bool, error) {
-		res, err := c.CoreV1().ConfigMaps("default").List(ctx, listOptions)
+		res, err := c.CoreV1().ConfigMaps("default").List(tCtx, listOptions)
 		if err != nil {
 			return false, nil
 		}
@@ -159,12 +167,258 @@ func TestWatchCacheUpdatedByEtcd(t *testing.T) {
 	}
 	t.Logf("Waiting for events watchcache NOT synced to %s", se.ResourceVersion)
 	if err := wait.Poll(100*time.Millisecond, 5*time.Second, func() (bool, error) {
-		res, err := c.CoreV1().Events("default").List(ctx, listOptions)
+		res, err := c.CoreV1().Events("default").List(tCtx, listOptions)
 		if err != nil {
 			return false, nil
 		}
 		return res.ResourceVersion == se.ResourceVersion, nil
-	}); err == nil || err != wait.ErrWaitTimeout {
+	}); err == nil || !wait.Interrupted(err) {
 		t.Errorf("Events watchcache unexpected synced: %v", err)
 	}
+}
+
+func BenchmarkListFromWatchCache(b *testing.B) {
+	tCtx := ktesting.Init(b)
+	c, _, tearDownFn := framework.StartTestServer(tCtx, b, framework.TestServerSetup{
+		ModifyServerConfig: func(config *controlplane.Config) {
+			// Switch off endpoints reconciler to avoid unnecessary operations.
+			config.Extra.EndpointReconcilerType = reconcilers.NoneEndpointReconcilerType
+		},
+	})
+	defer tearDownFn()
+
+	namespaces, secretsPerNamespace := 100, 1000
+	wg := sync.WaitGroup{}
+
+	errCh := make(chan error, namespaces)
+	for index := range namespaces {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			ns := &v1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("namespace-%d", index)},
+			}
+			ns, err := c.CoreV1().Namespaces().Create(tCtx, ns, metav1.CreateOptions{})
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			for j := range secretsPerNamespace {
+				secret := &v1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: fmt.Sprintf("secret-%d", j),
+					},
+				}
+				_, err := c.CoreV1().Secrets(ns.Name).Create(tCtx, secret, metav1.CreateOptions{})
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		b.Error(err)
+	}
+
+	b.ResetTimer()
+
+	opts := metav1.ListOptions{
+		ResourceVersion: "0",
+	}
+	for i := 0; i < b.N; i++ {
+		secrets, err := c.CoreV1().Secrets("").List(tCtx, opts)
+		if err != nil {
+			b.Errorf("failed to list secrets: %v", err)
+		}
+		b.Logf("Number of secrets: %d", len(secrets.Items))
+	}
+}
+
+func BenchmarkPodListVsWatchList(b *testing.B) {
+	klog.SetLogger(logr.Discard())
+	tCtx := context.Background()
+	_, clientConfig, tearDownFn := framework.StartTestServer(tCtx, b, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			opts.GenericServerRunOptions.AdvertiseAddress = netutils.ParseIPSloppy("127.0.0.1")
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+		},
+		ModifyServerConfig: func(config *controlplane.Config) {
+			config.Extra.EndpointReconcilerType = reconcilers.NoneEndpointReconcilerType
+		},
+	})
+	defer tearDownFn()
+
+	cfg := rest.CopyConfig(clientConfig)
+	cfg.ContentConfig.AcceptContentTypes = runtime.ContentTypeProtobuf
+	cfg.ContentConfig.ContentType = runtime.ContentTypeProtobuf
+	cfg.QPS = -1
+	c, err := clientset.NewForConfig(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	httpClient, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	namespaces := 100
+	podsPerNamespace := 100
+	totalPods := namespaces * podsPerNamespace
+	data := storagetesting.PrepareBenchmarkData(namespaces, podsPerNamespace, 50)
+
+	for _, nsName := range data.NamespaceNames {
+		ns := &v1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: nsName},
+		}
+		if _, err := c.CoreV1().Namespaces().Create(tCtx, ns, metav1.CreateOptions{}); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, totalPods)
+	sem := make(chan struct{}, 50)
+	for _, pod := range data.Pods {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(p *v1.Pod) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			status := p.Status
+			created, err := c.CoreV1().Pods(p.Namespace).Create(tCtx, p, metav1.CreateOptions{FieldManager: "kube-controller-manager"})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			created.Status = status
+			if _, err := c.CoreV1().Pods(p.Namespace).UpdateStatus(tCtx, created, metav1.UpdateOptions{FieldManager: "kubelet"}); err != nil {
+				errCh <- err
+				return
+			}
+		}(pod)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		b.Fatal(err)
+	}
+
+	// Wait until all pods are present in the watch cache.
+	if err := wait.PollUntilContextTimeout(tCtx, 100*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		list, err := c.CoreV1().Pods("").List(ctx, metav1.ListOptions{ResourceVersion: "0"})
+		if err != nil {
+			return false, err
+		}
+		return len(list.Items) == totalPods, nil
+	}); err != nil {
+		b.Fatalf("failed waiting for watch cache to sync %d pods: %v", totalPods, err)
+	}
+
+	// Measure single pod protobuf wire size by fetching one pod raw.
+	firstPod := data.Pods[0]
+	singleRaw, err := c.CoreV1().RESTClient().Get().Namespace(firstPod.Namespace).Resource("pods").Name(firstPod.Name).DoRaw(tCtx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Logf("Single pod protobuf wire size: %d bytes (%d pods total = %.2f MB)", len(singleRaw), totalPods, float64(len(singleRaw)*totalPods)/(1024*1024))
+
+	listURL := strings.TrimRight(cfg.Host, "/") + "/api/v1/pods?resourceVersion=0"
+	watchListURL := strings.TrimRight(cfg.Host, "/") + "/api/v1/pods?watch=true&sendInitialEvents=true&allowWatchBookmarks=true&resourceVersion=0&resourceVersionMatch=NotOlderThan"
+
+	runList := func(copyBuf []byte) {
+		req, err := http.NewRequestWithContext(tCtx, http.MethodGet, listURL, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		req.Header.Set("Accept", runtime.ContentTypeProtobuf)
+		req.Header.Set("Accept-Encoding", "identity")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}()
+		if resp.StatusCode != http.StatusOK {
+			b.Fatalf("unexpected status code: %d", resp.StatusCode)
+		}
+		n, err := io.CopyBuffer(io.Discard, resp.Body, copyBuf)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n < int64(totalPods*len(singleRaw)/2) {
+			b.Fatalf("unexpectedly small list response: %d bytes", n)
+		}
+	}
+
+	bookmarkMarker := []byte(metav1.InitialEventsAnnotationKey)
+	runWatchList := func(frameBuf []byte) {
+		reqCtx, cancel := context.WithCancel(tCtx)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, watchListURL, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		req.Header.Set("Accept", runtime.ContentTypeProtobuf)
+		req.Header.Set("Accept-Encoding", "identity")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}()
+		if resp.StatusCode != http.StatusOK {
+			b.Fatalf("unexpected status code: %d", resp.StatusCode)
+		}
+		frameReader := protobuf.LengthDelimitedFramer.NewFrameReader(resp.Body)
+		received := 0
+		for {
+			n, err := frameReader.Read(frameBuf)
+			if err != nil {
+				b.Fatalf("error reading watch frame after %d events: %v", received, err)
+			}
+			if bytes.Contains(frameBuf[:n], bookmarkMarker) {
+				break
+			}
+			received++
+		}
+		if received != totalPods {
+			b.Fatalf("expected %d initial events before bookmark, got %d", totalPods, received)
+		}
+	}
+
+	b.Run("List", func(b *testing.B) {
+		b.ReportAllocs()
+		copyBuf := make([]byte, 64*1024)
+		runList(copyBuf)
+		stdruntime.GC()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			runList(copyBuf)
+		}
+		b.ReportMetric(float64(len(singleRaw)), "pod-proto-B")
+	})
+
+	b.Run("WatchList", func(b *testing.B) {
+		b.ReportAllocs()
+		frameBuf := make([]byte, 64*1024)
+		runWatchList(frameBuf)
+		stdruntime.GC()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			runWatchList(frameBuf)
+		}
+		b.ReportMetric(float64(len(singleRaw)), "pod-proto-B")
+	})
 }

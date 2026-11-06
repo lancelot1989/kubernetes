@@ -32,6 +32,10 @@ func NewNoneEndpointReconciler() EndpointReconciler {
 	return &noneEndpointReconciler{}
 }
 
+func (r *noneEndpointReconciler) ValidateIP(ip net.IP) error {
+	return nil
+}
+
 // ReconcileEndpoints noop reconcile
 func (r *noneEndpointReconciler) ReconcileEndpoints(serviceName string, ip net.IP, endpointPorts []corev1.EndpointPort, reconcilePorts bool) error {
 	return nil
@@ -43,4 +47,7 @@ func (r *noneEndpointReconciler) RemoveEndpoints(serviceName string, ip net.IP, 
 }
 
 func (r *noneEndpointReconciler) StopReconciling() {
+}
+
+func (r *noneEndpointReconciler) Destroy() {
 }

@@ -19,9 +19,12 @@ package storageversion
 import (
 	"context"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/apis/apiserverinternal"
@@ -30,16 +33,28 @@ import (
 
 // storageVersionStrategy implements verification logic for StorageVersion.
 type storageVersionStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating StorageVersion objects.
-var Strategy = storageVersionStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = storageVersionStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped returns false because all StorageVersion's need to be cluster scoped
 func (storageVersionStrategy) NamespaceScoped() bool {
 	return false
+}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (storageVersionStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"internal.apiserver.k8s.io/v1alpha1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
 }
 
 // PrepareForCreate clears the status of an StorageVersion before creation.
@@ -60,12 +75,17 @@ func (storageVersionStrategy) Validate(ctx context.Context, obj runtime.Object) 
 	return validation.ValidateStorageVersion(sv)
 }
 
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (storageVersionStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	return nil
+}
+
 // Canonicalize normalizes the object after validation.
 func (storageVersionStrategy) Canonicalize(obj runtime.Object) {
 }
 
-//  Does not allow creating a StorageVersion object with a PUT request.
-func (storageVersionStrategy) AllowCreateOnUpdate() bool {
+// Does not allow creating a StorageVersion object with a PUT request.
+func (storageVersionStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -77,9 +97,14 @@ func (storageVersionStrategy) ValidateUpdate(ctx context.Context, obj, old runti
 	return validationErrorList
 }
 
+// WarningsOnUpdate returns warnings for the given update.
+func (storageVersionStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
 // AllowUnconditionalUpdate is the default update policy for storageVersion objects. Status update should
 // only be allowed if version match.
-func (storageVersionStrategy) AllowUnconditionalUpdate() bool {
+func (storageVersionStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return false
 }
 
@@ -89,6 +114,19 @@ type storageVersionStatusStrategy struct {
 
 // StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = storageVersionStatusStrategy{Strategy}
+
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (storageVersionStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"internal.apiserver.k8s.io/v1alpha1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("metadata"),
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+
+	return fields
+}
 
 func (storageVersionStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newSV := obj.(*apiserverinternal.StorageVersion)
@@ -100,4 +138,9 @@ func (storageVersionStatusStrategy) PrepareForUpdate(ctx context.Context, obj, o
 
 func (storageVersionStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateStorageVersionStatusUpdate(obj.(*apiserverinternal.StorageVersion), old.(*apiserverinternal.StorageVersion))
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (storageVersionStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }

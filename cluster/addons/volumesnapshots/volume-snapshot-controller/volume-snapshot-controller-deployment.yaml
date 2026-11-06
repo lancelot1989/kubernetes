@@ -22,6 +22,9 @@ spec:
       serviceAccount: volume-snapshot-controller
       containers:
         - name: volume-snapshot-controller
-          image: k8s.gcr.io/sig-storage/snapshot-controller:v3.0.2
+          image: registry.k8s.io/sig-storage/snapshot-controller:v8.6.0
           args:
             - "--v=5"
+            - "--metrics-path=/metrics"
+            - "--http-endpoint=:9102"
+            - "--feature-gates=CSIVolumeGroupSnapshot=true"

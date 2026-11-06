@@ -19,7 +19,6 @@ package credentialprovider
 import (
 	"encoding/base64"
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,7 +32,7 @@ func TestReadDockerConfigFile(t *testing.T) {
 	//test dockerconfig json
 	inputDockerconfigJSONFile := "{ \"auths\": { \"http://foo.example.com\":{\"auth\":\"Zm9vOmJhcgo=\",\"email\":\"foo@example.com\"}}}"
 
-	preferredPath, err := ioutil.TempDir("", "test_foo_bar_dockerconfigjson_")
+	preferredPath, err := os.MkdirTemp("", "test_foo_bar_dockerconfigjson_")
 	if err != nil {
 		t.Fatalf("Creating tmp dir fail: %v", err)
 		return
@@ -338,7 +337,7 @@ func TestReadDockerConfigFileFromBytes(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		cfg, err := readDockerConfigFileFromBytes(tc.input)
+		cfg, err := ReadDockerConfigFileFromBytes(tc.input)
 		if err != nil && !tc.errorExpected {
 			t.Fatalf("Error was not expected: %v", err)
 		}

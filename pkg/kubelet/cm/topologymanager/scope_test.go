@@ -17,13 +17,17 @@ limitations under the License.
 package topologymanager
 
 import (
-	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"reflect"
 	"testing"
+
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/ktesting"
+	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
 )
 
 func TestGetAffinity(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	tcases := []struct {
 		name          string
 		containerName string
@@ -39,7 +43,7 @@ func TestGetAffinity(t *testing.T) {
 	}
 	for _, tc := range tcases {
 		scope := scope{}
-		actual := scope.GetAffinity(tc.podUID, tc.containerName)
+		actual := scope.GetAffinity(logger, tc.podUID, tc.containerName)
 		if !reflect.DeepEqual(actual, tc.expected) {
 			t.Errorf("Expected Affinity in result to be %v, got %v", tc.expected, actual)
 		}
@@ -64,14 +68,13 @@ func TestAddContainer(t *testing.T) {
 		},
 	}
 	scope := scope{}
-	scope.podMap = make(map[string]string)
+	scope.podMap = containermap.NewContainerMap()
 	for _, tc := range testCases {
 		pod := v1.Pod{}
 		pod.UID = tc.podUID
-		err := scope.AddContainer(&pod, tc.containerID)
-		if err != nil {
-			t.Errorf("Expected error to be nil but got: %v", err)
-		}
+		container := v1.Container{}
+		container.Name = tc.name
+		scope.AddContainer(&pod, &container, tc.containerID)
 		if val, ok := scope.podMap[tc.containerID]; ok {
 			if reflect.DeepEqual(val, pod.UID) {
 				t.Errorf("Error occurred")
@@ -83,6 +86,7 @@ func TestAddContainer(t *testing.T) {
 }
 
 func TestRemoveContainer(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	testCases := []struct {
 		name        string
 		containerID string
@@ -100,18 +104,27 @@ func TestRemoveContainer(t *testing.T) {
 		},
 	}
 	var len1, len2 int
+	var lenHints1, lenHints2 int
 	scope := scope{}
-	scope.podMap = make(map[string]string)
+	scope.podMap = containermap.NewContainerMap()
+	scope.podTopologyHints = podTopologyHints{}
 	for _, tc := range testCases {
-		scope.podMap[tc.containerID] = string(tc.podUID)
+		scope.podMap.Add(string(tc.podUID), tc.name, tc.containerID)
+		scope.podTopologyHints[string(tc.podUID)] = make(map[string]TopologyHint)
+		scope.podTopologyHints[string(tc.podUID)][tc.name] = TopologyHint{}
 		len1 = len(scope.podMap)
-		err := scope.RemoveContainer(tc.containerID)
+		lenHints1 = len(scope.podTopologyHints)
+		err := scope.RemoveContainer(logger, tc.containerID)
 		len2 = len(scope.podMap)
+		lenHints2 = len(scope.podTopologyHints)
 		if err != nil {
 			t.Errorf("Expected error to be nil but got: %v", err)
 		}
 		if len1-len2 != 1 {
-			t.Errorf("Remove Pod resulted in error")
+			t.Errorf("Remove Pod from podMap resulted in error")
+		}
+		if lenHints1-lenHints2 != 1 {
+			t.Error("Remove Pod from podTopologyHints resulted in error")
 		}
 	}
 

@@ -21,13 +21,15 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/client-go/util/watchlist"
 )
 
 const (
@@ -59,6 +61,12 @@ func newUnstructuredWithSpec(spec map[string]interface{}) *unstructured.Unstruct
 	return u
 }
 
+func TestDoesClientSupportWatchListSemantics(t *testing.T) {
+	target := &FakeDynamicClient{}
+	if !watchlist.DoesClientNotSupportWatchListSemantics(target) {
+		t.Fatalf("FakeDynamicClient should NOT support WatchList semantics")
+	}
+}
 func TestGet(t *testing.T) {
 	scheme := runtime.NewScheme()
 
@@ -79,7 +87,7 @@ func TestGet(t *testing.T) {
 		},
 	}
 	if !equality.Semantic.DeepEqual(get, expected) {
-		t.Fatal(diff.ObjectGoPrintDiff(expected, get))
+		t.Fatal(cmp.Diff(expected, get))
 	}
 }
 
@@ -98,7 +106,7 @@ func TestListDecoding(t *testing.T) {
 		Items: []unstructured.Unstructured{},
 	}
 	if !equality.Semantic.DeepEqual(list, expectedList) {
-		t.Fatal(diff.ObjectGoPrintDiff(expectedList, list))
+		t.Fatal(cmp.Diff(expectedList, list))
 	}
 }
 
@@ -116,7 +124,7 @@ func TestGetDecoding(t *testing.T) {
 		},
 	}
 	if !equality.Semantic.DeepEqual(get, expectedObj) {
-		t.Fatal(diff.ObjectGoPrintDiff(expectedObj, get))
+		t.Fatal(cmp.Diff(expectedObj, get))
 	}
 }
 
@@ -144,7 +152,7 @@ func TestList(t *testing.T) {
 		*newUnstructured("group/version", "TheKind", "ns-foo", "name-foo"),
 	}
 	if !equality.Semantic.DeepEqual(listFirst.Items, expected) {
-		t.Fatal(diff.ObjectGoPrintDiff(expected, listFirst.Items))
+		t.Fatal(cmp.Diff(expected, listFirst.Items))
 	}
 }
 
@@ -177,7 +185,8 @@ func Test_ListKind(t *testing.T) {
 			"apiVersion": "group/version",
 			"kind":       "TheKindList",
 			"metadata": map[string]interface{}{
-				"resourceVersion": "",
+				"continue":        "",
+				"resourceVersion": "4", // Three objects created so far, starting value is 1.
 			},
 		},
 		Items: []unstructured.Unstructured{
@@ -187,7 +196,7 @@ func Test_ListKind(t *testing.T) {
 		},
 	}
 	if !equality.Semantic.DeepEqual(listFirst, expectedList) {
-		t.Fatal(diff.ObjectGoPrintDiff(expectedList, listFirst))
+		t.Fatal(cmp.Diff(expectedList, listFirst))
 	}
 }
 
@@ -240,7 +249,7 @@ func (tc *patchTestCase) verifyResult(result *unstructured.Unstructured) error {
 		return nil
 	}
 	if !equality.Semantic.DeepEqual(result, tc.expectedPatchedObject) {
-		return fmt.Errorf("unexpected diff in received object: %s", diff.ObjectGoPrintDiff(tc.expectedPatchedObject, result))
+		return fmt.Errorf("unexpected diff in received object: %s", cmp.Diff(tc.expectedPatchedObject, result))
 	}
 	return nil
 }
@@ -303,3 +312,168 @@ func TestPatch(t *testing.T) {
 		t.Run(tc.name, tc.runner)
 	}
 }
+
+// This test ensures list works when the fake dynamic client is seeded with a typed scheme and
+// unstructured type fixtures
+func TestListWithUnstructuredObjectsAndTypedScheme(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: testGroup, Version: testVersion, Resource: testResource}
+	gvk := gvr.GroupVersion().WithKind(testKind)
+
+	listGVK := gvk
+	listGVK.Kind += "List"
+
+	u := unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	u.SetName("name")
+	u.SetNamespace("namespace")
+
+	typedScheme := runtime.NewScheme()
+	typedScheme.AddKnownTypeWithName(gvk, &mockResource{})
+	typedScheme.AddKnownTypeWithName(listGVK, &mockResourceList{})
+
+	client := NewSimpleDynamicClient(typedScheme, &u)
+	list, err := client.Resource(gvr).Namespace("namespace").List(context.Background(), metav1.ListOptions{})
+
+	if err != nil {
+		t.Error("error listing", err)
+	}
+
+	expectedList := &unstructured.UnstructuredList{}
+	expectedList.SetGroupVersionKind(listGVK)
+	expectedList.SetResourceVersion("2") // One object created so far, initial value is 1.
+	expectedList.SetContinue("")
+	expectedList.Items = append(expectedList.Items, u)
+
+	if diff := cmp.Diff(expectedList, list); diff != "" {
+		t.Fatal("unexpected diff (-want, +got): ", diff)
+	}
+}
+
+func TestListWithNoFixturesAndTypedScheme(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: testGroup, Version: testVersion, Resource: testResource}
+	gvk := gvr.GroupVersion().WithKind(testKind)
+
+	listGVK := gvk
+	listGVK.Kind += "List"
+
+	typedScheme := runtime.NewScheme()
+	typedScheme.AddKnownTypeWithName(gvk, &mockResource{})
+	typedScheme.AddKnownTypeWithName(listGVK, &mockResourceList{})
+
+	client := NewSimpleDynamicClient(typedScheme)
+	list, err := client.Resource(gvr).Namespace("namespace").List(context.Background(), metav1.ListOptions{})
+
+	if err != nil {
+		t.Error("error listing", err)
+	}
+
+	expectedList := &unstructured.UnstructuredList{}
+	expectedList.SetGroupVersionKind(listGVK)
+	expectedList.SetResourceVersion("1") // No objects created so far.
+	expectedList.SetContinue("")
+
+	if diff := cmp.Diff(expectedList, list); diff != "" {
+		t.Fatal("unexpected diff (-want, +got): ", diff)
+	}
+}
+
+// This test ensures list works when the dynamic client is seeded with an empty scheme and
+// unstructured typed fixtures
+func TestListWithNoScheme(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: testGroup, Version: testVersion, Resource: testResource}
+	gvk := gvr.GroupVersion().WithKind(testKind)
+
+	listGVK := gvk
+	listGVK.Kind += "List"
+
+	u := unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	u.SetName("name")
+	u.SetNamespace("namespace")
+
+	emptyScheme := runtime.NewScheme()
+
+	client := NewSimpleDynamicClient(emptyScheme, &u)
+	list, err := client.Resource(gvr).Namespace("namespace").List(context.Background(), metav1.ListOptions{})
+
+	if err != nil {
+		t.Error("error listing", err)
+	}
+
+	expectedList := &unstructured.UnstructuredList{}
+	expectedList.SetGroupVersionKind(listGVK)
+	expectedList.SetResourceVersion("2") // One object created so far, initial value is 1.
+	expectedList.SetContinue("")
+	expectedList.Items = append(expectedList.Items, u)
+
+	if diff := cmp.Diff(expectedList, list); diff != "" {
+		t.Fatal("unexpected diff (-want, +got): ", diff)
+	}
+}
+
+// This test ensures list works when the dynamic client is seeded with an empty scheme and
+// unstructured typed fixtures
+func TestListWithTypedFixtures(t *testing.T) {
+	gvr := schema.GroupVersionResource{Group: testGroup, Version: testVersion, Resource: testResource}
+	gvk := gvr.GroupVersion().WithKind(testKind)
+
+	listGVK := gvk
+	listGVK.Kind += "List"
+
+	r := mockResource{}
+	r.SetGroupVersionKind(gvk)
+	r.SetName("name")
+	r.SetNamespace("namespace")
+
+	u := unstructured.Unstructured{}
+	u.SetGroupVersionKind(r.GetObjectKind().GroupVersionKind())
+	u.SetName(r.GetName())
+	u.SetNamespace(r.GetNamespace())
+
+	typedScheme := runtime.NewScheme()
+	typedScheme.AddKnownTypeWithName(gvk, &mockResource{})
+	typedScheme.AddKnownTypeWithName(listGVK, &mockResourceList{})
+
+	client := NewSimpleDynamicClient(typedScheme, &r)
+	list, err := client.Resource(gvr).Namespace("namespace").List(context.Background(), metav1.ListOptions{})
+
+	if err != nil {
+		t.Error("error listing", err)
+	}
+
+	expectedList := &unstructured.UnstructuredList{}
+	expectedList.SetGroupVersionKind(listGVK)
+	expectedList.SetResourceVersion("2") // One object created so far, initial value is 1.
+	expectedList.SetContinue("")
+	expectedList.Items = []unstructured.Unstructured{u}
+
+	if diff := cmp.Diff(expectedList, list); diff != "" {
+		t.Fatal("unexpected diff (-want, +got): ", diff)
+	}
+}
+
+type (
+	mockResource struct {
+		metav1.TypeMeta   `json:""`
+		metav1.ObjectMeta `json:"metadata"`
+	}
+	mockResourceList struct {
+		metav1.TypeMeta `json:""`
+		metav1.ListMeta `json:"metadata"`
+
+		Items []mockResource
+	}
+)
+
+func (l *mockResourceList) DeepCopyObject() runtime.Object {
+	o := *l
+	return &o
+}
+
+func (r *mockResource) DeepCopyObject() runtime.Object {
+	o := *r
+	return &o
+}
+
+var _ runtime.Object = (*mockResource)(nil)
+var _ runtime.Object = (*mockResourceList)(nil)

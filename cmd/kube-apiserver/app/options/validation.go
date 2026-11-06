@@ -22,21 +22,17 @@ import (
 	"net"
 	"strings"
 
-	apiextensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
-	genericfeatures "k8s.io/apiserver/pkg/features"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/features"
+	genericoptions "k8s.io/apiserver/pkg/server/options"
 	netutils "k8s.io/utils/net"
+
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver/options"
+	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
 )
 
 // TODO: Longer term we should read this from some config store, rather than a flag.
 // validateClusterIPFlags is expected to be called after Complete()
-func validateClusterIPFlags(options *ServerRunOptions) []error {
+func validateClusterIPFlags(options Extra) []error {
 	var errs []error
-	// maxCIDRBits is used to define the maximum CIDR size for the cluster ip(s)
-	const maxCIDRBits = 20
 
 	// validate that primary has been processed by user provided values or it has been defaulted
 	if options.PrimaryServiceClusterIPRange.IP == nil {
@@ -48,21 +44,7 @@ func validateClusterIPFlags(options *ServerRunOptions) []error {
 		errs = append(errs, errors.New("--service-cluster-ip-range must not contain more than two entries"))
 	}
 
-	// Complete() expected to have set Primary* and Secondary*
-	// primary CIDR validation
-	if err := validateMaxCIDRRange(options.PrimaryServiceClusterIPRange, maxCIDRBits, "--service-cluster-ip-range"); err != nil {
-		errs = append(errs, err)
-	}
-
-	// Secondary IP validation
-	// while api-server dualstack bits does not have dependency on EndPointSlice, its
-	// a good idea to have validation consistent across all components (ControllerManager
-	// needs EndPointSlice + DualStack feature flags).
 	secondaryServiceClusterIPRangeUsed := (options.SecondaryServiceClusterIPRange.IP != nil)
-	if secondaryServiceClusterIPRangeUsed && (!utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack) || !utilfeature.DefaultFeatureGate.Enabled(features.EndpointSlice)) {
-		errs = append(errs, fmt.Errorf("secondary service cluster-ip range(--service-cluster-ip-range[1]) can only be used if %v and %v feature is enabled", string(features.IPv6DualStack), string(features.EndpointSlice)))
-	}
-
 	// note: While the cluster might be dualstack (i.e. pods with multiple IPs), the user may choose
 	// to only ingress traffic within and into the cluster on one IP family only. this family is decided
 	// by the range set on --service-cluster-ip-range. If/when the user decides to use dual stack services
@@ -77,28 +59,12 @@ func validateClusterIPFlags(options *ServerRunOptions) []error {
 		if !dualstack {
 			errs = append(errs, errors.New("--service-cluster-ip-range[0] and --service-cluster-ip-range[1] must be of different IP family"))
 		}
-
-		if err := validateMaxCIDRRange(options.SecondaryServiceClusterIPRange, maxCIDRBits, "--service-cluster-ip-range[1]"); err != nil {
-			errs = append(errs, err)
-		}
 	}
 
 	return errs
 }
 
-func validateMaxCIDRRange(cidr net.IPNet, maxCIDRBits int, cidrFlag string) error {
-	// Should be smallish sized cidr, this thing is kept in etcd
-	// bigger cidr (specially those offered by IPv6) will add no value
-	// significantly increase snapshotting time.
-	var ones, bits = cidr.Mask.Size()
-	if bits-ones > maxCIDRBits {
-		return fmt.Errorf("specified %s is too large; for %d-bit addresses, the mask must be >= %d", cidrFlag, bits, bits-maxCIDRBits)
-	}
-
-	return nil
-}
-
-func validateServiceNodePort(options *ServerRunOptions) []error {
+func validateServiceNodePort(options Extra) []error {
 	var errs []error
 
 	if options.KubernetesServiceNodePort < 0 || options.KubernetesServiceNodePort > 65535 {
@@ -106,44 +72,24 @@ func validateServiceNodePort(options *ServerRunOptions) []error {
 	}
 
 	if options.KubernetesServiceNodePort > 0 && !options.ServiceNodePortRange.Contains(options.KubernetesServiceNodePort) {
-		errs = append(errs, fmt.Errorf("kubernetes service port range %v doesn't contain %v", options.ServiceNodePortRange, (options.KubernetesServiceNodePort)))
+		errs = append(errs, fmt.Errorf("kubernetes service node port range %v doesn't contain %v", options.ServiceNodePortRange, options.KubernetesServiceNodePort))
 	}
 	return errs
 }
 
-func validateTokenRequest(options *ServerRunOptions) []error {
-	var errs []error
-
-	enableAttempted := options.ServiceAccountSigningKeyFile != "" ||
-		options.Authentication.ServiceAccounts.Issuer != "" ||
-		len(options.Authentication.APIAudiences) != 0
-
-	enableSucceeded := options.ServiceAccountIssuer != nil
-
-	if !enableAttempted {
-		errs = append(errs, errors.New("--service-account-signing-key-file and --service-account-issuer are required flags"))
-	}
-
-	if enableAttempted && !enableSucceeded {
-		errs = append(errs, errors.New("--service-account-signing-key-file, --service-account-issuer, and --api-audiences should be specified together"))
-	}
-
-	return errs
-}
-
-func validateAPIPriorityAndFairness(options *ServerRunOptions) []error {
-	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIPriorityAndFairness) && options.GenericServerRunOptions.EnablePriorityAndFairness {
-		// If none of the following runtime config options are specified, APF is
-		// assumed to be turned on.
-		enabledAPIString := options.APIEnablement.RuntimeConfig.String()
-		testConfigs := []string{"flowcontrol.apiserver.k8s.io/v1beta1", "api/beta", "api/all"} // in the order of precedence
-		for _, testConfig := range testConfigs {
-			if strings.Contains(enabledAPIString, fmt.Sprintf("%s=false", testConfig)) {
-				return []error{fmt.Errorf("%s=false conflicts with APIPriorityAndFairness feature gate", testConfig)}
-			}
-			if strings.Contains(enabledAPIString, fmt.Sprintf("%s=true", testConfig)) {
-				return nil
-			}
+func validatePublicIPServiceClusterIPRangeIPFamilies(extra Extra, generic genericoptions.ServerRunOptions) []error {
+	// The "kubernetes.default" Service is SingleStack based on the configured ServiceIPRange.
+	// If the bootstrap controller reconcile the kubernetes.default Service and Endpoints, it must
+	// guarantee that the Service ClusterIPRepairConfig and the associated Endpoints have the same IP family, or
+	// it will not work for clients because of the IP family mismatch.
+	// TODO: revisit for dual-stack https://github.com/kubernetes/enhancements/issues/2438
+	if reconcilers.Type(extra.EndpointReconcilerType) != reconcilers.NoneEndpointReconcilerType {
+		serviceIPRange, _, err := controlplaneapiserver.ServiceIPRange(extra.PrimaryServiceClusterIPRange)
+		if err != nil {
+			return []error{fmt.Errorf("error determining service IP ranges: %w", err)}
+		}
+		if netutils.IsIPv4CIDR(&serviceIPRange) != netutils.IsIPv4(generic.AdvertiseAddress) {
+			return []error{fmt.Errorf("service IP family %q must match public address family %q", extra.PrimaryServiceClusterIPRange.String(), generic.AdvertiseAddress.String())}
 		}
 	}
 
@@ -151,29 +97,16 @@ func validateAPIPriorityAndFairness(options *ServerRunOptions) []error {
 }
 
 // Validate checks ServerRunOptions and return a slice of found errs.
-func (s *ServerRunOptions) Validate() []error {
+func (s CompletedOptions) Validate() []error {
 	var errs []error
+
+	errs = append(errs, s.CompletedOptions.Validate()...)
+	errs = append(errs, validateClusterIPFlags(s.Extra)...)
+	errs = append(errs, validateServiceNodePort(s.Extra)...)
+	errs = append(errs, validatePublicIPServiceClusterIPRangeIPFamilies(s.Extra, *s.GenericServerRunOptions)...)
+
 	if s.MasterCount <= 0 {
 		errs = append(errs, fmt.Errorf("--apiserver-count should be a positive number, but value '%d' provided", s.MasterCount))
-	}
-	errs = append(errs, s.Etcd.Validate()...)
-	errs = append(errs, validateClusterIPFlags(s)...)
-	errs = append(errs, validateServiceNodePort(s)...)
-	errs = append(errs, validateAPIPriorityAndFairness(s)...)
-	errs = append(errs, s.SecureServing.Validate()...)
-	errs = append(errs, s.Authentication.Validate()...)
-	errs = append(errs, s.Authorization.Validate()...)
-	errs = append(errs, s.Audit.Validate()...)
-	errs = append(errs, s.Admission.Validate()...)
-	errs = append(errs, s.APIEnablement.Validate(legacyscheme.Scheme, apiextensionsapiserver.Scheme, aggregatorscheme.Scheme)...)
-	errs = append(errs, validateTokenRequest(s)...)
-	errs = append(errs, s.Metrics.Validate()...)
-	errs = append(errs, s.Logs.Validate()...)
-	if s.IdentityLeaseDurationSeconds <= 0 {
-		errs = append(errs, fmt.Errorf("--identity-lease-duration-seconds should be a positive number, but value '%d' provided", s.IdentityLeaseDurationSeconds))
-	}
-	if s.IdentityLeaseRenewIntervalSeconds <= 0 {
-		errs = append(errs, fmt.Errorf("--identity-lease-renew-interval-seconds should be a positive number, but value '%d' provided", s.IdentityLeaseRenewIntervalSeconds))
 	}
 
 	return errs

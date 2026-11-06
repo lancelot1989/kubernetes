@@ -19,7 +19,7 @@ import (
 	"reflect"
 	"unicode/utf8"
 
-	"github.com/go-openapi/swag"
+	"github.com/go-openapi/swag/conv"
 	"k8s.io/kube-openapi/pkg/validation/errors"
 	"k8s.io/kube-openapi/pkg/validation/strfmt"
 )
@@ -184,7 +184,7 @@ func MinimumUint(path, in string, data, min uint64, exclusive bool) *errors.Vali
 // MultipleOf validates if the provided number is a multiple of the factor
 func MultipleOf(path, in string, data, factor float64) *errors.Validation {
 	// multipleOf factor must be positive
-	if factor < 0 {
+	if factor <= 0 {
 		return errors.MultipleOfMustBePositive(path, in, factor)
 	}
 	var mult float64
@@ -193,7 +193,7 @@ func MultipleOf(path, in string, data, factor float64) *errors.Validation {
 	} else {
 		mult = data / factor
 	}
-	if !swag.IsFloat64AJSONInteger(mult) {
+	if !conv.IsFloat64AJSONInteger(mult) {
 		return errors.NotMultipleOf(path, in, factor, data)
 	}
 	return nil
@@ -202,7 +202,7 @@ func MultipleOf(path, in string, data, factor float64) *errors.Validation {
 // MultipleOfInt validates if the provided integer is a multiple of the factor
 func MultipleOfInt(path, in string, data int64, factor int64) *errors.Validation {
 	// multipleOf factor must be positive
-	if factor < 0 {
+	if factor <= 0 {
 		return errors.MultipleOfMustBePositive(path, in, factor)
 	}
 	mult := data / factor
@@ -214,6 +214,10 @@ func MultipleOfInt(path, in string, data int64, factor int64) *errors.Validation
 
 // MultipleOfUint validates if the provided unsigned integer is a multiple of the factor
 func MultipleOfUint(path, in string, data, factor uint64) *errors.Validation {
+	// multipleOf factor must be positive
+	if factor == 0 {
+		return errors.MultipleOfMustBePositive(path, in, factor)
+	}
 	mult := data / factor
 	if mult*factor != data {
 		return errors.NotMultipleOf(path, in, factor, data)
@@ -333,11 +337,11 @@ func IsValueValidAgainstRange(val interface{}, typeName, format, prefix, path st
 	stringRep := ""
 	switch kind {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		stringRep = swag.FormatUint64(valueHelp.asUint64(val))
+		stringRep = conv.FormatUinteger(valueHelp.asUint64(val))
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		stringRep = swag.FormatInt64(valueHelp.asInt64(val))
+		stringRep = conv.FormatInteger(valueHelp.asInt64(val))
 	case reflect.Float32, reflect.Float64:
-		stringRep = swag.FormatFloat64(valueHelp.asFloat64(val))
+		stringRep = conv.FormatFloat(valueHelp.asFloat64(val))
 	default:
 		return fmt.Errorf("%s value number range checking called with invalid (non numeric) val type in %s", prefix, path)
 	}
@@ -348,22 +352,22 @@ func IsValueValidAgainstRange(val interface{}, typeName, format, prefix, path st
 	case integerType:
 		switch format {
 		case integerFormatInt32:
-			_, errVal = swag.ConvertInt32(stringRep)
+			_, errVal = conv.ConvertInt32(stringRep)
 		case integerFormatUInt32:
-			_, errVal = swag.ConvertUint32(stringRep)
+			_, errVal = conv.ConvertUint32(stringRep)
 		case integerFormatUInt64:
-			_, errVal = swag.ConvertUint64(stringRep)
+			_, errVal = conv.ConvertUint64(stringRep)
 		case integerFormatInt64:
 			fallthrough
 		default:
-			_, errVal = swag.ConvertInt64(stringRep)
+			_, errVal = conv.ConvertInt64(stringRep)
 		}
 	case numberType:
 		fallthrough
 	default:
 		switch format {
 		case numberFormatFloat, numberFormatFloat32:
-			_, errVal = swag.ConvertFloat32(stringRep)
+			_, errVal = conv.ConvertFloat32(stringRep)
 		case numberFormatDouble, numberFormatFloat64:
 			fallthrough
 		default:

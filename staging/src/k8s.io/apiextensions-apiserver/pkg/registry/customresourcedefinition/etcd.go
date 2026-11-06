@@ -20,7 +20,10 @@ import (
 	"context"
 	"fmt"
 
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	crdtable "k8s.io/apiextensions-apiserver/pkg/registry/customresourcedefinition/tableconvertor"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,17 +45,18 @@ func NewREST(scheme *runtime.Scheme, optsGetter generic.RESTOptionsGetter) (*RES
 	strategy := NewStrategy(scheme)
 
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &apiextensions.CustomResourceDefinition{} },
-		NewListFunc:              func() runtime.Object { return &apiextensions.CustomResourceDefinitionList{} },
-		PredicateFunc:            MatchCustomResourceDefinition,
-		DefaultQualifiedResource: apiextensions.Resource("customresourcedefinitions"),
+		NewFunc:                   func() runtime.Object { return &apiextensions.CustomResourceDefinition{} },
+		NewListFunc:               func() runtime.Object { return &apiextensions.CustomResourceDefinitionList{} },
+		PredicateFunc:             MatchCustomResourceDefinition,
+		DefaultQualifiedResource:  apiextensions.Resource("customresourcedefinitions"),
+		SingularQualifiedResource: apiextensions.Resource("customresourcedefinition"),
 
-		CreateStrategy: strategy,
-		UpdateStrategy: strategy,
-		DeleteStrategy: strategy,
+		CreateStrategy:      strategy,
+		UpdateStrategy:      strategy,
+		DeleteStrategy:      strategy,
+		ResetFieldsStrategy: strategy,
 
-		// TODO: define table converter that exposes more than name/creation timestamp
-		TableConvertor: rest.NewDefaultTableConvertor(apiextensions.Resource("customresourcedefinitions")),
+		TableConvertor: crdtable.New(),
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
@@ -99,7 +103,7 @@ func (r *REST) Delete(ctx context.Context, name string, deleteValidation rest.Va
 		err = apierrors.NewConflict(
 			apiextensions.Resource("customresourcedefinitions"),
 			name,
-			fmt.Errorf("Precondition failed: UID in precondition: %v, UID in object meta: %v", *options.Preconditions.UID, crd.UID),
+			fmt.Errorf("precondition failed: UID in precondition: %v, UID in object meta: %v", *options.Preconditions.UID, crd.UID),
 		)
 		return nil, false, err
 	}
@@ -107,7 +111,7 @@ func (r *REST) Delete(ctx context.Context, name string, deleteValidation rest.Va
 		err = apierrors.NewConflict(
 			apiextensions.Resource("customresourcedefinitions"),
 			name,
-			fmt.Errorf("Precondition failed: ResourceVersion in precondition: %v, ResourceVersion in object meta: %v", *options.Preconditions.ResourceVersion, crd.ResourceVersion),
+			fmt.Errorf("precondition failed: ResourceVersion in precondition: %v, ResourceVersion in object meta: %v", *options.Preconditions.ResourceVersion, crd.ResourceVersion),
 		)
 		return nil, false, err
 	}
@@ -177,7 +181,9 @@ func NewStatusREST(scheme *runtime.Scheme, rest *REST) *StatusREST {
 	statusStore := *rest.Store
 	statusStore.CreateStrategy = nil
 	statusStore.DeleteStrategy = nil
-	statusStore.UpdateStrategy = NewStatusStrategy(scheme)
+	statusStrategy := NewStatusStrategy(scheme)
+	statusStore.UpdateStrategy = statusStrategy
+	statusStore.ResetFieldsStrategy = statusStrategy
 	return &StatusREST{store: &statusStore}
 }
 
@@ -191,6 +197,12 @@ func (r *StatusREST) New() runtime.Object {
 	return &apiextensions.CustomResourceDefinition{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return r.store.Get(ctx, name, options)
@@ -201,4 +213,9 @@ func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.Updat
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }

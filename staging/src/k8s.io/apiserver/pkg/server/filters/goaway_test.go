@@ -22,7 +22,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -105,10 +104,6 @@ var (
 	// for watch request, test GOAWAY server push 1 byte in every second.
 	responseBody = []byte("hello")
 
-	// responseBodySize is the size of response body which test GOAWAY server sent for watch request,
-	// used to check if watch request was broken by GOAWAY frame.
-	responseBodySize = len(responseBody)
-
 	// requestPostBody is the request body which client must send to test GOAWAY server for POST method,
 	// otherwise, test GOAWAY server will respond 400 HTTP status code.
 	requestPostBody = responseBody
@@ -146,7 +141,7 @@ func newTestGOAWAYServer() (*httptest.Server, error) {
 		return
 	})
 	postHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqBody, err := ioutil.ReadAll(r.Body)
+		reqBody, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -190,38 +185,6 @@ type watchResponse struct {
 	err error
 }
 
-// newGOAWAYClient return a configured http client which used to request test GOAWAY server, a dial may specified
-// to encounter the TCP connection.
-func newGOAWAYClient(dial func(network, addr string, cfg *tls.Config) (net.Conn, error)) (*http.Client, error) {
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{http2.NextProtoTLS},
-	}
-
-	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		TLSHandshakeTimeout: 10 * time.Second,
-		TLSClientConfig:     tlsConfig,
-		MaxIdleConnsPerHost: 25,
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if dial != nil {
-				return dial(network, addr, tlsConfig)
-			}
-
-			return tls.Dial(network, addr, tlsConfig)
-		},
-	}
-	if err := http2.ConfigureTransport(tr); err != nil {
-		return nil, err
-	}
-
-	client := &http.Client{
-		Transport: tr,
-	}
-
-	return client, nil
-}
-
 // requestGOAWAYServer request test GOAWAY server using specified method and data according to the given url.
 // A non-nil channel will be returned if the request is watch, and a watchResponse can be got from the channel when watch done.
 func requestGOAWAYServer(client *http.Client, serverBaseURL, url string) (<-chan watchResponse, error) {
@@ -244,7 +207,7 @@ func requestGOAWAYServer(client *http.Client, serverBaseURL, url string) (<-chan
 
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response body and status code is %d, error: %v", resp.StatusCode, err)
 		}
@@ -284,7 +247,7 @@ func requestGOAWAYServer(client *http.Client, serverBaseURL, url string) (<-chan
 	}
 
 	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body, error: %v", err)
 	}
@@ -299,8 +262,6 @@ func requestGOAWAYServer(client *http.Client, serverBaseURL, url string) (<-chan
 // TestClientReceivedGOAWAY tests the in-flight watch requests will not be affected and new requests use a new
 // connection after client received GOAWAY.
 func TestClientReceivedGOAWAY(t *testing.T) {
-	t.Skip("disabled because of https://github.com/kubernetes/kubernetes/issues/94622")
-
 	s, err := newTestGOAWAYServer()
 	if err != nil {
 		t.Fatalf("failed to set-up test GOAWAY http server, err: %v", err)
@@ -344,23 +305,39 @@ func TestClientReceivedGOAWAY(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var mu sync.Mutex
 			// localAddr indicates how many TCP connection set up
 			localAddr := make([]string, 0)
 
-			client, err := newGOAWAYClient(func(network, addr string, cfg *tls.Config) (conn net.Conn, err error) {
+			// create the http client
+			dialFn := func(network, addr string, cfg *tls.Config) (conn net.Conn, err error) {
 				conn, err = tls.Dial(network, addr, cfg)
 				if err != nil {
 					t.Fatalf("unexpect connection err: %v", err)
 				}
 
-				mu.Lock()
 				localAddr = append(localAddr, conn.LocalAddr().String())
-				mu.Unlock()
 				return
-			})
-			if err != nil {
-				t.Fatalf("failed to set-up client, err: %v", err)
+			}
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{http2.NextProtoTLS},
+			}
+			tr := &http.Transport{
+				TLSHandshakeTimeout: 10 * time.Second,
+				TLSClientConfig:     tlsConfig,
+				// Disable connection pooling to avoid additional connections
+				// that cause the test to flake
+				MaxIdleConnsPerHost: -1,
+				DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialFn(network, addr, tlsConfig)
+				},
+			}
+			if err := http2.ConfigureTransport(tr); err != nil {
+				t.Fatalf("failed to configure http transport, err: %v", err)
+			}
+
+			client := &http.Client{
+				Transport: tr,
 			}
 
 			watchChs := make([]<-chan watchResponse, 0)
@@ -438,10 +415,7 @@ func TestGOAWAYHTTP1Requests(t *testing.T) {
 }
 
 // TestGOAWAYConcurrency tests GOAWAY frame will not affect concurrency requests in a single http client instance.
-// Known issues in history: https://github.com/kubernetes/kubernetes/issues/91131.
 func TestGOAWAYConcurrency(t *testing.T) {
-	t.Skip("disabled because of https://github.com/kubernetes/kubernetes/issues/94532")
-
 	s, err := newTestGOAWAYServer()
 	if err != nil {
 		t.Fatalf("failed to set-up test GOAWAY http server, err: %v", err)
@@ -450,7 +424,23 @@ func TestGOAWAYConcurrency(t *testing.T) {
 	s.StartTLS()
 	defer s.Close()
 
-	client, err := newGOAWAYClient(nil)
+	// create the http client
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{http2.NextProtoTLS},
+	}
+	tr := &http.Transport{
+		TLSHandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:     tlsConfig,
+		MaxIdleConnsPerHost: 25,
+	}
+	if err := http2.ConfigureTransport(tr); err != nil {
+		t.Fatalf("failed to configure http transport, err: %v", err)
+	}
+
+	client := &http.Client{
+		Transport: tr,
+	}
 	if err != nil {
 		t.Fatalf("failed to set-up client, err: %v", err)
 	}

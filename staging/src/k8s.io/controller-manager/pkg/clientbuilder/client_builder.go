@@ -17,41 +17,55 @@ limitations under the License.
 package clientbuilder
 
 import (
-	"context"
-	"fmt"
-	"time"
-
-	v1authenticationapi "k8s.io/api/authentication/v1"
-	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
-	apiserverserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	v1authentication "k8s.io/client-go/kubernetes/typed/authentication/v1"
-	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/metadata"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
-	watchtools "k8s.io/client-go/tools/watch"
+	"k8s.io/client-go/scale"
 	"k8s.io/klog/v2"
 )
 
-const (
-	// SecretTypeField is copied from pkg/apis/cores/field_constants.go
-	SecretTypeField = "type"
-)
-
-// ControllerClientBuilder allows you to get clients and configs for controllers
-// Please note a copy also exists in staging/src/k8s.io/cloud-provider/cloud.go
+// ControllerClientBuilder allows you to get clients for controllers.
+// Please note a subset copy also exists in staging/src/k8s.io/cloud-provider/cloud.go
 // TODO: Extract this into a separate controller utilities repo (issues/68947)
 type ControllerClientBuilder interface {
+	// Config returns a client config for the named controller.
+	//
+	// Deprecated: build clients through the builder (see TypedClientBuilder)
+	// so that they inherit the controller manager's client configuration and
+	// transport wrappers; a client built from a raw config bypasses them.
 	Config(name string) (*restclient.Config, error)
+	// ConfigOrDie is Config, exiting the process on error.
+	//
+	// Deprecated: see Config.
 	ConfigOrDie(name string) *restclient.Config
 	Client(name string) (clientset.Interface, error)
 	ClientOrDie(name string) clientset.Interface
+	// DiscoveryClient returns a discovery client with at least the rate
+	// limits discovery's bursts of requests need; a builder configured with
+	// higher limits keeps them.
+	DiscoveryClient(name string) (discovery.DiscoveryInterface, error)
+	DiscoveryClientOrDie(name string) discovery.DiscoveryInterface
+}
+
+// TypedClientBuilder is a ControllerClientBuilder that also constructs the
+// other clients controllers commonly need, so that controllers never handle a
+// rest.Config themselves. Both builders in this package implement it and the
+// controller managers hand it to their controllers.
+type TypedClientBuilder interface {
+	ControllerClientBuilder
+	MetadataClient(name string) (metadata.Interface, error)
+	DynamicClient(name string) (dynamic.Interface, error)
+	ScaleClient(name string, mapper scale.PreferredResourceMapper, resolver dynamic.APIPathResolverFunc, scaleKindResolver scale.ScaleKindResolver) (scale.ScalesGetter, error)
+	// WithRateLimits returns a builder whose clients use the given QPS and
+	// burst instead of the configured defaults. Any RateLimiter set on the
+	// underlying config is dropped, since it would take precedence over QPS
+	// and burst.
+	WithRateLimits(qps float32, burst int) TypedClientBuilder
+	// WithDropManagedFields returns a builder whose clients ask the server to
+	// omit metadata.managedFields from responses.
+	WithDropManagedFields() TypedClientBuilder
 }
 
 // SimpleControllerClientBuilder returns a fixed client with different user agents
@@ -61,6 +75,8 @@ type SimpleControllerClientBuilder struct {
 }
 
 // Config returns a client config for a fixed client
+//
+// Deprecated: see ControllerClientBuilder.Config.
 func (b SimpleControllerClientBuilder) Config(name string) (*restclient.Config, error) {
 	clientConfig := *b.ClientConfig
 	return restclient.AddUserAgent(&clientConfig, name), nil
@@ -68,12 +84,34 @@ func (b SimpleControllerClientBuilder) Config(name string) (*restclient.Config, 
 
 // ConfigOrDie returns a client config if no error from previous config func.
 // If it gets an error getting the client, it will log the error and kill the process it's running in.
+//
+// Deprecated: see ControllerClientBuilder.Config.
 func (b SimpleControllerClientBuilder) ConfigOrDie(name string) *restclient.Config {
 	clientConfig, err := b.Config(name)
 	if err != nil {
 		klog.Fatal(err)
 	}
 	return clientConfig
+}
+
+// WithRateLimits returns a TypedClientBuilder whose clients use the given QPS and burst.
+func (b SimpleControllerClientBuilder) WithRateLimits(qps float32, burst int) TypedClientBuilder {
+	clientConfig := *b.ClientConfig
+	clientConfig.QPS = qps
+	clientConfig.Burst = burst
+	clientConfig.RateLimiter = nil
+	return SimpleControllerClientBuilder{
+		ClientConfig: &clientConfig,
+	}
+}
+
+// WithDropManagedFields returns a TypedClientBuilder whose clients ask the server to omit managedFields.
+func (b SimpleControllerClientBuilder) WithDropManagedFields() TypedClientBuilder {
+	clientConfig := *b.ClientConfig
+	clientConfig.DropManagedFields = true
+	return SimpleControllerClientBuilder{
+		ClientConfig: &clientConfig,
+	}
 }
 
 // Client returns a clientset.Interface built from the ClientBuilder
@@ -95,161 +133,54 @@ func (b SimpleControllerClientBuilder) ClientOrDie(name string) clientset.Interf
 	return client
 }
 
-// SAControllerClientBuilder is a ControllerClientBuilder that returns clients identifying as
-// service accounts
-type SAControllerClientBuilder struct {
-	// ClientConfig is a skeleton config to clone and use as the basis for each controller client
-	ClientConfig *restclient.Config
-
-	// CoreClient is used to provision service accounts if needed and watch for their associated tokens
-	// to construct a controller client
-	CoreClient v1core.CoreV1Interface
-
-	// AuthenticationClient is used to check API tokens to make sure they are valid before
-	// building a controller client from them
-	AuthenticationClient v1authentication.AuthenticationV1Interface
-
-	// Namespace is the namespace used to host the service accounts that will back the
-	// controllers.  It must be highly privileged namespace which normal users cannot inspect.
-	Namespace string
-}
-
-// Config returns a complete clientConfig for constructing clients.  This is separate in anticipation of composition
-// which means that not all clientsets are known here
-func (b SAControllerClientBuilder) Config(name string) (*restclient.Config, error) {
-	sa, err := apiserverserviceaccount.GetOrCreateServiceAccount(b.CoreClient, b.Namespace, name)
-	if err != nil {
-		return nil, err
-	}
-
-	var clientConfig *restclient.Config
-	fieldSelector := fields.SelectorFromSet(map[string]string{
-		SecretTypeField: string(v1.SecretTypeServiceAccountToken),
-	}).String()
-	lw := &cache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			options.FieldSelector = fieldSelector
-			return b.CoreClient.Secrets(b.Namespace).List(context.TODO(), options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			options.FieldSelector = fieldSelector
-			return b.CoreClient.Secrets(b.Namespace).Watch(context.TODO(), options)
-		},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err = watchtools.UntilWithSync(ctx, lw, &v1.Secret{}, nil,
-		func(event watch.Event) (bool, error) {
-			switch event.Type {
-			case watch.Deleted:
-				return false, nil
-			case watch.Error:
-				return false, fmt.Errorf("error watching")
-
-			case watch.Added, watch.Modified:
-				secret, ok := event.Object.(*v1.Secret)
-				if !ok {
-					return false, fmt.Errorf("unexpected object type: %T", event.Object)
-				}
-				if !apiserverserviceaccount.IsServiceAccountToken(secret, sa) {
-					return false, nil
-				}
-				if len(secret.Data[v1.ServiceAccountTokenKey]) == 0 {
-					return false, nil
-				}
-				validConfig, valid, err := b.getAuthenticatedConfig(sa, string(secret.Data[v1.ServiceAccountTokenKey]))
-				if err != nil {
-					klog.Warningf("error validating API token for %s/%s in secret %s: %v", sa.Namespace, sa.Name, secret.Name, err)
-					// continue watching for good tokens
-					return false, nil
-				}
-				if !valid {
-					klog.Warningf("secret %s contained an invalid API token for %s/%s", secret.Name, sa.Namespace, sa.Name)
-					// try to delete the secret containing the invalid token
-					if err := b.CoreClient.Secrets(secret.Namespace).Delete(context.TODO(), secret.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-						klog.Warningf("error deleting secret %s containing invalid API token for %s/%s: %v", secret.Name, sa.Namespace, sa.Name, err)
-					}
-					// continue watching for good tokens
-					return false, nil
-				}
-				clientConfig = validConfig
-				return true, nil
-
-			default:
-				return false, fmt.Errorf("unexpected event type: %v", event.Type)
-			}
-		})
-	if err != nil {
-		return nil, fmt.Errorf("unable to get token for service account: %v", err)
-	}
-
-	return clientConfig, nil
-}
-
-func (b SAControllerClientBuilder) getAuthenticatedConfig(sa *v1.ServiceAccount, token string) (*restclient.Config, bool, error) {
-	username := apiserverserviceaccount.MakeUsername(sa.Namespace, sa.Name)
-
-	clientConfig := restclient.AnonymousClientConfig(b.ClientConfig)
-	clientConfig.BearerToken = token
-	restclient.AddUserAgent(clientConfig, username)
-
-	// Try token review first
-	tokenReview := &v1authenticationapi.TokenReview{Spec: v1authenticationapi.TokenReviewSpec{Token: token}}
-	if tokenResult, err := b.AuthenticationClient.TokenReviews().Create(context.TODO(), tokenReview, metav1.CreateOptions{}); err == nil {
-		if !tokenResult.Status.Authenticated {
-			klog.Warningf("Token for %s/%s did not authenticate correctly", sa.Namespace, sa.Name)
-			return nil, false, nil
-		}
-		if tokenResult.Status.User.Username != username {
-			klog.Warningf("Token for %s/%s authenticated as unexpected username: %s", sa.Namespace, sa.Name, tokenResult.Status.User.Username)
-			return nil, false, nil
-		}
-		klog.V(4).Infof("Verified credential for %s/%s", sa.Namespace, sa.Name)
-		return clientConfig, true, nil
-	}
-
-	// If we couldn't run the token review, the API might be disabled or we might not have permission.
-	// Try to make a request to /apis with the token. If we get a 401 we should consider the token invalid.
-	clientConfigCopy := *clientConfig
-	clientConfigCopy.NegotiatedSerializer = scheme.Codecs
-	client, err := restclient.UnversionedRESTClientFor(&clientConfigCopy)
-	if err != nil {
-		return nil, false, err
-	}
-	err = client.Get().AbsPath("/apis").Do(context.TODO()).Error()
-	if apierrors.IsUnauthorized(err) {
-		klog.Warningf("Token for %s/%s did not authenticate correctly: %v", sa.Namespace, sa.Name, err)
-		return nil, false, nil
-	}
-
-	return clientConfig, true, nil
-}
-
-// ConfigOrDie returns clientConfig for constructing clients.
-// If it gets an error, it will log the error and kill the process it's running in.
-func (b SAControllerClientBuilder) ConfigOrDie(name string) *restclient.Config {
-	clientConfig, err := b.Config(name)
-	if err != nil {
-		klog.Fatal(err)
-	}
-	return clientConfig
-}
-
-// Client returns clientset.Interface built from ClientBuilder
-func (b SAControllerClientBuilder) Client(name string) (clientset.Interface, error) {
+// DiscoveryClient returns a discovery.DiscoveryInterface built from the ClientBuilder
+// Discovery is special because it will artificially pump the burst quite high to handle the many discovery requests.
+func (b SimpleControllerClientBuilder) DiscoveryClient(name string) (discovery.DiscoveryInterface, error) {
 	clientConfig, err := b.Config(name)
 	if err != nil {
 		return nil, err
 	}
+	// Discovery makes a lot of requests infrequently.  This allows the burst to succeed and refill to happen
+	// in just a few seconds, unless the builder is already configured with higher limits.
+	clientConfig.Burst = max(clientConfig.Burst, 200)
+	clientConfig.QPS = max(clientConfig.QPS, 20)
 	return clientset.NewForConfig(clientConfig)
 }
 
-// ClientOrDie will return clientset.Interface built from ClientBuilder.
+// DiscoveryClientOrDie returns a discovery.DiscoveryInterface built from the ClientBuilder with no error.
+// Discovery is special because it will artificially pump the burst quite high to handle the many discovery requests.
 // If it gets an error getting the client, it will log the error and kill the process it's running in.
-func (b SAControllerClientBuilder) ClientOrDie(name string) clientset.Interface {
-	client, err := b.Client(name)
+func (b SimpleControllerClientBuilder) DiscoveryClientOrDie(name string) discovery.DiscoveryInterface {
+	client, err := b.DiscoveryClient(name)
 	if err != nil {
 		klog.Fatal(err)
 	}
 	return client
+}
+
+// MetadataClient returns a metadata.Interface built from the ClientBuilder.
+func (b SimpleControllerClientBuilder) MetadataClient(name string) (metadata.Interface, error) {
+	clientConfig, err := b.Config(name)
+	if err != nil {
+		return nil, err
+	}
+	return metadata.NewForConfig(clientConfig)
+}
+
+// DynamicClient returns a dynamic.Interface built from the ClientBuilder.
+func (b SimpleControllerClientBuilder) DynamicClient(name string) (dynamic.Interface, error) {
+	clientConfig, err := b.Config(name)
+	if err != nil {
+		return nil, err
+	}
+	return dynamic.NewForConfig(clientConfig)
+}
+
+// ScaleClient returns a scale.ScalesGetter built from the ClientBuilder.
+func (b SimpleControllerClientBuilder) ScaleClient(name string, mapper scale.PreferredResourceMapper, resolver dynamic.APIPathResolverFunc, scaleKindResolver scale.ScaleKindResolver) (scale.ScalesGetter, error) {
+	clientConfig, err := b.Config(name)
+	if err != nil {
+		return nil, err
+	}
+	return scale.NewForConfig(clientConfig, mapper, resolver, scaleKindResolver)
 }

@@ -2,14 +2,19 @@
 
 module k8s.io/mount-utils
 
-go 1.15
+go 1.27.0
+
+godebug default=go1.27
 
 require (
-	github.com/kr/pretty v0.2.0 // indirect
-	github.com/stretchr/testify v1.6.1
-	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
-	k8s.io/klog/v2 v2.4.0
-	k8s.io/utils v0.0.0-20201110183641-67b214c5f920
+	github.com/moby/sys/mountinfo v0.7.2
+	github.com/stretchr/testify v1.12.1
+	golang.org/x/sys v0.49.0
+	k8s.io/klog/v2 v2.140.0
+	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 )
 
-replace k8s.io/mount-utils => ../mount-utils
+require (
+	github.com/go-logr/logr v1.4.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
+)

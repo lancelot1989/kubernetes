@@ -17,8 +17,8 @@ limitations under the License.
 package helper
 
 import (
-	"encoding/json"
 	"fmt"
+	"k8s.io/klog/v2"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
@@ -26,7 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/validation"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/apis/core/helper"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // IsExtendedResourceName returns true if:
@@ -40,7 +42,7 @@ func IsExtendedResourceName(name v1.ResourceName) bool {
 	}
 	// Ensure it satisfies the rules in IsQualifiedName() after converted into quota resource name
 	nameForQuota := fmt.Sprintf("%s%s", v1.DefaultResourceRequestsPrefix, string(name))
-	if errs := validation.IsQualifiedName(string(nameForQuota)); len(errs) != 0 {
+	if errs := validation.IsQualifiedName(nameForQuota); len(errs) != 0 {
 		return false
 	}
 	return true
@@ -141,48 +143,22 @@ func IsServiceIPSet(service *v1.Service) bool {
 	return service.Spec.ClusterIP != v1.ClusterIPNone && service.Spec.ClusterIP != ""
 }
 
-// LoadBalancerStatusEqual evaluates the given load balancers' ingress IP addresses
-// and hostnames and returns true if equal or false if otherwise
-// TODO: make method on LoadBalancerStatus?
-func LoadBalancerStatusEqual(l, r *v1.LoadBalancerStatus) bool {
-	return ingressSliceEqual(l.Ingress, r.Ingress)
-}
-
-func ingressSliceEqual(lhs, rhs []v1.LoadBalancerIngress) bool {
-	if len(lhs) != len(rhs) {
-		return false
-	}
-	for i := range lhs {
-		if !ingressEqual(&lhs[i], &rhs[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func ingressEqual(lhs, rhs *v1.LoadBalancerIngress) bool {
-	if lhs.IP != rhs.IP {
-		return false
-	}
-	if lhs.Hostname != rhs.Hostname {
-		return false
-	}
-	return true
-}
-
 // GetAccessModesAsString returns a string representation of an array of access modes.
-// modes, when present, are always in the same order: RWO,ROX,RWX.
+// modes, when present, are always in the same order: RWO,ROX,RWX,RWOP.
 func GetAccessModesAsString(modes []v1.PersistentVolumeAccessMode) string {
 	modes = removeDuplicateAccessModes(modes)
 	modesStr := []string{}
-	if containsAccessMode(modes, v1.ReadWriteOnce) {
+	if ContainsAccessMode(modes, v1.ReadWriteOnce) {
 		modesStr = append(modesStr, "RWO")
 	}
-	if containsAccessMode(modes, v1.ReadOnlyMany) {
+	if ContainsAccessMode(modes, v1.ReadOnlyMany) {
 		modesStr = append(modesStr, "ROX")
 	}
-	if containsAccessMode(modes, v1.ReadWriteMany) {
+	if ContainsAccessMode(modes, v1.ReadWriteMany) {
 		modesStr = append(modesStr, "RWX")
+	}
+	if ContainsAccessMode(modes, v1.ReadWriteOncePod) {
+		modesStr = append(modesStr, "RWOP")
 	}
 	return strings.Join(modesStr, ",")
 }
@@ -200,6 +176,8 @@ func GetAccessModesFromString(modes string) []v1.PersistentVolumeAccessMode {
 			accessModes = append(accessModes, v1.ReadOnlyMany)
 		case s == "RWX":
 			accessModes = append(accessModes, v1.ReadWriteMany)
+		case s == "RWOP":
+			accessModes = append(accessModes, v1.ReadWriteOncePod)
 		}
 	}
 	return accessModes
@@ -209,14 +187,14 @@ func GetAccessModesFromString(modes string) []v1.PersistentVolumeAccessMode {
 func removeDuplicateAccessModes(modes []v1.PersistentVolumeAccessMode) []v1.PersistentVolumeAccessMode {
 	accessModes := []v1.PersistentVolumeAccessMode{}
 	for _, m := range modes {
-		if !containsAccessMode(accessModes, m) {
+		if !ContainsAccessMode(accessModes, m) {
 			accessModes = append(accessModes, m)
 		}
 	}
 	return accessModes
 }
 
-func containsAccessMode(modes []v1.PersistentVolumeAccessMode, mode v1.PersistentVolumeAccessMode) bool {
+func ContainsAccessMode(modes []v1.PersistentVolumeAccessMode, mode v1.PersistentVolumeAccessMode) bool {
 	for _, m := range modes {
 		if m == mode {
 			return true
@@ -311,72 +289,20 @@ func AddOrUpdateTolerationInPodSpec(spec *v1.PodSpec, toleration *v1.Toleration)
 	return true
 }
 
-// AddOrUpdateTolerationInPod tries to add a toleration to the pod's toleration list.
-// Returns true if something was updated, false otherwise.
-func AddOrUpdateTolerationInPod(pod *v1.Pod, toleration *v1.Toleration) bool {
-	return AddOrUpdateTolerationInPodSpec(&pod.Spec, toleration)
-}
-
-// TolerationsTolerateTaint checks if taint is tolerated by any of the tolerations.
-func TolerationsTolerateTaint(tolerations []v1.Toleration, taint *v1.Taint) bool {
-	for i := range tolerations {
-		if tolerations[i].ToleratesTaint(taint) {
-			return true
-		}
-	}
-	return false
-}
-
-type taintsFilterFunc func(*v1.Taint) bool
-
-// TolerationsTolerateTaintsWithFilter checks if given tolerations tolerates
-// all the taints that apply to the filter in given taint list.
-// DEPRECATED: Please use FindMatchingUntoleratedTaint instead.
-func TolerationsTolerateTaintsWithFilter(tolerations []v1.Toleration, taints []v1.Taint, applyFilter taintsFilterFunc) bool {
-	_, isUntolerated := FindMatchingUntoleratedTaint(taints, tolerations, applyFilter)
-	return !isUntolerated
-}
-
-// FindMatchingUntoleratedTaint checks if the given tolerations tolerates
-// all the filtered taints, and returns the first taint without a toleration
-func FindMatchingUntoleratedTaint(taints []v1.Taint, tolerations []v1.Toleration, inclusionFilter taintsFilterFunc) (v1.Taint, bool) {
-	filteredTaints := getFilteredTaints(taints, inclusionFilter)
-	for _, taint := range filteredTaints {
-		if !TolerationsTolerateTaint(tolerations, &taint) {
-			return taint, true
-		}
-	}
-	return v1.Taint{}, false
-}
-
-// getFilteredTaints returns a list of taints satisfying the filter predicate
-func getFilteredTaints(taints []v1.Taint, inclusionFilter taintsFilterFunc) []v1.Taint {
-	if inclusionFilter == nil {
-		return taints
-	}
-	filteredTaints := []v1.Taint{}
-	for _, taint := range taints {
-		if !inclusionFilter(&taint) {
-			continue
-		}
-		filteredTaints = append(filteredTaints, taint)
-	}
-	return filteredTaints
-}
-
 // GetMatchingTolerations returns true and list of Tolerations matching all Taints if all are tolerated, or false otherwise.
-func GetMatchingTolerations(taints []v1.Taint, tolerations []v1.Toleration) (bool, []v1.Toleration) {
+func GetMatchingTolerations(logger klog.Logger, taints []v1.Taint, tolerations []v1.Toleration) (bool, []v1.Toleration) {
 	if len(taints) == 0 {
 		return true, []v1.Toleration{}
 	}
 	if len(tolerations) == 0 && len(taints) > 0 {
 		return false, []v1.Toleration{}
 	}
+	enableComparisonOperators := utilfeature.DefaultFeatureGate.Enabled(features.TaintTolerationComparisonOperators)
 	result := []v1.Toleration{}
 	for i := range taints {
 		tolerated := false
 		for j := range tolerations {
-			if tolerations[j].ToleratesTaint(&taints[i]) {
+			if tolerations[j].ToleratesTaint(logger, &taints[i], enableComparisonOperators) {
 				result = append(result, tolerations[j])
 				tolerated = true
 				break
@@ -387,44 +313,6 @@ func GetMatchingTolerations(taints []v1.Taint, tolerations []v1.Toleration) (boo
 		}
 	}
 	return true, result
-}
-
-// GetAvoidPodsFromNodeAnnotations scans the list of annotations and
-// returns the pods that needs to be avoided for this node from scheduling
-func GetAvoidPodsFromNodeAnnotations(annotations map[string]string) (v1.AvoidPods, error) {
-	var avoidPods v1.AvoidPods
-	if len(annotations) > 0 && annotations[v1.PreferAvoidPodsAnnotationKey] != "" {
-		err := json.Unmarshal([]byte(annotations[v1.PreferAvoidPodsAnnotationKey]), &avoidPods)
-		if err != nil {
-			return avoidPods, err
-		}
-	}
-	return avoidPods, nil
-}
-
-// GetPersistentVolumeClass returns StorageClassName.
-func GetPersistentVolumeClass(volume *v1.PersistentVolume) string {
-	// Use beta annotation first
-	if class, found := volume.Annotations[v1.BetaStorageClassAnnotation]; found {
-		return class
-	}
-
-	return volume.Spec.StorageClassName
-}
-
-// GetPersistentVolumeClaimClass returns StorageClassName. If no storage class was
-// requested, it returns "".
-func GetPersistentVolumeClaimClass(claim *v1.PersistentVolumeClaim) string {
-	// Use beta annotation first
-	if class, found := claim.Annotations[v1.BetaStorageClassAnnotation]; found {
-		return class
-	}
-
-	if claim.Spec.StorageClassName != nil {
-		return *claim.Spec.StorageClassName
-	}
-
-	return ""
 }
 
 // ScopedResourceSelectorRequirementsAsSelector converts the ScopedResourceSelectorRequirement api type into a struct that implements

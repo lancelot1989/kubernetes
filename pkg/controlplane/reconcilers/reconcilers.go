@@ -25,6 +25,10 @@ import (
 
 // EndpointReconciler knows how to reconcile the endpoints for the apiserver service.
 type EndpointReconciler interface {
+	// ValidateIP ensures the given IP address meets any requirements to
+	// successfully call ReconcileEndpoints with this reconciler type.
+	ValidateIP(ip net.IP) error
+
 	// ReconcileEndpoints sets the endpoints for the given apiserver service (ro or rw).
 	// ReconcileEndpoints expects that the endpoints objects it manages will all be
 	// managed only by ReconcileEndpoints; therefore, to understand this, you need only
@@ -40,6 +44,10 @@ type EndpointReconciler interface {
 	RemoveEndpoints(serviceName string, ip net.IP, endpointPorts []corev1.EndpointPort) error
 	// StopReconciling turns any later ReconcileEndpoints call into a noop.
 	StopReconciling()
+	// Destroy shuts down all internal structures.
+	// Destroy needs to be implemented in thread-safe way and be prepared for being
+	// called more than once.
+	Destroy()
 }
 
 // Type the reconciler type
@@ -49,9 +57,9 @@ const (
 	// MasterCountReconcilerType will select the original reconciler
 	MasterCountReconcilerType Type = "master-count"
 	// LeaseEndpointReconcilerType will select a storage based reconciler
-	LeaseEndpointReconcilerType = "lease"
+	LeaseEndpointReconcilerType Type = "lease"
 	// NoneEndpointReconcilerType will turn off the endpoint reconciler
-	NoneEndpointReconcilerType = "none"
+	NoneEndpointReconcilerType Type = "none"
 )
 
 // Types an array of reconciler types

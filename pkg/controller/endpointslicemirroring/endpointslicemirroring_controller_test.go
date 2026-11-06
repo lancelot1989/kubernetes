@@ -23,14 +23,17 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 
+	"k8s.io/klog/v2"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/controller"
 )
 
@@ -46,17 +49,23 @@ type endpointSliceMirroringController struct {
 	serviceStore       cache.Store
 }
 
-func newController(batchPeriod time.Duration) (*fake.Clientset, *endpointSliceMirroringController) {
+func newController(ctx context.Context, batchPeriod time.Duration) (*fake.Clientset, *endpointSliceMirroringController) {
 	client := newClientset()
 	informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 
 	esController := NewController(
+		ctx,
 		informerFactory.Core().V1().Endpoints(),
-		informerFactory.Discovery().V1beta1().EndpointSlices(),
+		informerFactory.Discovery().V1().EndpointSlices(),
 		informerFactory.Core().V1().Services(),
 		int32(1000),
 		client,
 		batchPeriod)
+
+	// The event processing pipeline is normally started via Run() method.
+	// However, since we don't start it in unit tests, we explicitly start it here.
+	esController.eventBroadcaster.StartLogging(klog.Infof)
+	esController.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
 
 	esController.endpointsSynced = alwaysReady
 	esController.endpointSlicesSynced = alwaysReady
@@ -65,7 +74,7 @@ func newController(batchPeriod time.Duration) (*fake.Clientset, *endpointSliceMi
 	return client, &endpointSliceMirroringController{
 		esController,
 		informerFactory.Core().V1().Endpoints().Informer().GetStore(),
-		informerFactory.Discovery().V1beta1().EndpointSlices().Informer().GetStore(),
+		informerFactory.Discovery().V1().EndpointSlices().Informer().GetStore(),
 		informerFactory.Core().V1().Services().Informer().GetStore(),
 	}
 }
@@ -163,7 +172,7 @@ func TestSyncEndpoints(t *testing.T) {
 				Name: endpointsName + "-1",
 				Labels: map[string]string{
 					discovery.LabelServiceName: endpointsName,
-					discovery.LabelManagedBy:   controllerName,
+					discovery.LabelManagedBy:   ControllerName,
 				},
 			},
 		}},
@@ -216,7 +225,8 @@ func TestSyncEndpoints(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			client, esController := newController(time.Duration(0))
+			_, ctx := ktesting.NewTestContext(t)
+			client, esController := newController(ctx, time.Duration(0))
 			tc.endpoints.Name = endpointsName
 			tc.endpoints.Namespace = namespace
 			esController.endpointsStore.Add(tc.endpoints)
@@ -229,13 +239,14 @@ func TestSyncEndpoints(t *testing.T) {
 			for _, epSlice := range tc.endpointSlices {
 				epSlice.Namespace = namespace
 				esController.endpointSliceStore.Add(epSlice)
-				_, err := client.DiscoveryV1beta1().EndpointSlices(namespace).Create(context.TODO(), epSlice, metav1.CreateOptions{})
+				_, err := client.DiscoveryV1().EndpointSlices(namespace).Create(context.TODO(), epSlice, metav1.CreateOptions{})
 				if err != nil {
 					t.Fatalf("Expected no error creating EndpointSlice, got %v", err)
 				}
 			}
 
-			err := esController.syncEndpoints(fmt.Sprintf("%s/%s", namespace, endpointsName))
+			_, syncCtx := ktesting.NewTestContext(t)
+			err := esController.syncEndpoints(syncCtx, fmt.Sprintf("%s/%s", namespace, endpointsName))
 			if err != nil {
 				t.Fatalf("Unexpected error from syncEndpoints: %v", err)
 			}
@@ -311,7 +322,8 @@ func TestShouldMirror(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			_, c := newController(time.Duration(0))
+			_, ctx := ktesting.NewTestContext(t)
+			_, c := newController(ctx, time.Duration(0))
 
 			if tc.endpoints != nil {
 				err := c.endpointsStore.Add(tc.endpoints)
@@ -346,7 +358,7 @@ func TestEndpointSlicesMirroredForService(t *testing.T) {
 				Namespace: "ns1",
 				Labels: map[string]string{
 					discovery.LabelServiceName: "svc1",
-					discovery.LabelManagedBy:   controllerName,
+					discovery.LabelManagedBy:   ControllerName,
 				},
 			},
 		},
@@ -361,7 +373,7 @@ func TestEndpointSlicesMirroredForService(t *testing.T) {
 				Namespace: "ns2",
 				Labels: map[string]string{
 					discovery.LabelServiceName: "svc1",
-					discovery.LabelManagedBy:   controllerName,
+					discovery.LabelManagedBy:   ControllerName,
 				},
 			},
 		},
@@ -376,7 +388,7 @@ func TestEndpointSlicesMirroredForService(t *testing.T) {
 				Namespace: "ns1",
 				Labels: map[string]string{
 					discovery.LabelServiceName: "svc2",
-					discovery.LabelManagedBy:   controllerName,
+					discovery.LabelManagedBy:   ControllerName,
 				},
 			},
 		},
@@ -391,7 +403,7 @@ func TestEndpointSlicesMirroredForService(t *testing.T) {
 				Namespace: "ns1",
 				Labels: map[string]string{
 					discovery.LabelServiceName: "svc1",
-					discovery.LabelManagedBy:   controllerName + "foo",
+					discovery.LabelManagedBy:   ControllerName + "foo",
 				},
 			},
 		},
@@ -419,7 +431,7 @@ func TestEndpointSlicesMirroredForService(t *testing.T) {
 				Name:      "example-1",
 				Namespace: "ns1",
 				Labels: map[string]string{
-					discovery.LabelManagedBy: controllerName,
+					discovery.LabelManagedBy: ControllerName,
 				},
 			},
 		},
@@ -428,7 +440,8 @@ func TestEndpointSlicesMirroredForService(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			_, c := newController(time.Duration(0))
+			_, ctx := ktesting.NewTestContext(t)
+			_, c := newController(ctx, time.Duration(0))
 
 			err := c.endpointSliceStore.Add(tc.endpointSlice)
 			if err != nil {

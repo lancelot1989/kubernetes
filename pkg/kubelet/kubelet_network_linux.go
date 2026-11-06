@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 /*
 Copyright 2018 The Kubernetes Authors.
@@ -19,160 +19,105 @@ limitations under the License.
 package kubelet
 
 import (
-	"fmt"
+	"context"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/wait"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/features"
-	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
-	utilexec "k8s.io/utils/exec"
-	utilnet "k8s.io/utils/net"
+	utiliptables "sigs.k8s.io/iptables-wrappers/pkg/iptables"
 )
 
-func (kl *Kubelet) initNetworkUtil() {
-	exec := utilexec.New()
+const (
+	// KubeIPTablesHintChain is the chain whose existence in either iptables-legacy
+	// or iptables-nft indicates which version of iptables the system is using
+	KubeIPTablesHintChain utiliptables.Chain = "KUBE-IPTABLES-HINT"
 
-	// At this point in startup we don't know the actual node IPs, so we configure dual stack iptables
-	// rules if the node _might_ be dual-stack, and single-stack based on requested nodeIPs[0] otherwise.
-	maybeDualStack := utilfeature.DefaultFeatureGate.Enabled(features.IPv6DualStack)
-	ipv6Primary := kl.nodeIPs != nil && utilnet.IsIPv6(kl.nodeIPs[0])
+	// KubeFirewallChain is kubernetes firewall rules
+	KubeFirewallChain utiliptables.Chain = "KUBE-FIREWALL"
+)
 
-	var iptClients []utiliptables.Interface
-	var protocols []utiliptables.Protocol
-	if maybeDualStack || !ipv6Primary {
-		protocols = append(protocols, utiliptables.ProtocolIPv4)
-		iptClients = append(iptClients, utiliptables.New(exec, utiliptables.ProtocolIPv4))
+func (kl *Kubelet) initNetworkUtil(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+
+	iptClients := utiliptables.NewBestEffort(ctx, utiliptables.UseInstalledMode)
+	if len(iptClients) == 0 {
+		// We don't log this as an error because kubelet itself doesn't need any
+		// of this (it sets up these rules for the benefit of *other* components),
+		// and because we *expect* this to fail on hosts where only nftables is
+		// supported (in which case there can't be any other components using
+		// iptables that would need these rules anyway).
+		logger.Info("No iptables support on this system; not creating the KUBE-IPTABLES-HINT chain")
+		return
 	}
-	if maybeDualStack || ipv6Primary {
-		protocols = append(protocols, utiliptables.ProtocolIPv6)
-		iptClients = append(iptClients, utiliptables.New(exec, utiliptables.ProtocolIPv6))
-	}
 
-	for i := range iptClients {
-		iptClient := iptClients[i]
-		if kl.syncNetworkUtil(iptClient) {
-			klog.Infof("Initialized %s iptables rules.", protocols[i])
+	for family := range iptClients {
+		iptClient := iptClients[family]
+		if kl.syncIPTablesRules(ctx, iptClient) {
+			logger.Info("Initialized iptables rules.", "protocol", iptClient.Protocol())
 			go iptClient.Monitor(
+				ctx,
 				utiliptables.Chain("KUBE-KUBELET-CANARY"),
 				[]utiliptables.Table{utiliptables.TableMangle, utiliptables.TableNAT, utiliptables.TableFilter},
-				func() { kl.syncNetworkUtil(iptClient) },
-				1*time.Minute, wait.NeverStop,
+				func() { kl.syncIPTablesRules(ctx, iptClient) },
+				1*time.Minute,
 			)
 		} else {
-			klog.Warningf("Failed to initialize %s iptables rules; some functionality may be missing.", protocols[i])
+			logger.Info("Failed to initialize iptables rules; some functionality may be missing.", "protocol", iptClient.Protocol())
 		}
 	}
 }
 
-// syncNetworkUtil ensures the network utility are present on host.
-// Network util includes:
-// 1. 	In nat table, KUBE-MARK-DROP rule to mark connections for dropping
-// 	Marked connection will be drop on INPUT/OUTPUT Chain in filter table
-// 2. 	In nat table, KUBE-MARK-MASQ rule to mark connections for SNAT
-// 	Marked connection will get SNAT on POSTROUTING Chain in nat table
-func (kl *Kubelet) syncNetworkUtil(iptClient utiliptables.Interface) bool {
-	// Setup KUBE-MARK-DROP rules
-	dropMark := getIPTablesMark(kl.iptablesDropBit)
-	if _, err := iptClient.EnsureChain(utiliptables.TableNAT, KubeMarkDropChain); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s exists: %v", utiliptables.TableNAT, KubeMarkDropChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableNAT, KubeMarkDropChain, "-j", "MARK", "--or-mark", dropMark); err != nil {
-		klog.Errorf("Failed to ensure marking rule for %v: %v", KubeMarkDropChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureChain(utiliptables.TableFilter, KubeFirewallChain); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s exists: %v", utiliptables.TableFilter, KubeFirewallChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableFilter, KubeFirewallChain,
-		"-m", "comment", "--comment", "kubernetes firewall for dropping marked packets",
-		"-m", "mark", "--mark", fmt.Sprintf("%s/%s", dropMark, dropMark),
-		"-j", "DROP"); err != nil {
-		klog.Errorf("Failed to ensure rule to drop packet marked by %v in %v chain %v: %v", KubeMarkDropChain, utiliptables.TableFilter, KubeFirewallChain, err)
+// syncIPTablesRules ensures the KUBE-IPTABLES-HINT chain exists, and the martian packet
+// protection rule is installed.
+func (kl *Kubelet) syncIPTablesRules(ctx context.Context, iptClient utiliptables.Interface) bool {
+	logger := klog.FromContext(ctx)
+
+	// Create hint chain so other components can see whether we are using iptables-legacy
+	// or iptables-nft.
+	if _, err := iptClient.EnsureChain(ctx, utiliptables.TableMangle, KubeIPTablesHintChain); err != nil {
+		logger.Error(err, "Failed to ensure that iptables hint chain exists")
 		return false
 	}
 
-	// drop all non-local packets to localhost if they're not part of an existing
-	// forwarded connection. See #90259
 	if !iptClient.IsIPv6() { // ipv6 doesn't have this issue
-		if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableFilter, KubeFirewallChain,
+		// Set up the KUBE-FIREWALL chain and martian packet protection rule.
+		// (See below.)
+
+		// NOTE: kube-proxy (in iptables mode) creates an identical copy of this
+		// rule. If you want to change this rule in the future, you MUST do so in
+		// a way that will interoperate correctly with skewed versions of the rule
+		// created by kube-proxy.
+
+		if _, err := iptClient.EnsureChain(ctx, utiliptables.TableFilter, KubeFirewallChain); err != nil {
+			logger.Error(err, "Failed to ensure that filter table KUBE-FIREWALL chain exists")
+			return false
+		}
+
+		if _, err := iptClient.EnsureRule(ctx, utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainOutput, "-j", string(KubeFirewallChain)); err != nil {
+			logger.Error(err, "Failed to ensure that OUTPUT chain jumps to KUBE-FIREWALL")
+			return false
+		}
+		if _, err := iptClient.EnsureRule(ctx, utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainInput, "-j", string(KubeFirewallChain)); err != nil {
+			logger.Error(err, "Failed to ensure that INPUT chain jumps to KUBE-FIREWALL")
+			return false
+		}
+
+		// Kube-proxy's use of `route_localnet` to enable NodePorts on localhost
+		// creates a security hole (https://issue.k8s.io/90259) which this
+		// iptables rule mitigates. This rule should have been added to
+		// kube-proxy, but it mistakenly ended up in kubelet instead, and we are
+		// keeping it in kubelet for now in case other third-party components
+		// depend on it.
+		if _, err := iptClient.EnsureRule(ctx, utiliptables.Append, utiliptables.TableFilter, KubeFirewallChain,
 			"-m", "comment", "--comment", "block incoming localnet connections",
 			"--dst", "127.0.0.0/8",
 			"!", "--src", "127.0.0.0/8",
 			"-m", "conntrack",
 			"!", "--ctstate", "RELATED,ESTABLISHED,DNAT",
 			"-j", "DROP"); err != nil {
-			klog.Errorf("Failed to ensure rule to drop invalid localhost packets in %v chain %v: %v", utiliptables.TableFilter, KubeFirewallChain, err)
+			logger.Error(err, "Failed to ensure rule to drop invalid localhost packets in filter table KUBE-FIREWALL chain")
 			return false
 		}
 	}
 
-	if _, err := iptClient.EnsureRule(utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainOutput, "-j", string(KubeFirewallChain)); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s jumps to %s: %v", utiliptables.TableFilter, utiliptables.ChainOutput, KubeFirewallChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureRule(utiliptables.Prepend, utiliptables.TableFilter, utiliptables.ChainInput, "-j", string(KubeFirewallChain)); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s jumps to %s: %v", utiliptables.TableFilter, utiliptables.ChainInput, KubeFirewallChain, err)
-		return false
-	}
-
-	// Setup KUBE-MARK-MASQ rules
-	masqueradeMark := getIPTablesMark(kl.iptablesMasqueradeBit)
-	if _, err := iptClient.EnsureChain(utiliptables.TableNAT, KubeMarkMasqChain); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s exists: %v", utiliptables.TableNAT, KubeMarkMasqChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureChain(utiliptables.TableNAT, KubePostroutingChain); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s exists: %v", utiliptables.TableNAT, KubePostroutingChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableNAT, KubeMarkMasqChain, "-j", "MARK", "--or-mark", masqueradeMark); err != nil {
-		klog.Errorf("Failed to ensure marking rule for %v: %v", KubeMarkMasqChain, err)
-		return false
-	}
-	if _, err := iptClient.EnsureRule(utiliptables.Prepend, utiliptables.TableNAT, utiliptables.ChainPostrouting,
-		"-m", "comment", "--comment", "kubernetes postrouting rules", "-j", string(KubePostroutingChain)); err != nil {
-		klog.Errorf("Failed to ensure that %s chain %s jumps to %s: %v", utiliptables.TableNAT, utiliptables.ChainPostrouting, KubePostroutingChain, err)
-		return false
-	}
-
-	// Set up KUBE-POSTROUTING to unmark and masquerade marked packets
-	// NB: THIS MUST MATCH the corresponding code in the iptables and ipvs
-	// modes of kube-proxy
-	if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableNAT, KubePostroutingChain,
-		"-m", "mark", "!", "--mark", fmt.Sprintf("%s/%s", masqueradeMark, masqueradeMark),
-		"-j", "RETURN"); err != nil {
-		klog.Errorf("Failed to ensure filtering rule for %v: %v", KubePostroutingChain, err)
-		return false
-	}
-	// Clear the mark to avoid re-masquerading if the packet re-traverses the network stack.
-	// We know the mark bit is currently set so we can use --xor-mark to clear it (without needing
-	// to Sprintf another bitmask).
-	if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableNAT, KubePostroutingChain,
-		"-j", "MARK", "--xor-mark", masqueradeMark); err != nil {
-		klog.Errorf("Failed to ensure unmarking rule for %v: %v", KubePostroutingChain, err)
-		return false
-	}
-	masqRule := []string{
-		"-m", "comment", "--comment", "kubernetes service traffic requiring SNAT",
-		"-j", "MASQUERADE",
-	}
-	if iptClient.HasRandomFully() {
-		masqRule = append(masqRule, "--random-fully")
-	}
-	if _, err := iptClient.EnsureRule(utiliptables.Append, utiliptables.TableNAT, KubePostroutingChain, masqRule...); err != nil {
-		klog.Errorf("Failed to ensure SNAT rule for packets marked by %v in %v chain %v: %v", KubeMarkMasqChain, utiliptables.TableNAT, KubePostroutingChain, err)
-		return false
-	}
-
 	return true
-}
-
-// getIPTablesMark returns the fwmark given the bit
-func getIPTablesMark(bit int) string {
-	value := 1 << uint(bit)
-	return fmt.Sprintf("%#08x", value)
 }

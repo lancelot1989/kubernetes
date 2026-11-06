@@ -17,7 +17,7 @@ limitations under the License.
 package v1
 
 import (
-	"sort"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -198,7 +198,7 @@ func Intersection(a []corev1.ResourceName, b []corev1.ResourceName) []corev1.Res
 		}
 		result = append(result, item)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	slices.Sort(result)
 	return result
 }
 
@@ -211,7 +211,7 @@ func Difference(a []corev1.ResourceName, b []corev1.ResourceName) []corev1.Resou
 		}
 		result = append(result, item)
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	slices.Sort(result)
 	return result
 }
 
@@ -224,6 +224,17 @@ func IsZero(a corev1.ResourceList) bool {
 		}
 	}
 	return true
+}
+
+// RemoveZeros returns a new resource list that only has no zero values
+func RemoveZeros(a corev1.ResourceList) corev1.ResourceList {
+	result := corev1.ResourceList{}
+	for key, value := range a {
+		if !value.IsZero() {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 // IsNegative returns the set of resource names that have a negative value.

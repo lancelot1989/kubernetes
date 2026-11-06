@@ -17,15 +17,21 @@ limitations under the License.
 package filterlatency
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	utilclock "k8s.io/apimachinery/pkg/util/clock"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	noopoteltrace "go.opentelemetry.io/otel/trace/noop"
+
+	testingclock "k8s.io/utils/clock/testing"
 )
 
 func TestTrackStartedWithContextAlreadyHasFilterRecord(t *testing.T) {
+	ctx := t.Context()
 	filterName := "my-filter"
 	var (
 		callCount    int
@@ -40,9 +46,9 @@ func TestTrackStartedWithContextAlreadyHasFilterRecord(t *testing.T) {
 	})
 
 	requestFilterStarted := time.Now()
-	wrapped := trackStarted(handler, filterName, utilclock.NewFakeClock(requestFilterStarted))
+	wrapped := trackStarted(handler, noopoteltrace.NewTracerProvider(), filterName, testingclock.NewFakeClock(requestFilterStarted))
 
-	testRequest, err := http.NewRequest(http.MethodGet, "/api/v1/namespaces", nil)
+	testRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/namespaces", nil)
 	if err != nil {
 		t.Fatalf("failed to create new http request - %v", err)
 	}
@@ -69,6 +75,7 @@ func TestTrackStartedWithContextAlreadyHasFilterRecord(t *testing.T) {
 }
 
 func TestTrackStartedWithContextDoesNotHaveFilterRecord(t *testing.T) {
+	ctx := t.Context()
 	filterName := "my-filter"
 	var (
 		callCount    int
@@ -83,9 +90,9 @@ func TestTrackStartedWithContextDoesNotHaveFilterRecord(t *testing.T) {
 	})
 
 	requestFilterStarted := time.Now()
-	wrapped := trackStarted(handler, filterName, utilclock.NewFakeClock(requestFilterStarted))
+	wrapped := trackStarted(handler, noopoteltrace.NewTracerProvider(), filterName, testingclock.NewFakeClock(requestFilterStarted))
 
-	testRequest, err := http.NewRequest(http.MethodGet, "/api/v1/namespaces", nil)
+	testRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/namespaces", nil)
 	if err != nil {
 		t.Fatalf("failed to create new http request - %v", err)
 	}
@@ -108,6 +115,7 @@ func TestTrackStartedWithContextDoesNotHaveFilterRecord(t *testing.T) {
 }
 
 func TestTrackCompletedContextHasFilterRecord(t *testing.T) {
+	ctx := t.Context()
 	var (
 		handlerCallCount     int
 		actionCallCount      int
@@ -120,13 +128,13 @@ func TestTrackCompletedContextHasFilterRecord(t *testing.T) {
 	})
 
 	requestFilterEndedAt := time.Now()
-	wrapped := trackCompleted(handler, utilclock.NewFakeClock(requestFilterEndedAt), func(fr *requestFilterRecord, completedAt time.Time) {
+	wrapped := trackCompleted(handler, testingclock.NewFakeClock(requestFilterEndedAt), func(_ context.Context, fr *requestFilterRecord, completedAt time.Time) {
 		actionCallCount++
 		filterRecordGot = fr
 		filterCompletedAtGot = completedAt
 	})
 
-	testRequest, err := http.NewRequest(http.MethodGet, "/api/v1/namespaces", nil)
+	testRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/namespaces", nil)
 	if err != nil {
 		t.Fatalf("failed to create new http request - %v", err)
 	}
@@ -151,16 +159,17 @@ func TestTrackCompletedContextHasFilterRecord(t *testing.T) {
 }
 
 func TestTrackCompletedContextDoesNotHaveFilterRecord(t *testing.T) {
+	ctx := t.Context()
 	var actionCallCount, handlerCallCount int
 	handler := http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
 		handlerCallCount++
 	})
 
-	wrapped := trackCompleted(handler, utilclock.NewFakeClock(time.Now()), func(_ *requestFilterRecord, _ time.Time) {
+	wrapped := trackCompleted(handler, testingclock.NewFakeClock(time.Now()), func(_ context.Context, _ *requestFilterRecord, _ time.Time) {
 		actionCallCount++
 	})
 
-	testRequest, err := http.NewRequest(http.MethodGet, "/api/v1/namespaces", nil)
+	testRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/namespaces", nil)
 	if err != nil {
 		t.Fatalf("failed to create new http request - %v", err)
 	}
@@ -173,5 +182,90 @@ func TestTrackCompletedContextDoesNotHaveFilterRecord(t *testing.T) {
 	}
 	if actionCallCount != 0 {
 		t.Errorf("expected the callback to not be invoked, but was actually invoked %d times", actionCallCount)
+	}
+}
+
+func TestStartedAndCompletedOpenTelemetryTracing(t *testing.T) {
+	ctx := t.Context()
+	filterName := "my-filter"
+	// Seup OTel for testing
+	fakeRecorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(fakeRecorder))
+
+	// base handler func
+	var callCount int
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+		// we expect the handler to be invoked just once.
+		callCount++
+	})
+	// wrap with start and completed handler
+	wrapped := TrackCompleted(handler)
+	wrapped = TrackStarted(wrapped, tp, filterName)
+
+	testRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/namespaces", nil)
+	if err != nil {
+		t.Fatalf("failed to create new http request - %v", err)
+	}
+
+	wrapped.ServeHTTP(httptest.NewRecorder(), testRequest)
+
+	if callCount != 1 {
+		t.Errorf("expected the given handler to be invoked once, but was actually invoked %d times", callCount)
+	}
+	output := fakeRecorder.Ended()
+	if len(output) != 1 {
+		t.Fatalf("got %d; expected len(output) == 1", len(output))
+	}
+	span := output[0]
+	if span.Name() != filterName {
+		t.Fatalf("got %s; expected span.Name == my-filter", span.Name())
+	}
+}
+
+func TestNestedStartedAndCompletedOpenTelemetryTracing(t *testing.T) {
+	outerFilterName := "outer-filter"
+	innerFilterName := "inner-filter"
+	// Seup OTel for testing
+	fakeRecorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(fakeRecorder))
+
+	// base handler func
+	var callCount int
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+		// we expect the handler to be invoked just once.
+		callCount++
+	})
+	// wrap the handler with the inner start and completed handler
+	wrapped := TrackCompleted(handler)
+	wrapped = TrackStarted(wrapped, tp, innerFilterName)
+
+	// wrap with an external handler, nesting the inner span
+	wrapped = TrackCompleted(wrapped)
+	wrapped = TrackStarted(wrapped, tp, outerFilterName)
+
+	testRequest, err := http.NewRequest(http.MethodGet, "/api/v1/namespaces", nil)
+	if err != nil {
+		t.Fatalf("failed to create new http request - %v", err)
+	}
+
+	wrapped.ServeHTTP(httptest.NewRecorder(), testRequest)
+
+	if callCount != 1 {
+		t.Errorf("expected the given handler to be invoked once, but was actually invoked %d times", callCount)
+	}
+
+	checkSpans(t, fakeRecorder.Started(), []string{outerFilterName, innerFilterName})
+	checkSpans(t, fakeRecorder.Ended(), []string{innerFilterName, outerFilterName})
+}
+
+func checkSpans[T sdktrace.ReadOnlySpan](t *testing.T, output []T, spanNames []string) {
+	if len(output) != len(spanNames) {
+		t.Fatalf("got %d; expected len(output) == %d", len(output), len(spanNames))
+	}
+	for idx, spanName := range spanNames {
+		span := output[idx]
+		if span.Name() != spanName {
+			t.Fatalf("index %d: got %s; expected span.Name == %s", idx, span.Name(), spanName)
+		}
 	}
 }

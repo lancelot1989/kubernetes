@@ -57,8 +57,8 @@ $GCE_METADATA_SERVER = "169.254.169.254"
 # exist until an initial HNS network has been created on the Windows node - see
 # Add_InitialHnsNetwork().
 $MGMT_ADAPTER_NAME = "vEthernet (Ethernet*"
-$CRICTL_VERSION = 'v1.19.0'
-$CRICTL_SHA256 = 'df60ff65ab71c5cf1d8c38f51db6f05e3d60a45d3a3293c3248c925c25375921'
+$CRICTL_VERSION = 'v1.37.0'
+$CRICTL_SHA512 = '64705490d00780d117f469931e74206460b36737f88c40db5f222c985c63d9edc2b00bed72020a402da2da4a4762f7e0a0ddba5ef219dd529dee21fc14e2fd8e'
 
 Import-Module -Force C:\common.psm1
 
@@ -161,6 +161,20 @@ function Dump-DebugInfoToConsole {
   } Catch { }
 }
 
+# Configures Window Defender preferences
+function Configure-WindowsDefender {
+  if ((Get-WindowsFeature -Name 'Windows-Defender').Installed) {
+    Log-Output "Configuring Windows Defender preferences"
+    Set-MpPreference -SubmitSamplesConsent NeverSend
+    Log-Output "Disabling Windows Defender sample submission"
+    Set-MpPreference -MAPSReporting Disabled
+    Log-Output "Disabling Windows Defender Microsoft Active Protection Service Reporting"
+
+    Log-Output "Defender Preferences"
+    Get-MpPreference
+  }
+}
+
 # Converts the kube-env string in Yaml
 #
 # Returns: a PowerShell Hashtable object containing the key-value pairs from
@@ -215,6 +229,13 @@ function Fetch-KubeEnv {
   # The type of kube_env is a powershell String.
   $kube_env = Get-InstanceMetadataAttribute 'kube-env'
   $kube_env_table = ConvertFrom_Yaml_KubeEnv ${kube_env}
+
+  Log-Output "Logging kube-env key-value pairs except CERT and KEY values"
+  foreach ($entry in $kube_env_table.GetEnumerator()) {
+    if ((-not ($entry.Name.contains("CERT"))) -and (-not ($entry.Name.contains("KEY")))) {
+      Log-Output "$($entry.Name): $($entry.Value)"
+    }
+  }
   return ${kube_env_table}
 }
 
@@ -241,12 +262,10 @@ function Set_CurrentShellEnvironmentVar {
 # Sets environment variables used by Kubernetes binaries and by other functions
 # in this module. Depends on numerous ${kube_env} keys.
 function Set-EnvironmentVars {
-  if ($kube_env.ContainsKey('WINDOWS_CONTAINER_RUNTIME')) {
-      $container_runtime = ${kube_env}['WINDOWS_CONTAINER_RUNTIME']
+  if ($kube_env.ContainsKey('WINDOWS_CONTAINER_RUNTIME_ENDPOINT')) {
       $container_runtime_endpoint = ${kube_env}['WINDOWS_CONTAINER_RUNTIME_ENDPOINT']
   } else {
-      Log-Output "ERROR: WINDOWS_CONTAINER_RUNTIME not set in kube-env, falling back in CONTAINER_RUNTIME"
-      $container_runtime = ${kube_env}['CONTAINER_RUNTIME']
+      Log-Output "ERROR: WINDOWS_CONTAINER_RUNTIME_ENDPOINT not set in kube-env, falling back in CONTAINER_RUNTIME_ENDPOINT"
       $container_runtime_endpoint = ${kube_env}['CONTAINER_RUNTIME_ENDPOINT']
   }
   # Turning the kube-env values into environment variables is not required but
@@ -263,6 +282,7 @@ function Set-EnvironmentVars {
     "WINDOWS_CNI_VERSION" = ${kube_env}['WINDOWS_CNI_VERSION']
     "CSI_PROXY_STORAGE_PATH" = ${kube_env}['CSI_PROXY_STORAGE_PATH']
     "CSI_PROXY_VERSION" = ${kube_env}['CSI_PROXY_VERSION']
+    "CSI_PROXY_FLAGS" = ${kube_env}['CSI_PROXY_FLAGS']
     "ENABLE_CSI_PROXY" = ${kube_env}['ENABLE_CSI_PROXY']
     "PKI_DIR" = ${kube_env}['PKI_DIR']
     "CA_FILE_PATH" = ${kube_env}['CA_FILE_PATH']
@@ -274,13 +294,19 @@ function Set-EnvironmentVars {
     "MANIFESTS_DIR" = ${kube_env}['MANIFESTS_DIR']
     "INFRA_CONTAINER" = ${kube_env}['WINDOWS_INFRA_CONTAINER']
     "WINDOWS_ENABLE_PIGZ" = ${kube_env}['WINDOWS_ENABLE_PIGZ']
+    "WINDOWS_ENABLE_HYPERV" = ${kube_env}['WINDOWS_ENABLE_HYPERV']
+    "ENABLE_AUTH_PROVIDER_GCP" = ${kube_env}['ENABLE_AUTH_PROVIDER_GCP']
+    "AUTH_PROVIDER_GCP_STORAGE_PATH" = ${kube_env}['AUTH_PROVIDER_GCP_STORAGE_PATH']
+    "AUTH_PROVIDER_GCP_VERSION" = ${kube_env}['AUTH_PROVIDER_GCP_VERSION']
+    "AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64" = ${kube_env}['AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64']
+    "AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR" = ${kube_env}['AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR']
+    "AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE" = ${kube_env}['AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE']
 
     "Path" = ${env:Path} + ";" + ${kube_env}['NODE_DIR']
     "KUBE_NETWORK" = "l2bridge".ToLower()
     "KUBELET_CERT_PATH" = ${kube_env}['PKI_DIR'] + '\kubelet.crt'
     "KUBELET_KEY_PATH" = ${kube_env}['PKI_DIR'] + '\kubelet.key'
 
-    "CONTAINER_RUNTIME" = $container_runtime
     "CONTAINER_RUNTIME_ENDPOINT" = $container_runtime_endpoint
 
     'LICENSE_DIR' = 'C:\Program Files\Google\Compute Engine\THIRD_PARTY_NOTICES'
@@ -303,10 +329,13 @@ function Set-PrerequisiteOptions {
   Log-Output "Disabling Windows Update service"
   & sc.exe config wuauserv start=disabled
   & sc.exe stop wuauserv
+  Write-VerboseServiceInfoToConsole -Service 'wuauserv' -Delay 1
 
   # Use TLS 1.2: needed for Invoke-WebRequest downloads from github.com.
   [Net.ServicePointManager]::SecurityProtocol = `
       [Net.SecurityProtocolType]::Tls12
+
+  Configure-WindowsDefender
 }
 
 # Creates directories where other functions in this module will read and write
@@ -331,39 +360,6 @@ function Download-HelperScripts {
         -OutFile ${env:K8S_DIR}\hns.psm1 `
         -URLs 'https://storage.googleapis.com/gke-release/winnode/config/sdn/master/hns.psm1'
   }
-}
-
-# Downloads the gke-exec-auth-plugin for TPM-based authentication to the
-# master, if auth plugin support has been requested for this node (see
-# Test-NodeUsesAuthPlugin).
-# https://github.com/kubernetes/cloud-provider-gcp/tree/master/cmd/gke-exec-auth-plugin
-#
-# Required ${kube_env} keys:
-#   EXEC_AUTH_PLUGIN_LICENSE_URL
-#   EXEC_AUTH_PLUGIN_HASH
-#   EXEC_AUTH_PLUGIN_URL
-function DownloadAndInstall-AuthPlugin {
-  if (-not (Test-NodeUsesAuthPlugin ${kube_env})) {
-    Log-Output 'Skipping download of auth plugin'
-    return
-  }
-  if (-not (ShouldWrite-File "${env:NODE_DIR}\gke-exec-auth-plugin.exe")) {
-    return
-  }
-
-  if (-not ($kube_env.ContainsKey('EXEC_AUTH_PLUGIN_LICENSE_URL') -and
-            $kube_env.ContainsKey('EXEC_AUTH_PLUGIN_HASH') -and
-            $kube_env.ContainsKey('EXEC_AUTH_PLUGIN_URL'))) {
-    Log-Output -Fatal ("Missing one or more kube-env keys needed for " +
-                       "downloading auth plugin: $(Out-String $kube_env)")
-  }
-  MustDownload-File `
-      -URLs ${kube_env}['EXEC_AUTH_PLUGIN_URL'] `
-      -Hash ${kube_env}['EXEC_AUTH_PLUGIN_HASH'] `
-      -OutFile "${env:NODE_DIR}\gke-exec-auth-plugin.exe"
-  MustDownload-File `
-      -URLs ${kube_env}['EXEC_AUTH_PLUGIN_LICENSE_URL'] `
-      -OutFile "${env:LICENSE_DIR}\LICENSE_gke-exec-auth-plugin.txt"
 }
 
 # Downloads the Kubernetes binaries from kube-env's NODE_BINARY_TAR_URL and
@@ -422,11 +418,12 @@ function DownloadAndInstall-CSIProxyBinaries {
 function Start-CSIProxy {
   if ("${env:ENABLE_CSI_PROXY}" -eq "true") {
     Log-Output "Creating CSI Proxy Service"
-    $flags = "-windows-service -log_file=${env:LOGS_DIR}\csi-proxy.log -logtostderr=false"
+    $flags = "-windows-service -log_file=${env:LOGS_DIR}\csi-proxy.log -logtostderr=false ${env:CSI_PROXY_FLAGS}"
     & sc.exe create csiproxy binPath= "${env:NODE_DIR}\csi-proxy.exe $flags"
     & sc.exe failure csiproxy reset= 0 actions= restart/10000
     Log-Output "Starting CSI Proxy Service"
     & sc.exe start csiproxy
+    Write-VerboseServiceInfoToConsole -Service 'csiproxy' -Delay 1
   }
 }
 
@@ -543,15 +540,6 @@ function Create-NodePki {
     Log-Output -Fatal 'CA_CERT not present in kube-env'
   }
 
-  # On nodes that use a plugin to support authentication, KUBELET_CERT and
-  # KUBELET_KEY will not be present - TPM_BOOTSTRAP_CERT and TPM_BOOTSTRAP_KEY
-  # should be set instead.
-  if (Test-NodeUsesAuthPlugin ${kube_env}) {
-    Log-Output ('Skipping KUBELET_CERT and KUBELET_KEY, plugin will be used ' +
-                'for authentication')
-    return
-  }
-
   if ($kube_env.ContainsKey('KUBELET_CERT')) {
     $KUBELET_CERT = ${kube_env}['KUBELET_CERT']
     Write_PkiData "${KUBELET_CERT}" ${env:KUBELET_CERT_PATH}
@@ -571,7 +559,7 @@ function Create-NodePki {
 }
 
 # Creates the bootstrap kubelet kubeconfig at $env:BOOTSTRAP_KUBECONFIG.
-# https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet-tls-bootstrapping/
+# https://kubernetes.io/docs/reference/access-authn-authz/kubelet-tls-bootstrapping/
 #
 # Create-NodePki() must be called first.
 #
@@ -642,11 +630,56 @@ function Write_KubeconfigFromMetadata {
 # Required ${kube_env} keys:
 #   KUBERNETES_MASTER_NAME: the apiserver IP address.
 function Create-KubeletKubeconfig {
-  if (Test-NodeUsesAuthPlugin ${kube_env}) {
-    Write_KubeconfigFromMetadata
-  } else {
-    Write_BootstrapKubeconfig
+  Write_BootstrapKubeconfig
+}
+
+# Creates the kubeconfig user file for applications that communicate with Kubernetes.
+#
+# Create-NodePki() must be called first.
+#
+# Required ${kube_env} keys:
+#   CA_CERT
+#   KUBERNETES_MASTER_NAME
+function Create-Kubeconfig {
+  param (
+    [parameter(Mandatory=$true)] [string]$Name,
+    [parameter(Mandatory=$true)] [string]$Path,
+    [parameter(Mandatory=$true)] [string]$Token
+  )
+  if (-not (ShouldWrite-File $Path)) {
+    return
   }
+
+  New-Item -Force -ItemType file $Path | Out-Null
+
+  # In configure-helper.sh kubelet kubeconfig uses certificate-authority while
+  # kubeproxy kubeconfig uses certificate-authority-data, ugh. Does it matter?
+  # Use just one or the other for consistency?
+  Set-Content $Path `
+'apiVersion: v1
+kind: Config
+users:
+- name: APP_NAME
+  user:
+    token: APP_TOKEN
+clusters:
+- name: local
+  cluster:
+    server: https://APISERVER_ADDRESS
+    certificate-authority-data: CA_CERT
+contexts:
+- context:
+    cluster: local
+    user: APP_NAME
+  name: service-account-context
+current-context: service-account-context'.`
+  replace('APP_NAME', $Name).`
+  replace('APP_TOKEN', $Token).`
+  replace('CA_CERT', ${kube_env}['CA_CERT']).`
+  replace('APISERVER_ADDRESS', ${kube_env}['KUBERNETES_MASTER_NAME'])
+
+  Log-Output ("${Name} kubeconfig:`n" +
+              "$(Get-Content -Raw ${Path})")
 }
 
 # Creates the kube-proxy user kubeconfig file at $env:KUBEPROXY_KUBECONFIG.
@@ -657,39 +690,9 @@ function Create-KubeletKubeconfig {
 #   CA_CERT
 #   KUBE_PROXY_TOKEN
 function Create-KubeproxyKubeconfig {
-  if (-not (ShouldWrite-File ${env:KUBEPROXY_KUBECONFIG})) {
-    return
-  }
-
-  New-Item -Force -ItemType file ${env:KUBEPROXY_KUBECONFIG} | Out-Null
-
-  # In configure-helper.sh kubelet kubeconfig uses certificate-authority while
-  # kubeproxy kubeconfig uses certificate-authority-data, ugh. Does it matter?
-  # Use just one or the other for consistency?
-  Set-Content ${env:KUBEPROXY_KUBECONFIG} `
-'apiVersion: v1
-kind: Config
-users:
-- name: kube-proxy
-  user:
-    token: KUBEPROXY_TOKEN
-clusters:
-- name: local
-  cluster:
-    server: https://APISERVER_ADDRESS
-    certificate-authority-data: CA_CERT
-contexts:
-- context:
-    cluster: local
-    user: kube-proxy
-  name: service-account-context
-current-context: service-account-context'.`
-    replace('KUBEPROXY_TOKEN', ${kube_env}['KUBE_PROXY_TOKEN']).`
-    replace('CA_CERT', ${kube_env}['CA_CERT']).`
-    replace('APISERVER_ADDRESS', ${kube_env}['KUBERNETES_MASTER_NAME'])
-
-  Log-Output ("kubeproxy kubeconfig:`n" +
-              "$(Get-Content -Raw ${env:KUBEPROXY_KUBECONFIG})")
+  Create-Kubeconfig -Name 'kube-proxy' `
+    -Path ${env:KUBEPROXY_KUBECONFIG} `
+    -Token ${kube_env}['KUBE_PROXY_TOKEN']
 }
 
 # Returns the IP alias range configured for this GCE instance.
@@ -847,8 +850,12 @@ function Configure-HostNetworkingService {
         -Verbose
     $created_hns_network = $true
   }
-
+  # This name of endpoint is referred in pkg/proxy/winkernel/proxier.go as part of
+  # kube-proxy as well. A health check port for every service that is specified as
+  # "externalTrafficPolicy: local" will be added on the endpoint.
+  # PLEASE KEEP THEM CONSISTENT!!!
   $endpoint_name = "cbr0"
+
   $vnic_name = "vEthernet (${endpoint_name})"
 
   $hns_endpoint = Get-HnsEndpoint | Where-Object Name -eq $endpoint_name
@@ -938,155 +945,9 @@ function Configure-GcePdTools {
   Import-Module -Name $modulePath'.replace('K8S_DIR', ${env:K8S_DIR})
 }
 
-# Setup cni network. This function supports both Docker and containerd.
+# Setup cni network for containerd.
 function Prepare-CniNetworking {
-  if (${env:CONTAINER_RUNTIME} -eq "containerd") {
-    # For containerd the CNI binaries have already been installed along with
-    # the runtime.
     Configure_Containerd_CniNetworking
-  } else {
-    Install_Cni_Binaries
-    Configure_Dockerd_CniNetworking
-  }
-}
-
-# Downloads the Windows CNI binaries and puts them in $env:CNI_DIR.
-function Install_Cni_Binaries {
-  if (-not (ShouldWrite-File ${env:CNI_DIR}\win-bridge.exe) -and
-      -not (ShouldWrite-File ${env:CNI_DIR}\host-local.exe)) {
-    return
-  }
-
-  $tmp_dir = 'C:\cni_tmp'
-  New-Item $tmp_dir -ItemType 'directory' -Force | Out-Null
-
-  $release_url = "${env:WINDOWS_CNI_STORAGE_PATH}/${env:WINDOWS_CNI_VERSION}/"
-  $tgz_url = ($release_url +
-              "cni-plugins-windows-amd64-${env:WINDOWS_CNI_VERSION}.tgz")
-  $sha_url = ($tgz_url + ".sha512")
-  MustDownload-File -URLs $sha_url -OutFile $tmp_dir\cni-plugins.sha512
-  $sha512_val = ($(Get-Content $tmp_dir\cni-plugins.sha512) -split ' ',2)[0]
-  MustDownload-File `
-      -URLs $tgz_url `
-      -OutFile $tmp_dir\cni-plugins.tgz `
-      -Hash $sha512_val
-
-  tar xzvf $tmp_dir\cni-plugins.tgz -C $tmp_dir
-  Move-Item -Force $tmp_dir\host-local.exe ${env:CNI_DIR}\
-  Move-Item -Force $tmp_dir\win-bridge.exe ${env:CNI_DIR}\
-  Remove-Item -Force -Recurse $tmp_dir
-
-  if (-not ((Test-Path ${env:CNI_DIR}\win-bridge.exe) -and `
-            (Test-Path ${env:CNI_DIR}\host-local.exe))) {
-    Log-Output `
-        "win-bridge.exe and host-local.exe not found in ${env:CNI_DIR}" `
-        -Fatal
-  }
-}
-
-# Writes a CNI config file under $env:CNI_CONFIG_DIR.
-#
-# Prerequisites:
-#   $env:POD_CIDR is set (by Set-PodCidr).
-#   The "management" interface exists (Configure-HostNetworkingService).
-#   The HNS network for pod networking has been configured
-#     (Configure-HostNetworkingService).
-#
-# Required ${kube_env} keys:
-#   DNS_SERVER_IP
-#   DNS_DOMAIN
-#   SERVICE_CLUSTER_IP_RANGE
-function Configure_Dockerd_CniNetworking {
-  $l2bridge_conf = "${env:CNI_CONFIG_DIR}\l2bridge.conf"
-  if (-not (ShouldWrite-File ${l2bridge_conf})) {
-    return
-  }
-
-  $mgmt_ip = (Get_MgmtNetAdapter |
-              Get-NetIPAddress -AddressFamily IPv4).IPAddress
-
-  $cidr_range_start = Get_PodIP_Range_Start(${env:POD_CIDR})
-
-  # Explanation of the CNI config values:
-  #   POD_CIDR: the pod CIDR assigned to this node.
-  #   CIDR_RANGE_START: start of the pod CIDR range.
-  #   MGMT_IP: the IP address assigned to the node's primary network interface
-  #     (i.e. the internal IP of the GCE VM).
-  #   SERVICE_CIDR: the CIDR used for kubernetes services.
-  #   DNS_SERVER_IP: the cluster's DNS server IP address.
-  #   DNS_DOMAIN: the cluster's DNS domain, e.g. "cluster.local".
-  #
-  # OutBoundNAT ExceptionList: No SNAT for CIDRs in the list, the same as default GKE non-masquerade destination ranges listed at https://cloud.google.com/kubernetes-engine/docs/how-to/ip-masquerade-agent#default-non-masq-dests
-
-  New-Item -Force -ItemType file ${l2bridge_conf} | Out-Null
-  Set-Content ${l2bridge_conf} `
-'{
-  "cniVersion":  "0.2.0",
-  "name":  "l2bridge",
-  "type":  "win-bridge",
-  "capabilities":  {
-    "portMappings":  true,
-    "dns": true
-  },
-  "ipam":  {
-    "type": "host-local",
-    "subnet": "POD_CIDR",
-    "rangeStart": "CIDR_RANGE_START"
-  },
-  "dns":  {
-    "Nameservers":  [
-      "DNS_SERVER_IP"
-    ],
-    "Search": [
-      "DNS_DOMAIN"
-    ]
-  },
-  "Policies":  [
-    {
-      "Name":  "EndpointPolicy",
-      "Value":  {
-        "Type":  "OutBoundNAT",
-        "ExceptionList":  [
-          "169.254.0.0/16",
-          "10.0.0.0/8",
-          "172.16.0.0/12",
-          "192.168.0.0/16",
-          "100.64.0.0/10",
-          "192.0.0.0/24",
-          "192.0.2.0/24",
-          "192.88.99.0/24",
-          "198.18.0.0/15",
-          "198.51.100.0/24",
-          "203.0.113.0/24",
-          "240.0.0.0/4"
-        ]
-      }
-    },
-    {
-      "Name":  "EndpointPolicy",
-      "Value":  {
-        "Type":  "ROUTE",
-        "DestinationPrefix":  "SERVICE_CIDR",
-        "NeedEncap":  true
-      }
-    },
-    {
-      "Name":  "EndpointPolicy",
-      "Value":  {
-        "Type":  "ROUTE",
-        "DestinationPrefix":  "MGMT_IP/32",
-        "NeedEncap":  true
-      }
-    }
-  ]
-}'.replace('POD_CIDR', ${env:POD_CIDR}).`
-  replace('CIDR_RANGE_START', ${cidr_range_start}).`
-  replace('DNS_SERVER_IP', ${kube_env}['DNS_SERVER_IP']).`
-  replace('DNS_DOMAIN', ${kube_env}['DNS_DOMAIN']).`
-  replace('MGMT_IP', ${mgmt_ip}).`
-  replace('SERVICE_CIDR', ${kube_env}['SERVICE_CLUSTER_IP_RANGE'])
-
-  Log-Output "CNI config:`n$(Get-Content -Raw ${l2bridge_conf})"
 }
 
 # Obtain the host dns conf and save it to a file so that kubelet/CNI
@@ -1150,16 +1011,13 @@ function Start-WorkerServices {
   # otherwise kubelet and kube-proxy will not be able to run properly.
   $instance_name = "$(Get-InstanceMetadata 'name' | Out-String)"
   $default_kubelet_args = @(`
-      "--pod-infra-container-image=${env:INFRA_CONTAINER}",
       "--hostname-override=${instance_name}"
   )
 
   $kubelet_args = ${default_kubelet_args} + ${kubelet_args}
-  if (-not (Test-NodeUsesAuthPlugin ${kube_env})) {
-    Log-Output 'Using bootstrap kubeconfig for authentication'
-    $kubelet_args = (${kubelet_args} +
-                     "--bootstrap-kubeconfig=${env:BOOTSTRAP_KUBECONFIG}")
-  }
+  Log-Output 'Using bootstrap kubeconfig for authentication'
+  $kubelet_args = (${kubelet_args} +
+                   "--bootstrap-kubeconfig=${env:BOOTSTRAP_KUBECONFIG}")
   Log-Output "Final kubelet_args: ${kubelet_args}"
 
   # Compute kube-proxy args
@@ -1209,23 +1067,25 @@ function Start-WorkerServices {
         "A kubelet process is already running, don't know what to do"
   }
   Log-Output "Creating kubelet service"
-  & sc.exe create kubelet binPath= "${env:NODE_DIR}\kubelet.exe ${kubelet_args}" start= demand
+  & sc.exe create kubelet binPath= "${env:NODE_DIR}\kube-log-runner.exe -log-file=${env:LOGS_DIR}\kubelet.log ${env:NODE_DIR}\kubelet.exe ${kubelet_args}" start= demand
   & sc.exe failure kubelet reset= 0 actions= restart/10000
   Log-Output "Starting kubelet service"
   & sc.exe start kubelet
 
   Log-Output "Waiting 10 seconds for kubelet to stabilize"
   Start-Sleep 10
+  Write-VerboseServiceInfoToConsole -Service 'kubelet'
 
   if (Get-Process | Where-Object Name -eq "kube-proxy") {
     Log-Output -Fatal `
         "A kube-proxy process is already running, don't know what to do"
   }
   Log-Output "Creating kube-proxy service"
-  & sc.exe create kube-proxy binPath= "${env:NODE_DIR}\kube-proxy.exe ${kubeproxy_args}" start= demand
+  & sc.exe create kube-proxy binPath= "${env:NODE_DIR}\kube-log-runner.exe -log-file=${env:LOGS_DIR}\kube-proxy.log ${env:NODE_DIR}\kube-proxy.exe ${kubeproxy_args}" start= demand
   & sc.exe failure kube-proxy reset= 0 actions= restart/10000
   Log-Output "Starting kube-proxy service"
   & sc.exe start kube-proxy
+  Write-VerboseServiceInfoToConsole -Service 'kube-proxy' -Delay 1
 
   # F1020 23:08:52.000083    9136 server.go:361] unable to load in-cluster
   # configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be
@@ -1236,6 +1096,12 @@ function Start-WorkerServices {
   WaitFor_KubeletAndKubeProxyReady
   Verify_GceMetadataServerRouteIsPresent
   Log-Output "Kubernetes components started successfully"
+}
+
+# Stop and unregister both kubelet & kube-proxy services.
+function Unregister-WorkerServices {
+  & sc.exe delete kube-proxy
+  & sc.exe delete kubelet
 }
 
 # Wait for kubelet and kube-proxy to be ready within 10s.
@@ -1255,12 +1121,34 @@ function WaitFor_KubeletAndKubeProxyReady {
 }
 
 # Runs 'kubectl get nodes'.
-# TODO(pjh): run more verification commands.
+# Runs additional verification commands to ensure node successfully joined cluster
+# and that it connects to the API Server.
 function Verify-WorkerServices {
-  Log-Output ("kubectl get nodes:`n" +
-              $(& "${env:NODE_DIR}\kubectl.exe" get nodes | Out-String))
+  $timeout = 12
+  $retries = 0
+  $retryDelayInSeconds = 5
+
+  Log-Output ("Testing node connection to API server...")
+  do {
+      $retries++
+      $nodes_list = & "${env:NODE_DIR}\kubectl.exe" get nodes -o=custom-columns=:.metadata.name -A | Out-String
+      $host_status = & "${env:NODE_DIR}\kubectl.exe" get nodes (hostname) -o=custom-columns=:.status.conditions[4].type | Out-String
+      Start-Sleep $retryDelayInSeconds
+  } while (((-Not $nodes_list) -or (-Not $nodes_list.contains((hostname))) -or (-Not $host_status.contains("Ready")))-and ($retries -le $timeout))
+
+  If (-Not $nodes_list){
+      Throw ("Node: '$(hostname)' failed to connect to API server")
+
+  }ElseIf (-Not $nodes_list.contains((hostname))) {
+      Throw ("Node: '$(hostname)' failed to join the cluster; NODES: '`n $($nodes_list)'")
+
+  }ELseIf (-Not $host_status.contains("Ready")) {
+      Throw ("Node: '$(hostname)' is not in Ready state")
+  }
+
+  Log-Output ("Node: $(hostname) successfully joined cluster `n NODES: `n $($nodes_list)")
   Verify_GceMetadataServerRouteIsPresent
-  Log_Todo "run more verification commands."
+
 }
 
 # Downloads the Windows crictl package and installs its contents (e.g.
@@ -1269,15 +1157,13 @@ function DownloadAndInstall-Crictl {
   if (-not (ShouldWrite-File ${env:NODE_DIR}\crictl.exe)) {
     return
   }
-  $CRI_TOOLS_GCS_BUCKET = 'k8s-artifacts-cri-tools'
-  $url = ('https://storage.googleapis.com/' + $CRI_TOOLS_GCS_BUCKET +
-          '/release/' + $CRICTL_VERSION + '/crictl-' + $CRICTL_VERSION +
-          '-windows-amd64.tar.gz')
+  $url = ('https://github.com/kubernetes-sigs/cri-tools/releases/download/' +
+          $CRICTL_VERSION + '/crictl-' + $CRICTL_VERSION + '-windows-amd64.tar.gz')
   MustDownload-File `
       -URLs $url `
       -OutFile ${env:NODE_DIR}\crictl.tar.gz `
-      -Hash $CRICTL_SHA256 `
-      -Algorithm SHA256
+      -Hash $CRICTL_SHA512 `
+      -Algorithm SHA512
   tar xzvf ${env:NODE_DIR}\crictl.tar.gz -C ${env:NODE_DIR}
 }
 
@@ -1307,54 +1193,60 @@ function Pull-InfraContainer {
   Log-Output "Infra/pause container:`n$inspect"
 }
 
-# Setup the container runtime on the node. It supports both
-# Docker and containerd.
+# Setup the containerd on the node.
 function Setup-ContainerRuntime {
   Install-Pigz
-  if (${env:CONTAINER_RUNTIME} -eq "containerd") {
-    Install_Containerd
-    Configure_Containerd
-    Start_Containerd
-  } else {
-    Create_DockerRegistryKey
-    Configure_Dockerd
-  }
+  Install_Containerd
+  Configure_Containerd
+  Start_Containerd
 }
 
-# Add a registry key for docker in EventLog so that log messages are mapped
-# correctly. This is a workaround since the key is missing in the base image.
-# https://github.com/MicrosoftDocs/Virtualization-Documentation/pull/503
-# TODO: Fix this in the base image.
-# TODO(random-liu): Figure out whether we need this for containerd.
-function Create_DockerRegistryKey {
-  $tmp_dir = 'C:\tmp_docker_reg'
-  New-Item -Force -ItemType 'directory' ${tmp_dir} | Out-Null
-  $reg_file = 'docker.reg'
-  Set-Content ${tmp_dir}\${reg_file} `
-'Windows Registry Editor Version 5.00
- [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\EventLog\Application\docker]
-"CustomSource"=dword:00000001
-"EventMessageFile"="C:\\Program Files\\docker\\dockerd.exe"
-"TypesSupported"=dword:00000007'
-
-  Log-Output "Importing registry key for Docker"
-  reg import ${tmp_dir}\${reg_file}
-  Remove-Item -Force -Recurse ${tmp_dir}
+function Test-ContainersFeatureInstalled {
+  return (Get-WindowsFeature Containers).Installed
 }
 
-# Configure Docker daemon and restart the service.
-function Configure_Dockerd {
-  Set-Content "C:\ProgramData\docker\config\daemon.json" @'
-{
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "1m",
-    "max-file": "5"
-  }
+# After this function returns, the computer must be restarted to complete
+# the installation!
+function Install-ContainersFeature {
+  Log-Output "Installing Windows 'Containers' feature"
+  Install-WindowsFeature Containers
 }
-'@
 
- Restart-Service Docker
+# Verifies if Hyper-V should be enabled in the node
+function Test-ShouldEnableHyperVFeature {
+  return "${env:WINDOWS_ENABLE_HYPERV}" -eq "true"
+}
+
+# Check if Hyper-V feature is enabled
+function Test-HyperVFeatureEnabled {
+  return ((Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V).State -eq 'Enabled')
+}
+
+# After this function returns, the computer must be restarted to complete
+# the installation!
+function Enable-HyperVFeature {
+  Log-Output "Enabling Windows 'HyperV' feature"
+  Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart
+  Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell -All -NoRestart
+}
+
+# Configures the TCP/IP parameters to be in sync with the GCP recommendation.
+# Not setting these values correctly can cause network issues for connections
+# that live longer than 10 minutes.
+# See: https://cloud.google.com/compute/docs/troubleshooting/general-tips#idle-connections
+function Set-WindowsTCPParameters {
+  Set-ItemProperty -Force -Confirm:$false -Path `
+    'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'KeepAliveInterval' -Type Dword -Value 1000
+  Set-ItemProperty -Force -Confirm:$false `
+    -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'KeepAliveTime' -Type Dword -Value 60000
+  Set-ItemProperty -Force -Confirm:$false `
+    -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters' `
+    -Name 'TcpMaxDataRetransmissions' -Type Dword -Value 10
+
+  Log-Output 'TCP/IP Parameters'
+  Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
 }
 
 # Writes a CNI config file under $env:CNI_CONFIG_DIR for containerd.
@@ -1481,21 +1373,16 @@ function Install_Containerd {
     return
   }
 
-  # TODO(random-liu): Change this to official release path after testing.
-  $CONTAINERD_GCS_BUCKET = "cri-containerd-staging/windows"
-
   $tmp_dir = 'C:\containerd_tmp'
   New-Item $tmp_dir -ItemType 'directory' -Force | Out-Null
 
-  $version_url = "https://storage.googleapis.com/$CONTAINERD_GCS_BUCKET/latest"
-  MustDownload-File -URLs $version_url -OutFile $tmp_dir\version
-  $version = $(Get-Content $tmp_dir\version)
-
-  $tar_url = ("https://storage.googleapis.com/$CONTAINERD_GCS_BUCKET/" +
-              "cri-containerd-cni-$version.windows-amd64.tar.gz")
-  $sha_url = $tar_url + ".sha256"
-  MustDownload-File -URLs $sha_url -OutFile $tmp_dir\sha256
-  $sha = $(Get-Content $tmp_dir\sha256)
+  # TODO(ibrahimab) Change this to a gcs bucket with CI maintained and accessible by community.
+  $version = '1.6.2'
+  $tar_url = ("https://github.com/containerd/containerd/releases/download/v${version}/" +
+              "cri-containerd-cni-${version}-windows-amd64.tar.gz")
+  $sha_url = $tar_url + ".sha256sum"
+  MustDownload-File -URLs $sha_url -OutFile $tmp_dir\sha256sum
+  $sha = $(Get-Content $tmp_dir\sha256sum).Split(" ")[0].ToUpper()
 
   MustDownload-File `
       -URLs $tar_url `
@@ -1504,38 +1391,66 @@ function Install_Containerd {
       -Algorithm SHA256
 
   tar xzvf $tmp_dir\containerd.tar.gz -C $tmp_dir
-  Move-Item -Force $tmp_dir\cni\*.exe ${env:CNI_DIR}\
-  Move-Item -Force $tmp_dir\*.exe ${env:NODE_DIR}\
+  Move-Item -Force $tmp_dir\cni\bin\*.exe "${env:CNI_DIR}\"
+  Move-Item -Force $tmp_dir\*.exe "${env:NODE_DIR}\"
   Remove-Item -Force -Recurse $tmp_dir
+
+  # Exclusion for Defender.
+  Add-MpPreference -ExclusionProcess "${env:NODE_DIR}\containerd.exe"
+}
+
+# Lookup the path of containerd config if exists, else returns a default.
+function Get_Containerd_ConfigPath {
+  $service = Get-WMIObject -Class Win32_Service -Filter  "Name='containerd'"
+  if (!($service -eq $null) -and
+      $service.PathName -match ".*\s--config\s*(\S+).*" -and
+      $matches.Count -eq 2) {
+    return $matches[1]
+  } else {
+    return 'C:\Program Files\containerd\config.toml'
+  }
 }
 
 # Generates the containerd config.toml file.
 function Configure_Containerd {
-  $config_dir = 'C:\Program Files\containerd'
+  $config_path = Get_Containerd_ConfigPath
+  $config_dir = [System.IO.Path]::GetDirectoryName($config_path)
   New-Item $config_dir -ItemType 'directory' -Force | Out-Null
-  Set-Content "$config_dir\config.toml" @"
+  Set-Content ${config_path} @"
+[plugins.scheduler]
+  schedule_delay = '0s'
+  startup_delay = '0s'
 [plugins.cri]
   sandbox_image = 'INFRA_CONTAINER_IMAGE'
+[plugins.cri.containerd]
+  snapshotter = 'windows'
+  default_runtime_name = 'runhcs-wcow-process'
+  disable_snapshot_annotations = true
+  discard_unpacked_layers = true
 [plugins.cri.cni]
   bin_dir = 'CNI_BIN_DIR'
   conf_dir = 'CNI_CONF_DIR'
 "@.replace('INFRA_CONTAINER_IMAGE', ${env:INFRA_CONTAINER}).`
-    replace('CNI_BIN_DIR', ${env:CNI_DIR}).`
-    replace('CNI_CONF_DIR', ${env:CNI_CONFIG_DIR})
+    replace('CNI_BIN_DIR', "${env:CNI_DIR}").`
+    replace('CNI_CONF_DIR', "${env:CNI_CONFIG_DIR}")
 }
 
-# Register and start containerd service.
+# Register if needed and start containerd service.
 function Start_Containerd {
-  Log-Output "Creating containerd service"
-  & containerd.exe --register-service --log-file ${env:LOGS_DIR}/containerd.log
+  # Do the registration only if the containerd service does not exist.
+  if ((Get-WMIObject -Class Win32_Service -Filter  "Name='containerd'") -eq $null) {
+    Log-Output "Creating containerd service"
+    & containerd.exe --register-service --log-file "${env:LOGS_DIR}/containerd.log"
+  }
+
   Log-Output "Starting containerd service"
-  Start-Service containerd
+  Restart-Service containerd
 }
 
 # Pigz Resources
 $PIGZ_ROOT = 'C:\pigz'
 $PIGZ_VERSION = '2.3.1'
-$PIGZ_TAR_URL = 'https://storage.googleapis.com/gke-release/winnode/pigz/prod/gke_windows/pigz/release/5/20201104-134221/pigz-$PIGZ_VERSION.zip'
+$PIGZ_TAR_URL = "https://storage.googleapis.com/gke-release/winnode/pigz/prod/gke_windows/pigz/release/5/20201104-134221/pigz-$PIGZ_VERSION.zip"
 $PIGZ_TAR_HASH = '5a6f8f5530acc85ea51797f58c1409e5af6b69e55da243ffc608784cf14fec0cd16f74cc61c564d69e1a267750aecfc1e4c53b5219ff5f893b42a7576306f34c'
 
 # Install Pigz (https://github.com/madler/pigz) into Windows for improved image
@@ -1553,11 +1468,13 @@ function Install-Pigz {
       Expand-Archive -Path "$PIGZ_ROOT\pigz-$PIGZ_VERSION.zip" `
         -DestinationPath $PIGZ_ROOT
       Remove-Item -Path "$PIGZ_ROOT\pigz-$PIGZ_VERSION.zip"
-      # Docker and Containerd search for unpigz.exe on the first container image
+      # Containerd search for unpigz.exe on the first container image
       # pull request after the service is started. If unpigz.exe is in the
       # Windows path it'll use it instead of the default unzipper.
       # See: https://github.com/containerd/containerd/issues/1896
       Add-MachineEnvironmentPath -Path $PIGZ_ROOT
+      # Add process exclusion for Windows Defender to boost performance.
+      Add-MpPreference -ExclusionProcess "$PIGZ_ROOT\unpigz.exe"
       Log-Output "Installed Pigz $PIGZ_VERSION"
     } else {
       Log-Output "Pigz already installed."
@@ -1568,15 +1485,16 @@ function Install-Pigz {
 # TODO(pjh): move the logging agent code below into a separate
 # module; it was put here temporarily to avoid disrupting the file layout in
 # the K8s release machinery.
-$LOGGINGAGENT_VERSION = '1.6.0'
+$LOGGINGAGENT_VERSION = '1.8.10'
 $LOGGINGAGENT_ROOT = 'C:\fluent-bit'
 $LOGGINGAGENT_SERVICE = 'fluent-bit'
 $LOGGINGAGENT_CMDLINE = '*fluent-bit.exe*'
 
-$LOGGINGEXPORTER_VERSION = 'v0.10.3'
+$LOGGINGEXPORTER_VERSION = 'v0.17.0'
 $LOGGINGEXPORTER_ROOT = 'C:\flb-exporter'
 $LOGGINGEXPORTER_SERVICE = 'flb-exporter'
 $LOGGINGEXPORTER_CMDLINE = '*flb-exporter.exe*'
+$LOGGINGEXPORTER_HASH = 'c808c9645d84b06b89932bd707d51a9d1d0b451b5a702a5f9b2b4462c8be6502'
 
 # Restart Logging agent or starts it if it is not currently running
 function Restart-LoggingAgent {
@@ -1691,22 +1609,25 @@ function DownloadAndInstall-LoggingAgents {
       Log-Output 'Downloading logging exporter'
       New-Item $LOGGINGEXPORTER_ROOT -ItemType 'directory' -Force | Out-Null
       MustDownload-File `
-          -OutFile $LOGGINGEXPORTER_ROOT\flb-exporter.exe -URLs $url
+          -OutFile $LOGGINGEXPORTER_ROOT\flb-exporter.exe `
+          -URLs $url `
+          -Hash $LOGGINGEXPORTER_HASH `
+          -Algorithm SHA256
   }
 }
 
 function Create-LoggingAgentServices {
   cd $LOGGINGAGENT_ROOT
 
-  Log-Output 'Creating service: ${LOGGINGAGENT_SERVICE}'
+  Log-Output "Creating service: ${LOGGINGAGENT_SERVICE}"
   sc.exe create $LOGGINGAGENT_SERVICE binpath= "${LOGGINGAGENT_ROOT}\bin\fluent-bit.exe -c \fluent-bit\conf\fluent-bit.conf"
   sc.exe failure $LOGGINGAGENT_SERVICE reset= 30 actions= restart/5000
-  sc.exe query $LOGGINGAGENT_SERVICE
+  Write-VerboseServiceInfoToConsole -Service $LOGGINGAGENT_SERVICE
 
-  Log-Output 'Creating service: ${LOGGINGEXPORTER_SERVICE}'
+  Log-Output "Creating service: ${LOGGINGEXPORTER_SERVICE}"
   sc.exe create  $LOGGINGEXPORTER_SERVICE  binpath= "${LOGGINGEXPORTER_ROOT}\flb-exporter.exe --kubernetes-separator=_ --stackdriver-resource-model=k8s --enable-pod-label-discovery --logtostderr --winsvc  --pod-label-dot-replacement=_"
   sc.exe failure $LOGGINGEXPORTER_SERVICE reset= 30 actions= restart/5000
-  sc.exe query $LOGGINGEXPORTER_SERVICE
+  Write-VerboseServiceInfoToConsole -Service $LOGGINGEXPORTER_SERVICE
 }
 
 # Writes the logging configuration file for Logging agent. Restart-LoggingAgent
@@ -1723,6 +1644,10 @@ function Configure-LoggingAgent {
 
   $fluentbit_parser_file = "$LOGGINGAGENT_ROOT\conf\parsers.conf"
   $PARSERS_CONFIG | Out-File -FilePath $fluentbit_parser_file -Encoding ASCII
+
+  # Create directory for all the log position files.
+  New-Item -Type Directory -Path "/var/run/google-fluentbit/pos-files/" -Force | Out-Null
+
   Log-Output "Wrote logging config to $fluentbit_parser_file"
 }
 
@@ -1731,7 +1656,7 @@ $FLUENTBIT_CONFIG = @'
 [SERVICE]
     Flush         5
     Grace         120
-    Log_Level     debug
+    Log_Level     info
     Log_File      /var/log/fluentbit.log
     Daemon        off
     Parsers_File  parsers.conf
@@ -1782,15 +1707,13 @@ $FLUENTBIT_CONFIG = @'
     #
     # storage.backlog.mem_limit 5M
 
-
 [INPUT]
     Name         winlog
     Interval_Sec 2
     # Channels Setup,Windows PowerShell
     Channels     application,system,security
-    Tag          winevent.raw
-    DB           winlog.sqlite   #
-
+    Tag          winevt.raw
+    DB           /var/run/google-fluentbit/pos-files/winlog.db
 
 # Json Log Example:
 # {"log":"[info:2016-02-16T16:04:05.930-08:00] Some log text here\n","stream":"stdout","time":"2016-02-17T00:04:05.931087621Z"}
@@ -1799,40 +1722,19 @@ $FLUENTBIT_CONFIG = @'
     Alias            kube_containers
     Tag              kube_<namespace_name>_<pod_name>_<container_name>
     Tag_Regex        (?<pod_name>[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*)_(?<namespace_name>[^_]+)_(?<container_name>.+)-
-    Path             /var/log/containers/*.log
     Mem_Buf_Limit    5MB
     Skip_Long_Lines  On
     Refresh_Interval 5
-    DB               flb_kube.db
+    Path             C:\var\log\containers\*.log
+    DB               /var/run/google-fluentbit/pos-files/flb_kube.db
 
-    # Settings from fluentd missing here.
-    # tag reform.*
-    # format json
-    # time_key time
-    # time_format %Y-%m-%dT%H:%M:%S.%NZ
-
-
-# Example:
-# I0204 07:32:30.020537    3368 server.go:1048] POST /stats/container/: (13.972191ms) 200 [[Go-http-client/1.1] 10.244.1.3:40537]
-[INPUT]
-    Name             tail
-    Alias            kubelet
-    Tag              kubelet
-    #Multiline        on
-    #Multiline_Flush  5
-    Mem_Buf_Limit    5MB
-    Skip_Long_Lines  On
-    Refresh_Interval 5
-    Path /etc/kubernetes/logs/kubelet.log
-    DB               /etc/kubernetes/logs/gcp-kubelet.db
-
-    # Copied from fluentbit config. How is this used ? In match stages ?
-    Parser_Firstline /^\w\d{4}/
-    Parser_1         ^(?<severity>\w)(?<time>\d{4} [^\s]*)\s+(?<pid>\d+)\s+(?<source>[^ \]]+)\] (?<message>.*)/
-
-    # missing from fluentbit
-    #   time_format %m%d %H:%M:%S.%N
-
+[FILTER]
+    Name         parser
+    Match        kube_*
+    Key_Name     log
+    Reserve_Data True
+    Parser       docker
+    Parser       containerd
 
 # Example:
 # I0928 03:15:50.440223    4880 main.go:51] Starting CSI-Proxy Server ...
@@ -1840,86 +1742,85 @@ $FLUENTBIT_CONFIG = @'
     Name             tail
     Alias            csi-proxy
     Tag              csi-proxy
-    #Multiline        on
-    #Multiline_Flush  5
     Mem_Buf_Limit    5MB
     Skip_Long_Lines  On
     Refresh_Interval 5
     Path             /etc/kubernetes/logs/csi-proxy.log
-    DB               /etc/kubernetes/logs/gcp-csi-proxy.db
-
-    # Copied from fluentbit config. How is this used ? In match stages ?
-    Parser_Firstline /^\w\d{4}/
-    Parser_1         ^(?<severity>\w)(?<time>\d{4} [^\s]*)\s+(?<pid>\d+)\s+(?<source>[^ \]]+)\] (?<message>.*)/
-
-    # missing from fluentbit
-    #   time_format %m%d %H:%M:%S.%N
-
-# Example:
-# time="2019-12-10T21:27:59.836946700Z" level=info msg="loading plugin \"io.containerd.grpc.v1.cri\"..." type=io.containerd.grpc.v1
-[INPUT]
-    Name             tail
-    Alias            container-runtime
-    Tag container-runtime
-    #Multiline        on
-    #Multiline_Flush  5
-    Mem_Buf_Limit    5MB
-    Skip_Long_Lines  On
-    Refresh_Interval 5
-    Path             /etc/kubernetes/logs/containerd.log
-    DB               /etc/kubernetes/logs/gcp-containerd.log.pos
-
-    # Copied from fluentbit config. How is this used ? In match stages ?
-    Parser_Firstline /^\w\d{4}/
-    Parser_1         ^(?<severity>\w)(?<time>\d{4} [^\s]*)\s+(?<pid>\d+)\s+(?<source>[^ \]]+)\] (?<message>.*)/
-
-    # missing from fluentbit
-    #   time_format %m%d %H:%M:%S.%N
-
+    DB               /var/run/google-fluentbit/pos-files/csi-proxy.db
+    Multiline        On
+    Parser_Firstline glog
 
 # I1118 21:26:53.975789       6 proxier.go:1096] Port "nodePort for kube-system/default-http-backend:http" (:31429/tcp) was open before and is still needed
 [INPUT]
     Name             tail
     Alias            kube-proxy
     Tag              kube-proxy
-    #Multiline        on
-    #Multiline_Flush  5
     Mem_Buf_Limit    5MB
     Skip_Long_Lines  On
     Refresh_Interval 5
     Path             /etc/kubernetes/logs/kube-proxy.log
-    DB               /etc/kubernetes/logs/gcp-kubeproxy.db
+    DB               /var/run/google-fluentbit/pos-files/kube-proxy.db
+    Multiline        On
+    Parser_Firstline glog
 
-    # Copied from fluentbit config. How is this used ? In match stages ?
-    Parser_Firstline /^\w\d{4}/
-    Parser_1         ^(?<severity>\w)(?<time>\d{4} [^\s]*)\s+(?<pid>\d+)\s+(?<source>[^ \]]+)\] (?<message>.*)/
+# Example:
+# time="2019-12-10T21:27:59.836946700Z" level=info msg="loading plugin \"io.containerd.grpc.v1.cri\"..." type=io.containerd.grpc.v1
+[INPUT]
+    Name             tail
+    Alias            container-runtime
+    Tag              container-runtime
+    Mem_Buf_Limit    5MB
+    Skip_Long_Lines  On
+    Refresh_Interval 5
+    Path             /etc/kubernetes/logs/containerd.log
+    DB               /var/run/google-fluentbit/pos-files/container-runtime.db
+    # TODO: Add custom parser for containerd logs once format is settled.
 
-    # missing from fluentbit
-    #   time_format %m%d %H:%M:%S.%N
+# Example:
+# I0204 07:32:30.020537    3368 server.go:1048] POST /stats/container/: (13.972191ms) 200 [[Go-http-client/1.1] 10.244.1.3:40537]
+[INPUT]
+    Name             tail
+    Alias            kubelet
+    Tag              kubelet
+    Mem_Buf_Limit    5MB
+    Skip_Long_Lines  On
+    Refresh_Interval 5
+    Path             /etc/kubernetes/logs/kubelet.log
+    DB               /var/run/google-fluentbit/pos-files/kubelet.db
+    Multiline        On
+    Parser_Firstline glog
 
 [FILTER]
     Name        modify
     Match       *
     Hard_rename log message
 
-# [OUTPUT]
-#    Name        http
-#    Match       *
-#    Host        127.0.0.1
-#    Port        2021
-#    URI         /logs
-#    header_tag  FLUENT-TAG
-#    Format      msgpack
-#    Retry_Limit 2
+[FILTER]
+    Name        modify
+    Match       winevt.raw
+    Hard_rename Message message
+
+[FILTER]
+    Name         parser
+    Match        kube_*
+    Key_Name     message
+    Reserve_Data True
+    Parser       glog
+    Parser       json
 
 [OUTPUT]
-    name  stackdriver
-    match *
+    Name        http
+    Match       *
+    Host        127.0.0.1
+    Port        2021
+    URI         /logs
+    header_tag  FLUENT-TAG
+    Format      msgpack
+    Retry_Limit 2
 '@
 
 # Fluentbit parsers config file
 $PARSERS_CONFIG = @'
-
 [PARSER]
     Name        docker
     Format      json
@@ -1957,22 +1858,6 @@ $PARSERS_CONFIG = @'
     Time_Key    timestamp
     Time_Format %Y-%m-%dT%H:%M:%S.%L%z
 
-# ----------
-
-[PARSER]
-    Name   json
-    Format json
-    Time_Key time
-    Time_Format %d/%b/%Y:%H:%M:%S %z
-
-[PARSER]
-    Name         docker
-    Format       json
-    Time_Key     time
-    Time_Format  %Y-%m-%dT%H:%M:%S.%L
-    Time_Keep    On
-
-
 [PARSER]
     Name        syslog-rfc5424
     Format      regex
@@ -2008,7 +1893,6 @@ $PARSERS_CONFIG = @'
 # This section would be deprecated soon
 #
 
-$STACKDRIVER_VERSION = 'v1-11'
 $STACKDRIVER_ROOT = 'C:\Program Files (x86)\Stackdriver'
 
 # Restarts the Stackdriver logging agent, or starts it if it is not currently
@@ -2078,6 +1962,7 @@ function Configure-StackdriverAgent {
   # seconds. The logging agent may die die to various disruptions but can be
   # resumed.
   sc.exe failure StackdriverLogging reset= 0 actions= restart/1000/restart/10000
+  Write-VerboseServiceInfoToConsole -Service 'StackdriverLogging'
 }
 
 # The NODE_NAME placeholder must be replaced with the node's name (hostname).
@@ -2263,6 +2148,52 @@ $FLUENTD_CONFIG = @'
   </record>
 </filter>
 '@
+
+# Downloads the out-of-tree kubelet image credential provider binaries.
+function DownloadAndInstall-AuthProviderGcpBinary {
+  if ("${env:ENABLE_AUTH_PROVIDER_GCP}" -eq "true") {
+    $filename = 'auth-provider-gcp.exe'
+    if (ShouldWrite-File ${env:AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR}\$filename) {
+      Log-Output "Installing auth provider gcp binaries"
+      $tmp_dir = 'C:\k8s_tmp'
+      New-Item -Force -ItemType 'directory' $tmp_dir | Out-Null
+      $url = "${env:AUTH_PROVIDER_GCP_STORAGE_PATH}/${env:AUTH_PROVIDER_GCP_VERSION}/auth-provider-gcp/windows/amd64/$filename"
+      MustDownload-File -Hash $AUTH_PROVIDER_GCP_HASH_WINDOWS_AMD64 -Algorithm SHA512 -OutFile $tmp_dir\$filename -URLs $url
+      Move-Item -Force $tmp_dir\$filename ${env:AUTH_PROVIDER_GCP_WINDOWS_BIN_DIR}
+      Remove-Item -Force -Recurse $tmp_dir
+    } else {
+      Log-Output "Skipping auth provider gcp binaries installation, auth-provider-gcp.exe file already exists."
+    }
+  }
+}
+
+# Creates config file for the out-of-tree kubelet image credential provider.
+function Create-AuthProviderGcpConfig {
+  if ("${env:ENABLE_AUTH_PROVIDER_GCP}" -eq "true") {
+    if (ShouldWrite-File ${env:AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE}) {
+      Log-Output "Creating auth provider gcp config file"
+      Set-Content ${env:AUTH_PROVIDER_GCP_WINDOWS_CONF_FILE} @'
+kind: CredentialProviderConfig
+apiVersion: kubelet.config.k8s.io/v1
+providers:
+  - name: auth-provider-gcp.exe
+    apiVersion: credentialprovider.kubelet.k8s.io/v1
+    matchImages:
+    - "container.cloud.google.com"
+    - "gcr.io"
+    - "*.gcr.io"
+    - "*.pkg.dev"
+    args:
+    - get-credentials
+    - --v=3
+    defaultCacheDuration: 1m
+'@
+    } else {
+      Log-Output "Skipping auth provider gcp config file creation, it already exists"
+    }
+  }
+}
+
 
 # Export all public functions:
 Export-ModuleMember -Function *-*
